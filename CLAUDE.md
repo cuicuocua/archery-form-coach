@@ -72,6 +72,17 @@ Rules the PM follows:
   in degrees, using shoulder-to-hip distance as the scale reference (draw side
   preferred, bow side as fallback). This stays meaningful even when the
   shoulder line itself is unreliable. Documented inline in `app.js`.
+- **Bow type: compound only, for now.** The owner shoots both recurve and
+  compound; this prototype is tuned for **compound**. That is not cosmetic —
+  compound has mechanical let-off (the archer holds full draw comfortably for
+  seconds, so hold-and-stillness thresholds can be generous), a fixed draw stop
+  (draw length is highly repeatable shot to shot, so hand separation is a near-
+  binary signal), and a release aid anchoring at or behind the jaw rather than
+  fingers under the chin. Recurve would want looser hold/stillness thresholds
+  and a different anchor position. **Do not build a bow-type toggle or a second
+  set of constants until the owner actually starts shooting recurve with this** —
+  it is speculative until then.
+
 - **Confidence handling**: any landmark with MediaPipe `visibility` below
   `MIN_VISIBILITY` (constant, currently 0.6) makes its readout show grey
   "— uncertain" instead of a number/color — never show a confident-looking

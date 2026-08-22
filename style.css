@@ -66,6 +66,25 @@ html, body {
   display: none;
 }
 
+/* ?debug overlay: a small, blunt diagnostic corner — must never cover the readouts */
+#debug {
+  position: absolute;
+  bottom: calc(env(safe-area-inset-bottom, 16px) + 64px);
+  left: 8px;
+  z-index: 5;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 6px 8px;
+  border-radius: 6px;
+  white-space: pre;
+  pointer-events: none;
+}
+
+#debug.hidden {
+  display: none;
+}
+
 #readouts {
   position: absolute;
   top: calc(env(safe-area-inset-top, 12px) + 12px);

@@ -13,11 +13,19 @@ const DRAW_ELBOW_HEIGHT_MAX = 15;
 
 const MIN_VISIBILITY = 0.6; // MediaPipe's 0–1 confidence per joint; below this we show "uncertain"
 
-const FULL_DRAW_ANCHOR_MAX = 0.35; // draw-hand wrist must be this close to the mouth/nose, as a fraction of torso length, to count as "at anchor"
+// These five are tuned for COMPOUND shooting (mechanical release aid, let-off held at full
+// draw) — if the owner starts shooting recurve with this, expect to revisit all five, since a
+// recurve archer anchors differently (fingers under the chin, not a release hand near the jaw)
+// and can't hold nearly as steady (no let-off, fighting full poundage the whole time).
+const FULL_DRAW_ANCHOR_MAX = 0.45; // draw-hand wrist must be this close to the mouth/nose, as a fraction of torso length, to count as "at anchor" — looser than you might expect because a release aid sits the hand further back near the jaw than fingers under the chin would; hand separation (below) does the real discriminating, this just filters out the grossly wrong
 const FULL_DRAW_BOW_ARM_MIN = 150; // degrees; bow arm must be at least this straight to count as "drawn" (looser than the good-form target above — a freeze should still fire on so-so form)
-const FULL_DRAW_HOLD_MS = 300; // must stay at full draw this long before we freeze, so the hand passing through on its way up doesn't trigger it
+const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. THE key signal: a compound's draw length is fixed by a mechanical stop, so this is near-binary (mid-raise vs. hard against the wall) and can be set with confidence
+const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
+const FULL_DRAW_HOLD_MS = 900; // must stay at full draw this long before we freeze. Compound let-off means the archer can comfortably hold for several seconds, so there's room to be generous here without risking a missed shot — 900ms firmly rules out passing through on the way up
 const AUTO_FREEZE_HOLD_MS = 4000; // how long an automatic freeze holds the frame before releasing itself
 // ===========================================================================
+
+const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
 const L_SHOULDER = 11, R_SHOULDER = 12;
@@ -37,6 +45,8 @@ const readoutBowArm = document.getElementById("readout-bowarm");
 const valueBowArm = document.getElementById("value-bowarm");
 const readoutElbow = document.getElementById("readout-elbow");
 const valueElbow = document.getElementById("value-elbow");
+const debugEl = document.getElementById("debug");
+if (DEBUG) debugEl.classList.remove("hidden");
 
 let poseLandmarker = null;
 let stream = null;
@@ -51,6 +61,14 @@ let drawingUtils = null;
 //   'cooldown' — just released; waits for the archer to leave full draw before re-arming
 //   'manual'   — the owner tapped Freeze; only the button can end this, never the logic below
 let freezeState = { kind: "armed" };
+
+// Previous frame's draw-wrist position + timestamp, for the stillness check in isAtFullDraw
+// below. Deliberately just one remembered frame, not a history buffer — cheap and enough.
+let lastDrawWrist = null;
+
+// Last frame's full-draw condition values, for the ?debug overlay only (see syncDebugOverlay).
+// Stays null whenever isAtFullDraw bails out before it can compute them.
+let debugInfo = null;
 
 function isFrozen(state) {
   return state.kind === "frozen" || state.kind === "manual";
@@ -171,11 +189,17 @@ function updateDrawElbowReadout(landmarks) {
   setReadout(readoutElbow, valueElbow, `${sign}${Math.round(degrees)}°`, ok ? "ok" : "warn");
 }
 
-// The full-draw signal: the draw-hand wrist has arrived near the face (mouth corners,
-// falling back to the nose if the mouth isn't visible) while the bow arm is substantially
-// extended. Distance is normalised by torso length so it works the same at any distance
-// from the camera. Returns false — never a guess — if a landmark it needs is uncertain.
-function isAtFullDraw(landmarks) {
+// The full-draw signal. Four things all have to be true at once:
+//  - the draw-hand wrist has arrived near the face (mouth corners, falling back to the nose)
+//  - the bow arm is substantially extended
+//  - the two wrists are far apart (rules out the raise, where both hands are still up near
+//    the head together, close before the arms are ever drawn apart)
+//  - the draw wrist has stopped moving (rules out the raise, which is fast and continuous,
+//    vs. anchor, which is a held pause)
+// All distances are normalised by torso length so this works the same at any distance from
+// the camera, and doesn't care which way the archer (or the mirrored camera) is facing.
+// Returns false — never a guess — if a landmark it needs is uncertain.
+function isAtFullDraw(landmarks, nowMs) {
   const drawWrist = rightHanded ? R_WRIST : L_WRIST;
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowElbow = rightHanded ? L_ELBOW : R_ELBOW;
@@ -183,6 +207,8 @@ function isAtFullDraw(landmarks) {
   const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
   const drawHip = rightHanded ? R_HIP : L_HIP;
   const bowHip = rightHanded ? L_HIP : R_HIP;
+
+  if (DEBUG) debugInfo = null; // cleared unless we make it all the way through below
 
   if (![drawWrist, bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) {
     return false;
@@ -205,12 +231,30 @@ function isAtFullDraw(landmarks) {
   if (!scale) return false;
 
   const wrist = landmarks[drawWrist];
+  const bowWristPos = landmarks[bowWrist];
   const anchorDist = Math.hypot(wrist.x - anchor.x, wrist.y - anchor.y) / scale;
+  const handSep = Math.hypot(wrist.x - bowWristPos.x, wrist.y - bowWristPos.y) / scale;
 
   const bowArmAngle = angleAt(landmarks[bowShoulder], landmarks[bowElbow], landmarks[bowWrist]);
   if (bowArmAngle === null) return false;
 
-  return anchorDist <= FULL_DRAW_ANCHOR_MAX && bowArmAngle >= FULL_DRAW_BOW_ARM_MIN;
+  // Stillness: compare to where the draw wrist was last frame. Speed (distance moved per
+  // second), not raw distance, so it doesn't depend on how often this happens to get called.
+  // No previous frame yet means we can't know it's still, so treat that as "moving".
+  const prev = lastDrawWrist;
+  lastDrawWrist = { x: wrist.x, y: wrist.y, t: nowMs };
+  const dtSec = prev ? (nowMs - prev.t) / 1000 : 0;
+  const speed =
+    prev && dtSec > 0 ? Math.hypot(wrist.x - prev.x, wrist.y - prev.y) / scale / dtSec : Infinity;
+
+  const anchorOk = anchorDist <= FULL_DRAW_ANCHOR_MAX;
+  const armOk = bowArmAngle >= FULL_DRAW_BOW_ARM_MIN;
+  const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
+  const stillOk = speed <= FULL_DRAW_STILL_MAX;
+
+  if (DEBUG) debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+
+  return anchorOk && armOk && sepOk && stillOk;
 }
 
 // Pure state-machine transition for the auto-freeze logic — no DOM, no MediaPipe, easy to
@@ -260,6 +304,23 @@ function syncFreezeUI() {
   }
 }
 
+// ?debug-only readout of why the auto-freeze trigger is (or isn't) firing. No-op — not even
+// a DOM lookup beyond the one at startup — when ?debug isn't in the URL.
+function syncDebugOverlay() {
+  if (!DEBUG) return;
+  const d = debugInfo;
+  const mark = (ok) => (ok ? "OK" : "FAIL");
+  debugEl.textContent = !d
+    ? `state: ${freezeState.kind}\n(no full-draw signal this frame)`
+    : [
+        `state: ${freezeState.kind}`,
+        `anchor dist: ${d.anchorDist.toFixed(2)} ${mark(d.anchorOk)}`,
+        `hand sep: ${d.handSep.toFixed(2)} ${mark(d.sepOk)}`,
+        `bow arm: ${d.bowArmAngle.toFixed(0)}° ${mark(d.armOk)}`,
+        `still: ${isFinite(d.speed) ? d.speed.toFixed(2) : "n/a"} ${mark(d.stillOk)}`,
+      ].join("\n");
+}
+
 function renderLoop() {
   requestAnimationFrame(renderLoop);
   const now = performance.now();
@@ -270,6 +331,7 @@ function renderLoop() {
     // Auto-frozen: no new landmarks to look at, just watch the clock for the auto-release.
     freezeState = nextFreezeState(freezeState, false, now);
     syncFreezeUI();
+    syncDebugOverlay();
     return;
   }
 
@@ -283,15 +345,17 @@ function renderLoop() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
+    if (DEBUG) debugInfo = null;
   } else {
     drawSkeleton(landmarks);
     updateBowArmReadout(landmarks);
     updateDrawElbowReadout(landmarks);
-    atFullDraw = isAtFullDraw(landmarks);
+    atFullDraw = isAtFullDraw(landmarks, now);
   }
 
   freezeState = nextFreezeState(freezeState, atFullDraw, now);
   syncFreezeUI();
+  syncDebugOverlay();
 }
 
 function updateHandButtonLabel() {
@@ -366,6 +430,55 @@ function selfTest() {
   // Manual freeze is not overridden.
   const s4 = nextFreezeState({ kind: "manual" }, true, 999999);
   console.assert(s4.kind === "manual", "manual freeze must never be auto-released or overridden");
+
+  // isAtFullDraw: the raise (bow arm straight, both hands up near the face together) must
+  // NOT read as full draw — that was the field bug. Only real full draw (hands apart, held
+  // still) should. Saves/restores the module state isAtFullDraw depends on so this doesn't
+  // disturb the real app.
+  const savedHanded = rightHanded;
+  const savedLastWrist = lastDrawWrist;
+  rightHanded = true;
+  const mkLandmarks = (overrides) => {
+    const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 1 }));
+    for (const i in overrides) lm[i] = { ...lm[i], ...overrides[i] };
+    return lm;
+  };
+  // Shared skeleton scale: shoulder-to-hip torso length of 0.3, bow arm dead straight.
+  const base = {
+    9: { x: 0.5, y: 0.3 }, // mouth L
+    10: { x: 0.5, y: 0.3 }, // mouth R
+    11: { x: 0.3, y: 0.3 }, // bow (left) shoulder
+    12: { x: 0.5, y: 0.3 }, // draw (right) shoulder
+    13: { x: 0.15, y: 0.3 }, // bow elbow
+    23: { x: 0.3, y: 0.6 }, // bow hip
+    24: { x: 0.5, y: 0.6 }, // draw hip
+  };
+
+  lastDrawWrist = null;
+  const raise = mkLandmarks({ ...base, 15: { x: 0.48, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
+  console.assert(
+    isAtFullDraw(raise, 0) === false,
+    "raise (hands together, bow arm straight) must not read as full draw"
+  );
+
+  lastDrawWrist = null;
+  const drawn = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
+  console.assert(
+    isAtFullDraw(drawn, 0) === false,
+    "first frame at full draw should read as still-moving (no prior position yet)"
+  );
+  console.assert(
+    isAtFullDraw(drawn, 500) === true,
+    "same position 500ms later (zero speed) should read as full draw"
+  );
+  const drifted = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.6, y: 0.31 } });
+  console.assert(
+    isAtFullDraw(drifted, 600) === false,
+    "wrist jumping far in 100ms (fast) should not read as holding still"
+  );
+
+  rightHanded = savedHanded;
+  lastDrawWrist = savedLastWrist;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
