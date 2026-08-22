@@ -26,6 +26,7 @@ const AUTO_FREEZE_HOLD_MS = 4000; // how long an automatic freeze holds the fram
 // ===========================================================================
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
+const DEBUG_PEAK_WINDOW_MS = 30000; // ?debug overlay only: how long "recent best" keeps its reading before a fresh one can take over. Long enough to lower the bow and walk 5m over to look — at this length it's really "best of the last shot or two", not strictly this one, which is fine for calibration
 
 // MediaPipe pose landmark indices (33-point model)
 const L_SHOULDER = 11, R_SHOULDER = 12;
@@ -67,8 +68,16 @@ let freezeState = { kind: "armed" };
 let lastDrawWrist = null;
 
 // Last frame's full-draw condition values, for the ?debug overlay only (see syncDebugOverlay).
-// Stays null whenever isAtFullDraw bails out before it can compute them.
+// Stays null whenever isAtFullDraw bails out before it can compute them, and while frozen
+// (isAtFullDraw isn't called then) it simply keeps showing the frame that triggered the freeze.
 let debugInfo = null;
+
+// The single best (highest hand-separation) frame seen in the last DEBUG_PEAK_WINDOW_MS,
+// snapshotted whole so all four numbers on it come from the same instant — "recent best" in
+// the ?debug overlay (not "this shot": the window is long enough to span more than one shot).
+// Never cleared by a missing pose or a freeze, only by time or a better frame, so it survives
+// exactly the moments (frozen, bow lowered, walking over to look) where the live numbers don't.
+let peak = null;
 
 function isFrozen(state) {
   return state.kind === "frozen" || state.kind === "manual";
@@ -252,7 +261,16 @@ function isAtFullDraw(landmarks, nowMs) {
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
   const stillOk = speed <= FULL_DRAW_STILL_MAX;
 
-  if (DEBUG) debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+  if (DEBUG) {
+    debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+    // Keep this frame as "recent best" if it beats the current one, or if the current one has
+    // aged out — same one-variable trick as the stillness check above, just for display.
+    // >= (not >) on purpose: if the archer holds steady at their widest separation for a
+    // moment, keep refreshing to that latest frame rather than freezing on the first instant
+    // it was reached — the first instant is often still mid-motion (stillOk still false).
+    const expired = !peak || nowMs - peak.seenAt > DEBUG_PEAK_WINDOW_MS;
+    if (expired || handSep >= peak.handSep) peak = { ...debugInfo, seenAt: nowMs };
+  }
 
   return anchorOk && armOk && sepOk && stillOk;
 }
@@ -305,20 +323,29 @@ function syncFreezeUI() {
 }
 
 // ?debug-only readout of why the auto-freeze trigger is (or isn't) firing. No-op — not even
-// a DOM lookup beyond the one at startup — when ?debug isn't in the URL.
+// a DOM lookup beyond the one at startup — when ?debug isn't in the URL. Deliberately big and
+// blunt: this has to be readable from ~5 metres away while the owner is mid-shot, not tidy.
+// Hand separation gets top billing because it's the number most likely to need retuning; the
+// "recent best" line is what answers the real open question when the freeze never fires at
+// all — did the hands actually get far enough apart recently, or is something else the problem.
 function syncDebugOverlay() {
   if (!DEBUG) return;
-  const d = debugInfo;
-  const mark = (ok) => (ok ? "OK" : "FAIL");
-  debugEl.textContent = !d
-    ? `state: ${freezeState.kind}\n(no full-draw signal this frame)`
-    : [
-        `state: ${freezeState.kind}`,
-        `anchor dist: ${d.anchorDist.toFixed(2)} ${mark(d.anchorOk)}`,
-        `hand sep: ${d.handSep.toFixed(2)} ${mark(d.sepOk)}`,
-        `bow arm: ${d.bowArmAngle.toFixed(0)}° ${mark(d.armOk)}`,
-        `still: ${isFinite(d.speed) ? d.speed.toFixed(2) : "n/a"} ${mark(d.stillOk)}`,
-      ].join("\n");
+  const otherChecks = (s) => `anchor ${s.anchorOk ? "ok" : "fail"} · arm ${s.armOk ? "ok" : "fail"} · still ${s.stillOk ? "ok" : "fail"}`;
+  const sepLine = (s) =>
+    `hand sep ${s.handSep.toFixed(2)} of ${FULL_DRAW_HAND_SEP_MIN} needed — ${s.sepOk ? "far enough apart" : "too close together"}`;
+
+  const liveHtml = !debugInfo
+    ? `<div class="debug-big debug-fail">hand sep: no pose seen</div>`
+    : `<div class="debug-big ${debugInfo.sepOk ? "debug-ok" : "debug-fail"}">${sepLine(debugInfo)}</div>`;
+
+  const bestHtml = !peak
+    ? ""
+    : `<div class="debug-mid ${peak.sepOk ? "debug-ok" : "debug-fail"}">recent best: ${sepLine(peak)}</div>
+       <div class="debug-small">that frame's other checks — ${otherChecks(peak)}</div>`;
+
+  const stateHtml = `<div class="debug-small">state: ${freezeState.kind}${debugInfo ? " · " + otherChecks(debugInfo) : ""}</div>`;
+
+  debugEl.innerHTML = liveHtml + bestHtml + stateHtml;
 }
 
 function renderLoop() {
@@ -443,24 +470,61 @@ function selfTest() {
     for (const i in overrides) lm[i] = { ...lm[i], ...overrides[i] };
     return lm;
   };
-  // Shared skeleton scale: shoulder-to-hip torso length of 0.3, bow arm dead straight.
+  // Shared skeleton scale: shoulder-to-hip torso length of 0.3.
   const base = {
     9: { x: 0.5, y: 0.3 }, // mouth L
     10: { x: 0.5, y: 0.3 }, // mouth R
     11: { x: 0.3, y: 0.3 }, // bow (left) shoulder
     12: { x: 0.5, y: 0.3 }, // draw (right) shoulder
-    13: { x: 0.15, y: 0.3 }, // bow elbow
+    13: { x: 0.15, y: 0.3 }, // bow elbow — collinear with shoulder(0.3) and bow wrist(0.0) used by the "drawn"/"drifted"/mid-draw fixtures below: 180°, a genuinely straight arm
     23: { x: 0.3, y: 0.6 }, // bow hip
     24: { x: 0.5, y: 0.6 }, // draw hip
   };
 
+  // --- Raise: bow arm straight, hands together up near the face. Must be rejected, and
+  // rejected BY HAND SEPARATION SPECIFICALLY — not as a side effect of some other condition
+  // also (accidentally) failing, which is exactly what let the original bug through: that
+  // fixture's elbow was on the wrong side of the shoulder/wrist line, measuring 0° (folded)
+  // instead of 180° (straight), so it was "rejected" by armOk failing instead, for real full
+  // draw's actual bow arm angle, not the raise's.
   lastDrawWrist = null;
-  const raise = mkLandmarks({ ...base, 15: { x: 0.48, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
+  const raise = mkLandmarks({
+    ...base,
+    13: { x: 0.41, y: 0.3 }, // bow elbow, positioned so shoulder(0.30)-elbow(0.41)-wrist(0.52) are collinear
+    15: { x: 0.52, y: 0.3 }, // bow wrist
+    16: { x: 0.52, y: 0.31 }, // draw wrist, right next to the bow wrist — hands together
+  });
+  const raiseArmAngle = angleAt(raise[L_SHOULDER], raise[L_ELBOW], raise[L_WRIST]);
   console.assert(
-    isAtFullDraw(raise, 0) === false,
-    "raise (hands together, bow arm straight) must not read as full draw"
+    Math.abs(raiseArmAngle - 180) < 0.01,
+    "raise fixture's bow arm must actually measure as ~180° (straight), or this isn't testing the raise at all"
+  );
+  const raiseScale = torsoLength(raise, R_SHOULDER, R_HIP);
+  const raiseAnchor = {
+    x: (raise[MOUTH_L].x + raise[MOUTH_R].x) / 2,
+    y: (raise[MOUTH_L].y + raise[MOUTH_R].y) / 2,
+  };
+  const raiseAnchorDist =
+    Math.hypot(raise[R_WRIST].x - raiseAnchor.x, raise[R_WRIST].y - raiseAnchor.y) / raiseScale;
+  const raiseHandSep =
+    Math.hypot(raise[R_WRIST].x - raise[L_WRIST].x, raise[R_WRIST].y - raise[L_WRIST].y) / raiseScale;
+  console.assert(
+    raiseAnchorDist <= FULL_DRAW_ANCHOR_MAX,
+    "raise fixture should pass the anchor-proximity check on its own"
+  );
+  console.assert(
+    raiseHandSep < FULL_DRAW_HAND_SEP_MIN,
+    "raise fixture's hands should be too close together to pass hand separation — the one thing meant to reject it"
+  );
+  console.assert(isAtFullDraw(raise, 0) === false, "raise (first frame) must not read as full draw");
+  console.assert(
+    isAtFullDraw(raise, 500) === false,
+    "raise held steady for a second frame (passes stillness too, now) must still be rejected — by hand separation alone"
   );
 
+  // --- Full draw, held: hands apart, near anchor, bow arm straight. Rejected on the first
+  // frame only because there's no prior position yet to judge stillness from; reads true once
+  // it's held for a frame.
   lastDrawWrist = null;
   const drawn = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
   console.assert(
@@ -471,6 +535,39 @@ function selfTest() {
     isAtFullDraw(drawn, 500) === true,
     "same position 500ms later (zero speed) should read as full draw"
   );
+
+  // --- Drawing in progress: hands already apart and already near anchor (so anchor, arm, and
+  // separation would all pass) but the draw wrist is still travelling fast between frames —
+  // must be rejected by stillness alone, not because it never got close enough.
+  lastDrawWrist = null;
+  const midDraw1 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.4, y: 0.31 } });
+  isAtFullDraw(midDraw1, 0); // seeds lastDrawWrist; this call's own result isn't the point
+  const midDraw2 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.5, y: 0.32 } });
+  const midScale = torsoLength(midDraw2, R_SHOULDER, R_HIP);
+  const midAnchor = {
+    x: (midDraw2[MOUTH_L].x + midDraw2[MOUTH_R].x) / 2,
+    y: (midDraw2[MOUTH_L].y + midDraw2[MOUTH_R].y) / 2,
+  };
+  const midAnchorDist =
+    Math.hypot(midDraw2[R_WRIST].x - midAnchor.x, midDraw2[R_WRIST].y - midAnchor.y) / midScale;
+  const midHandSep =
+    Math.hypot(midDraw2[R_WRIST].x - midDraw2[L_WRIST].x, midDraw2[R_WRIST].y - midDraw2[L_WRIST].y) / midScale;
+  console.assert(midAnchorDist <= FULL_DRAW_ANCHOR_MAX, "mid-draw fixture should pass the anchor check on its own");
+  console.assert(
+    midHandSep >= FULL_DRAW_HAND_SEP_MIN,
+    "mid-draw fixture's hands should already be far enough apart on their own"
+  );
+  console.assert(
+    isAtFullDraw(midDraw2, 50) === false,
+    "wrist still travelling fast toward anchor (50ms, big jump) must not read as full draw yet — only stillness should be stopping it"
+  );
+
+  // --- Fast jump while otherwise at full draw: same idea as mid-draw above, kept as its own
+  // check because it's the scenario closest to what a real archer's hand does in the instant
+  // right before it settles at anchor.
+  lastDrawWrist = null;
+  const driftSeed = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
+  isAtFullDraw(driftSeed, 500); // seeds lastDrawWrist at the same position/time as `drawn` above
   const drifted = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.6, y: 0.31 } });
   console.assert(
     isAtFullDraw(drifted, 600) === false,
