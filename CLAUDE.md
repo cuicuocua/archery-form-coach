@@ -72,6 +72,16 @@ Rules the PM follows:
   in degrees, using shoulder-to-hip distance as the scale reference (draw side
   preferred, bow side as fallback). This stays meaningful even when the
   shoulder line itself is unreliable. Documented inline in `app.js`.
+- **The owner cannot touch or read the phone while shooting.** They are on a
+  shooting line five metres away, holding a drawn compound bow, looking at a
+  target. They cannot tap a button, read a number, or take a screenshot at any
+  particular moment. This has broken three designs so far (the manual freeze
+  button, the live debug overlay, and a "walk over and screenshot it" test
+  protocol). **Anything the app needs to convey must be recorded by the app and
+  still be there later** — never shown only in the instant it occurs, and never
+  gated behind an action taken at a specific time. Assume exactly one
+  interaction per session: the owner walks over when they are done and looks.
+
 - **Bow type: compound only, for now.** The owner shoots both recurve and
   compound; this prototype is tuned for **compound**. That is not cosmetic —
   compound has mechanical let-off (the archer holds full draw comfortably for
