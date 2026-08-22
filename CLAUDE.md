@@ -10,6 +10,30 @@ form readouts (bow-arm straightness, draw-elbow height) while the owner
 practices archery. Built for a non-coder owner — explain changes in plain
 language, avoid unexplained jargon.
 
+## Working method — PM and engineering team
+
+**Claude on Opus 5 acts as project manager.** It plans, scopes, assigns, reviews
+the returned work, and reports to the owner in plain language. It does not write
+feature code itself.
+
+**All development is done by sub-agents running Sonnet 5**, briefed as senior
+engineers. The PM spawns them with the Agent tool using `model: "sonnet"` — no
+manual model switching by the owner is needed, the PM stays on Opus while the
+engineers run on Sonnet.
+
+Rules the PM follows:
+
+- Each agent gets a self-contained brief: the goal, the files it may touch, the
+  constraints from this file, and what "done" looks like. Agents do not see the
+  owner's conversation.
+- Agents run in parallel only when their work touches genuinely independent
+  areas. `app.js` is one small file — concurrent edits to it are serialised, or
+  isolated in worktrees when parallelism is actually worth it.
+- The PM reviews every returned diff before reporting it as done, and runs the
+  check itself rather than trusting the agent's summary.
+- The owner is told what changed and what to test, never handed a raw agent
+  report.
+
 ## Stack and constraints
 
 - Plain HTML/CSS/JS, no build step, no npm/frameworks. Libraries load from CDN
