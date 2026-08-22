@@ -26,6 +26,16 @@ const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation m
 const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
 const FULL_DRAW_HOLD_MS = 900; // must stay at full draw this long before we freeze. Compound let-off means the archer can comfortably hold for several seconds, so there's room to be generous here without risking a missed shot — 900ms firmly rules out passing through on the way up
 const AUTO_FREEZE_HOLD_MS = 4000; // how long an automatic freeze holds the frame before releasing itself
+
+// Shot log display-only cutoffs — NOT form targets like the numbers above. These decide when a
+// shot's own DEVIATION FROM THE OWNER'S OWN SESSION AVERAGE (see summarizeShots) gets coloured
+// as "close to your average" vs "worth a look", nothing more. No coaching authority behind
+// them either — picked as a plausible slice of a normal end's natural wobble — but unlike the
+// block above, there's no "correct" value to eventually replace them with: they only ever judge
+// a shot against the owner's own numbers, so tune by eye once there's a real session to look at.
+const BOW_ARM_CONSISTENCY_MAX_DEVIATION = 3; // degrees from this session's average bow-arm angle
+const SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION = 8; // percentage points from this session's average
+const ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION = 4; // degrees from this session's average
 // ===========================================================================
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
@@ -282,7 +292,14 @@ function drawElbowAlignmentOf(landmarks) {
   // Image y grows downward: a smaller actual y than expected means the elbow sits higher.
   const direction = elbow.y < expectedY ? "high" : elbow.y > expectedY ? "low" : "level";
 
-  return { deviation, direction };
+  // Signed version of the same reading, for averaging (see summarizeShots below) — deviation +
+  // direction on its own can't be averaged honestly, since "8 high" and "8 low" would both look
+  // like +8 and cancel out into a fake "consistent" reading. High is positive, low is negative
+  // (arbitrary choice, kept consistent everywhere this value is used); the plain deviation +
+  // direction text above is untouched, so the live readout keeps reading e.g. "6° high".
+  const signed = direction === "high" ? deviation : direction === "low" ? -deviation : 0;
+
+  return { deviation, direction, signed };
 }
 
 function updateDrawElbowReadout(landmarks) {
@@ -411,32 +428,160 @@ function logShot(entry) {
   renderShotLog();
 }
 
+// One measure's stats across the shot log: the owner's own average, their spread (best-to-worst
+// gap — the number that matters most, since every target range in this file is a desk guess but
+// "did I repeat myself" needs no calibration at all, see CLAUDE.md), and each shot's deviation
+// from that average. `getValue(entry)` pulls the one number this measure cares about (or
+// null/undefined if that shot's landmark was below MIN_VISIBILITY) — those get excluded from
+// the average, not silently treated as zero. Pure: no DOM, no MediaPipe, just arrays — so
+// selfTest can check it directly.
+function summarizeMeasure(entries, getValue) {
+  const total = entries.length;
+  const points = entries
+    .map((e) => ({ shotNum: e.shotNum, value: getValue(e) }))
+    .filter((p) => p.value != null);
+  const n = points.length;
+
+  // Fewer than two readings: there's nothing to spread across and no baseline worth deviating
+  // from (a single point's "average" just equals itself). Report the plain average when there
+  // is exactly one reading — it's still true — but no spread and no deviations, rather than
+  // faking a "+0" or dividing by zero.
+  if (n < 2) {
+    return { n, total, average: n === 1 ? points[0].value : null, spread: null, deviations: {}, outlierShotNum: null };
+  }
+
+  const values = points.map((p) => p.value);
+  const average = values.reduce((sum, v) => sum + v, 0) / n;
+  const spread = Math.max(...values) - Math.min(...values);
+
+  const deviations = {};
+  let outlierShotNum = null;
+  let worstAbsDev = -1;
+  for (const p of points) {
+    const dev = p.value - average;
+    deviations[p.shotNum] = dev;
+    if (Math.abs(dev) > worstAbsDev) {
+      worstAbsDev = Math.abs(dev);
+      outlierShotNum = p.shotNum;
+    }
+  }
+  return { n, total, average, spread, deviations, outlierShotNum };
+}
+
+// The shot log's stats for all four numbers it tracks, in one call. Pure, same reason as above.
+function summarizeShots(entries) {
+  return {
+    bowArm: summarizeMeasure(entries, (e) => e.bowArmAngle),
+    shoulderBow: summarizeMeasure(entries, (e) => e.shoulderDrop?.bow ?? null),
+    shoulderDraw: summarizeMeasure(entries, (e) => e.shoulderDrop?.draw ?? null),
+    elbow: summarizeMeasure(entries, (e) => e.elbowAlign?.signed ?? null),
+  };
+}
+
+// Plain degrees, e.g. "168". Default average formatter for summaryLine below.
+function fmtSignedDeg(v) {
+  const r = Math.round(v);
+  return r === 0 ? "in line" : `${Math.abs(r)}° ${r > 0 ? "high" : "low"}`;
+}
+
+// The one-line, plain-language summary for one measure, shown at the top of the log. Leads with
+// the owner's own average and spread — nothing here is judged against a placeholder threshold —
+// and says plainly when a reading is missing rather than quietly averaging over a smaller
+// sample than the shot count suggests. `formatAvg` lets the elbow measure (signed, direction
+// based) reuse this instead of duplicating the sentence structure.
+function summaryLine(label, unit, s, formatAvg = (v) => `${Math.round(v)}${unit}`) {
+  if (s.n === 0) return `${label} — no readable shots yet.`;
+  const missing = s.n < s.total ? ` (based on ${s.n} of ${s.total} shots)` : "";
+  const body =
+    s.n === 1
+      ? `${label} — only one shot so far, ${formatAvg(s.average)}, not enough yet to see how consistent you are`
+      : `${label} — you averaged ${formatAvg(s.average)}, varying by ${Math.round(s.spread)}${unit}`;
+  return `${body}${missing}.`;
+}
+
+// One shot's number rendered as "raw value (signed deviation)" — bare, no repeated "vs your
+// average" text (that's said ONCE, under the summary block — see renderShotLog; saying it once
+// per row on four different numbers was an unreadable wall of text on a phone screen). Coloured
+// using the SAME ok/warn classes and --green/--amber variables the live readouts already use
+// (see style.css). Falls back to the plain number, uncoloured, when there's no baseline yet
+// (fewer than two readings) or this shot's own reading was uncertain (shown as "not measured",
+// not a bare dash that reads like a typo mid-sentence).
+//
+// Returns { html, flagged } rather than just HTML: `flagged` says whether THIS shot is both the
+// session's worst reading for this measure AND actually outside the display cutoff — the second
+// half matters because summarizeMeasure always names an outlierShotNum once there are 2+
+// readings ("someone is always the maximum"), even when every shot in a tight cluster is
+// basically identical. Without the cutoff check, a shot 0.5 percentage points from its own
+// average could get marked "most different" right next to text saying it's right on average —
+// a real bug this replaced. renderShotRow uses `flagged` to show at most one outlier mark for
+// the whole row, not one per measure.
+function shotValueHtml(rawText, value, unit, shotNum, stats, maxDeviation) {
+  if (value == null) return { html: `<span class="value uncertain">not measured</span>`, flagged: false };
+  if (!(shotNum in stats.deviations)) return { html: `<span class="value">${rawText}</span>`, flagged: false };
+  const dev = stats.deviations[shotNum];
+  const rounded = Math.round(dev);
+  const devText = rounded > 0 ? `+${rounded}` : `${rounded}`;
+  const ok = Math.abs(dev) <= maxDeviation;
+  const flagged = !ok && stats.outlierShotNum === shotNum;
+  return { html: `<span class="value ${ok ? "ok" : "warn"}">${rawText} (${devText})</span>`, flagged };
+}
+
+function renderShotRow(e, stats) {
+  const armText = e.bowArmAngle == null ? "—" : `${Math.round(e.bowArmAngle)}°`;
+  const arm = shotValueHtml(armText, e.bowArmAngle, "°", e.shotNum, stats.bowArm, BOW_ARM_CONSISTENCY_MAX_DEVIATION);
+
+  const bowDrop = e.shoulderDrop?.bow ?? null;
+  const bowText = bowDrop == null ? "—" : `${Math.round(bowDrop)}%`;
+  const bow = shotValueHtml(bowText, bowDrop, "%", e.shotNum, stats.shoulderBow, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
+
+  const drawDrop = e.shoulderDrop?.draw ?? null;
+  const drawText = drawDrop == null ? "—" : `${Math.round(drawDrop)}%`;
+  const draw = shotValueHtml(drawText, drawDrop, "%", e.shotNum, stats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
+
+  const elbowText = !e.elbowAlign
+    ? "—"
+    : Math.round(e.elbowAlign.deviation) === 0
+      ? "in line"
+      : `${Math.round(e.elbowAlign.deviation)}° ${e.elbowAlign.direction}`;
+  const elbow = shotValueHtml(elbowText, e.elbowAlign?.signed ?? null, "°", e.shotNum, stats.elbow, ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION);
+
+  const froze = e.froze ? "auto-froze" : "no freeze";
+  // At most one outlier mark for the whole row (not one per measure, per the brief) — the reader
+  // already knows from the summary note what a ⚠ means, so a bare mark next to the shot number
+  // is enough.
+  const outlierMark = [arm, bow, draw, elbow].some((v) => v.flagged) ? " ⚠" : "";
+  const debugBit = DEBUG
+    ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
+    : "";
+  return `<div class="shotlog-row">Shot ${e.shotNum}${outlierMark} · ${froze}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div>`;
+}
+
 // Plain-language shot log — this is what the owner actually reads, standing at the phone after
 // their end, not mid-shot, so it can be a normal-sized list rather than the big blunt ?debug
-// overlay. Extra per-shot detail (hand separation, the four trigger checks) only shows up when
-// ?debug is on; without it, this is just shot number / two form readouts / did it freeze.
+// overlay. A summary block (own average + own spread, per measure) sits above the per-shot
+// rows; a single note under it explains what the parenthesized numbers in every row below mean,
+// so the rows themselves can stay compact — bare signed numbers, no repeated phrase. Extra
+// per-shot detail (hand separation, the four trigger checks) only shows up when ?debug is on.
 function renderShotLog() {
   if (log.length === 0) {
     shotLogEl.innerHTML = `<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
-  const pct = (v) => (v == null ? "—" : `${Math.round(v)}%`);
-  shotLogEl.innerHTML = log
-    .map((e) => {
-      const arm = e.bowArmAngle == null ? "—" : `${Math.round(e.bowArmAngle)}°`;
-      const shoulders = e.shoulderDrop ? `bow ${pct(e.shoulderDrop.bow)} / draw ${pct(e.shoulderDrop.draw)}` : "—";
-      const elbow = !e.elbowAlign
-        ? "—"
-        : Math.round(e.elbowAlign.deviation) === 0
-          ? "in line"
-          : `${Math.round(e.elbowAlign.deviation)}° ${e.elbowAlign.direction}`;
-      const froze = e.froze ? "auto-froze" : "no freeze";
-      const debugBit = DEBUG
-        ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
-        : "";
-      return `<div class="shotlog-row">Shot ${e.shotNum} — bow arm ${arm}, shoulders ${shoulders}, elbow ${elbow} — ${froze}${debugBit}</div>`;
-    })
+
+  const stats = summarizeShots(log);
+  const summaryLines = [
+    summaryLine("Bow arm", "°", stats.bowArm),
+    summaryLine("Bow shoulder", "%", stats.shoulderBow),
+    summaryLine("Draw shoulder", "%", stats.shoulderDraw),
+    summaryLine("Elbow", "°", stats.elbow, fmtSignedDeg),
+  ]
+    .map((line) => `<div class="shotlog-summary-row">${line}</div>`)
     .join("");
+  const note = `<div class="shotlog-summary-note">Numbers in parentheses below = that shot vs your session average above.</div>`;
+
+  const rowsHtml = log.map((e) => renderShotRow(e, stats)).join("");
+
+  shotLogEl.innerHTML = `<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
 }
 
 // Pure state-machine transition for the auto-freeze logic — no DOM, no MediaPipe, easy to
@@ -935,6 +1080,111 @@ function selfTest() {
     drawElbowAlignmentOf(vertical) === null,
     "a near-vertical bow-wrist -> draw-wrist line can't tell high from low, so this should be uncertain (null), not a guess"
   );
+
+  // --- Feature C: signed elbow deviation (high = positive, low = negative), so the shot log
+  // summary can average it honestly instead of "8 high" and "8 low" cancelling out to ~0.
+  console.assert(Math.abs(inLineResult.signed) < 0.01, "elbow dead in line should have ~0 signed deviation");
+  console.assert(highRHResult.signed > 0, "a high elbow should have a positive signed deviation");
+  console.assert(lowRHResult.signed < 0, "a low elbow should have a negative signed deviation");
+  console.assert(
+    Math.abs(highRHResult.signed - highRHResult.deviation) < 0.01,
+    "signed deviation should equal the plain deviation magnitude when the direction is high"
+  );
+  console.assert(
+    Math.abs(lowRHResult.signed + lowRHResult.deviation) < 0.01,
+    "signed deviation should be the negative of the plain deviation magnitude when the direction is low"
+  );
+
+  // --- Feature D: summarizeShots — pure stats over the shot log (own average, own spread, each
+  // shot's deviation from that average). No DOM, no module state, so plain fixture arrays are
+  // enough; nothing here needs the save/restore dance the fixtures above use.
+  const statFixture = [
+    { shotNum: 1, bowArmAngle: 160, shoulderDrop: { bow: 40, draw: 50 }, elbowAlign: { signed: 2 } },
+    { shotNum: 2, bowArmAngle: 170, shoulderDrop: { bow: 44, draw: null }, elbowAlign: { signed: -2 } },
+    { shotNum: 3, bowArmAngle: null, shoulderDrop: { bow: 42, draw: 48 }, elbowAlign: null },
+  ];
+  const statResult = summarizeShots(statFixture);
+  console.assert(
+    statResult.bowArm.n === 2 && statResult.bowArm.total === 3,
+    "bow arm average should count only the 2 non-null readings, out of 3 total attempts"
+  );
+  console.assert(Math.abs(statResult.bowArm.average - 165) < 0.001, "average of 160 and 170 should be 165");
+  console.assert(Math.abs(statResult.bowArm.spread - 10) < 0.001, "spread should be the 10° gap between 160 and 170");
+  console.assert(
+    statResult.bowArm.deviations[1] === -5 && statResult.bowArm.deviations[2] === 5,
+    "each shot's deviation should be its own value minus the average, signed"
+  );
+  console.assert(
+    statResult.shoulderDraw.n === 2 && statResult.shoulderDraw.total === 3,
+    "draw-shoulder average should exclude shot 2's null reading but still count 3 total attempts, not 2"
+  );
+
+  // Outlier picking: the shot furthest from the average, not just the first or last one.
+  const outlierFixture = [
+    { shotNum: 1, bowArmAngle: 160 },
+    { shotNum: 2, bowArmAngle: 170 },
+    { shotNum: 3, bowArmAngle: 168 },
+  ];
+  const outlierResult = summarizeShots(outlierFixture);
+  console.assert(
+    outlierResult.bowArm.outlierShotNum === 1,
+    "shot 1 (160, furthest from the 166 average) should be flagged as the outlier, not shots 2 or 3"
+  );
+
+  // Thin samples must not throw, and must not fake a spread or a "+0" deviation.
+  const oneShotResult = summarizeShots([
+    { shotNum: 1, bowArmAngle: 170, shoulderDrop: { bow: null, draw: null }, elbowAlign: null },
+  ]);
+  console.assert(
+    oneShotResult.bowArm.n === 1 && oneShotResult.bowArm.average === 170,
+    "a single reading should still report a plain average"
+  );
+  console.assert(oneShotResult.bowArm.spread === null, "a single reading has no spread to report");
+  console.assert(
+    Object.keys(oneShotResult.bowArm.deviations).length === 0,
+    "a single reading has no baseline to deviate from — must not fake a +0 deviation"
+  );
+  console.assert(oneShotResult.bowArm.outlierShotNum === null, "a single reading can't have an outlier");
+
+  const emptyResult = summarizeShots([]);
+  console.assert(
+    emptyResult.bowArm.n === 0 && emptyResult.bowArm.total === 0 && emptyResult.bowArm.average === null,
+    "an empty log must not throw, and must report nothing rather than a fake 0"
+  );
+
+  // --- Outlier gating: summarizeMeasure always names an outlierShotNum once n >= 2 (someone is
+  // always the maximum), but shotValueHtml must only actually FLAG it when that shot's own
+  // deviation exceeds the measure's display cutoff. This is the exact field bug: draw-shoulder
+  // read 41% and 42% (half a point apart, well inside the ±8pp cutoff) and still showed "most
+  // different this session" right next to "right on your average" — a self-contradiction.
+  const tightFixture = [
+    { shotNum: 1, shoulderDrop: { draw: 41 } },
+    { shotNum: 2, shoulderDrop: { draw: 42 } },
+  ];
+  const tightStats = summarizeShots(tightFixture);
+  console.assert(
+    tightStats.shoulderDraw.outlierShotNum !== null,
+    "sanity check: the pure function should still name a max-deviation shot even in a tight cluster"
+  );
+  const tightShot1 = shotValueHtml("41%", 41, "%", 1, tightStats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
+  const tightShot2 = shotValueHtml("42%", 42, "%", 2, tightStats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
+  console.assert(
+    tightShot1.flagged === false && tightShot2.flagged === false,
+    "a tight cluster, all readings well inside the display cutoff, must not flag anything as an outlier"
+  );
+
+  // Mirror case: a reading that genuinely exceeds the cutoff must still be flagged. Three
+  // points, deliberately NOT symmetric — a two-point spread ties on |deviation| for both shots,
+  // and the tie-break in summarizeMeasure (first one wins) would make this pass or fail
+  // depending on which shotNum happens to go first, which isn't what's being tested here.
+  const spreadFixture = [
+    { shotNum: 1, shoulderDrop: { draw: 40 } },
+    { shotNum: 2, shoulderDrop: { draw: 42 } },
+    { shotNum: 3, shoulderDrop: { draw: 65 } }, // average 49, so shot 3 is +16, unambiguously furthest
+  ];
+  const spreadStats = summarizeShots(spreadFixture);
+  const spreadShot3 = shotValueHtml("65%", 65, "%", 3, spreadStats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
+  console.assert(spreadShot3.flagged === true, "a reading that genuinely exceeds the display cutoff should still be flagged");
 
   rightHanded = savedHanded;
   lastDrawWrist = savedLastWrist;
