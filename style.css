@@ -117,33 +117,76 @@ html, body {
 #debug .debug-ok { color: var(--green); }
 #debug .debug-fail { color: var(--amber); }
 
+/* Shot log: hidden until the owner taps Log. There is no reason to protect the live camera
+   view from this one — reading it only happens standing still at the phone after an end, which
+   is exactly the moment #debug above is designed NOT to require. Covers most of the screen on
+   purpose; a normal readable list, not the big blunt ?debug overlay. */
+#shotlog {
+  position: absolute;
+  inset: 40px 12px;
+  z-index: 10;
+  background: rgba(10, 10, 10, 0.92);
+  color: #fff;
+  border-radius: 16px;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+#shotlog.hidden {
+  display: none;
+}
+
+#shotlog .shotlog-row {
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+#shotlog .shotlog-row:last-child {
+  border-bottom: none;
+}
+
+#shotlog .shotlog-debug {
+  display: block;
+  font-size: 12px;
+  opacity: 0.65;
+  margin-top: 2px;
+}
+
+#shotlog .shotlog-empty {
+  opacity: 0.7;
+  font-size: 15px;
+}
+
 #readouts {
   position: absolute;
   top: calc(env(safe-area-inset-top, 12px) + 12px);
-  left: 12px;
-  right: 12px;
+  left: 8px;
+  right: 8px;
   display: flex;
-  gap: 10px;
+  gap: 6px;
   z-index: 5;
 }
 
 .readout {
   flex: 1;
+  min-width: 0; /* let three panels actually shrink to fit instead of overflowing the row */
   background: var(--panel-bg);
   border-radius: 16px;
-  padding: 10px 14px;
+  padding: 8px 6px;
   color: #fff;
   text-align: center;
 }
 
 .readout .label {
-  font-size: 13px;
+  font-size: 12px;
   opacity: 0.8;
   margin-bottom: 4px;
 }
 
 .readout .value {
-  font-size: 30px;
+  font-size: 24px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
@@ -151,6 +194,35 @@ html, body {
 .readout.ok .value { color: var(--green); }
 .readout.warn .value { color: var(--amber); }
 .readout.uncertain .value { color: var(--grey); }
+
+/* Shoulder-drop panel: two independent numbers (bow/draw) side by side in one readout, each
+   with its own ok/warn/uncertain colour — see setValueState, which classes these value spans
+   directly instead of the shared outer .readout panel that setReadout uses for the others. */
+.shoulder-pair {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.shoulder-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.shoulder-side .side-label {
+  font-size: 10px;
+  opacity: 0.7;
+  margin-bottom: 2px;
+}
+
+.shoulder-side .value {
+  font-size: 19px;
+}
+
+.value.ok { color: var(--green); }
+.value.warn { color: var(--amber); }
+.value.uncertain { color: var(--grey); }
 
 #controls {
   position: absolute;

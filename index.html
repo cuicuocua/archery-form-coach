@@ -13,14 +13,28 @@
 
     <div id="status">Starting camera…</div>
     <div id="debug" class="hidden"></div>
+    <div id="shotlog" class="hidden"></div>
 
     <div id="readouts">
       <div class="readout" id="readout-bowarm">
         <div class="label">Bow-arm line</div>
         <div class="value" id="value-bowarm">—</div>
       </div>
+      <div class="readout" id="readout-shoulders">
+        <div class="label">Shoulder drop</div>
+        <div class="shoulder-pair">
+          <div class="shoulder-side">
+            <span class="side-label">Bow</span>
+            <span class="value" id="value-shoulder-bow">—</span>
+          </div>
+          <div class="shoulder-side">
+            <span class="side-label">Draw</span>
+            <span class="value" id="value-shoulder-draw">—</span>
+          </div>
+        </div>
+      </div>
       <div class="readout" id="readout-elbow">
-        <div class="label">Draw-elbow height</div>
+        <div class="label">Elbow ↔ arrow line</div>
         <div class="value" id="value-elbow">—</div>
       </div>
     </div>
@@ -29,6 +43,7 @@
       <button id="btn-camera" title="Switch camera">🔄 Camera</button>
       <button id="btn-hand" title="Switch handedness">🎯 Right-handed</button>
       <button id="btn-freeze" title="Freeze frame">⏸ Freeze</button>
+      <button id="btn-log" title="Shot log">📋 Log</button>
     </div>
   </div>
 

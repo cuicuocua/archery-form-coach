@@ -8,10 +8,12 @@ import {
 const BOW_ARM_ANGLE_MIN = 165; // degrees at the bow elbow; 180 = perfectly straight
 const BOW_ARM_ANGLE_MAX = 180;
 
-const DRAW_ELBOW_HEIGHT_MIN = -5; // degrees; 0 = level with shoulder line, + = above
-const DRAW_ELBOW_HEIGHT_MAX = 15;
-
 const MIN_VISIBILITY = 0.6; // MediaPipe's 0–1 confidence per joint; below this we show "uncertain"
+
+// Placeholders, compound-specific like the rest of this block — owner will tune these with a
+// coach once there's real footage to compare against.
+const SHOULDER_DROP_MIN_PCT = 45; // % of torso length; each shoulder's ear-to-shoulder gap must be at least this to count as "dropped" rather than "shrugged". Rough anatomy puts a relaxed adult around 45-50% and a shrugged one nearer 40%, so this sits at the boundary — but it is a desk estimate, not a measurement. Replace it with real numbers off the shot log after one session: shoot a few deliberately shrugged and a few deliberately dropped, and put this between the two clusters
+const DRAW_ELBOW_ALIGN_MAX_DEVIATION = 8; // degrees the draw elbow may sit off the bow-wrist-to-draw-wrist line (extended backwards), either high or low, and still count as "in line" with the arrow
 
 // These five are tuned for COMPOUND shooting (mechanical release aid, let-off held at full
 // draw) — if the owner starts shooting recurve with this, expect to revisit all five, since a
@@ -20,13 +22,13 @@ const MIN_VISIBILITY = 0.6; // MediaPipe's 0–1 confidence per joint; below thi
 const FULL_DRAW_ANCHOR_MAX = 0.45; // draw-hand wrist must be this close to the mouth/nose, as a fraction of torso length, to count as "at anchor" — looser than you might expect because a release aid sits the hand further back near the jaw than fingers under the chin would; hand separation (below) does the real discriminating, this just filters out the grossly wrong
 const FULL_DRAW_BOW_ARM_MIN = 150; // degrees; bow arm must be at least this straight to count as "drawn" (looser than the good-form target above — a freeze should still fire on so-so form)
 const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. THE key signal: a compound's draw length is fixed by a mechanical stop, so this is near-binary (mid-raise vs. hard against the wall) and can be set with confidence
+const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one
 const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
 const FULL_DRAW_HOLD_MS = 900; // must stay at full draw this long before we freeze. Compound let-off means the archer can comfortably hold for several seconds, so there's room to be generous here without risking a missed shot — 900ms firmly rules out passing through on the way up
 const AUTO_FREEZE_HOLD_MS = 4000; // how long an automatic freeze holds the frame before releasing itself
 // ===========================================================================
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
-const DEBUG_PEAK_WINDOW_MS = 30000; // ?debug overlay only: how long "recent best" keeps its reading before a fresh one can take over. Long enough to lower the bow and walk 5m over to look — at this length it's really "best of the last shot or two", not strictly this one, which is fine for calibration
 
 // MediaPipe pose landmark indices (33-point model)
 const L_SHOULDER = 11, R_SHOULDER = 12;
@@ -34,6 +36,7 @@ const L_ELBOW = 13, R_ELBOW = 14;
 const L_WRIST = 15, R_WRIST = 16;
 const L_HIP = 23, R_HIP = 24;
 const NOSE = 0, MOUTH_L = 9, MOUTH_R = 10;
+const L_EAR = 7, R_EAR = 8;
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("overlay");
@@ -44,10 +47,14 @@ const btnHand = document.getElementById("btn-hand");
 const btnFreeze = document.getElementById("btn-freeze");
 const readoutBowArm = document.getElementById("readout-bowarm");
 const valueBowArm = document.getElementById("value-bowarm");
+const valueShoulderBow = document.getElementById("value-shoulder-bow");
+const valueShoulderDraw = document.getElementById("value-shoulder-draw");
 const readoutElbow = document.getElementById("readout-elbow");
 const valueElbow = document.getElementById("value-elbow");
 const debugEl = document.getElementById("debug");
 if (DEBUG) debugEl.classList.remove("hidden");
+const btnLog = document.getElementById("btn-log");
+const shotLogEl = document.getElementById("shotlog");
 
 let poseLandmarker = null;
 let stream = null;
@@ -72,12 +79,16 @@ let lastDrawWrist = null;
 // (isAtFullDraw isn't called then) it simply keeps showing the frame that triggered the freeze.
 let debugInfo = null;
 
-// The single best (highest hand-separation) frame seen in the last DEBUG_PEAK_WINDOW_MS,
-// snapshotted whole so all four numbers on it come from the same instant — "recent best" in
-// the ?debug overlay (not "this shot": the window is long enough to span more than one shot).
-// Never cleared by a missing pose or a freeze, only by time or a better frame, so it survives
-// exactly the moments (frozen, bow lowered, walking over to look) where the live numbers don't.
-let peak = null;
+// Shot log: a persistent record the owner can check after they've finished shooting, because
+// they cannot read the screen or tap anything while actually on the line (see CLAUDE.md). One
+// row per draw attempt — the best (highest hand-separation) frame seen during it, whether or
+// not it went on to trigger a freeze — kept until the page reloads. No timer anywhere in this:
+// entries never expire or get overwritten just because time passed, only because a newer
+// attempt bumps an old one out of the last SHOT_LOG_MAX.
+const SHOT_LOG_MAX = 10;
+let shotCount = 0; // total attempts this session, keeps counting even once the log above fills up
+let log = []; // newest first
+let attempt = null; // the attempt currently in progress, if any — see trackShotAttempt below
 
 function isFrozen(state) {
   return state.kind === "frozen" || state.kind === "manual";
@@ -140,16 +151,27 @@ function setReadout(readoutEl, valueEl, text, state) {
   readoutEl.classList.add(state);
 }
 
-function updateBowArmReadout(landmarks) {
+// Like setReadout, but classes the value span itself rather than its containing panel — used
+// for the shoulder-drop readout, which reports two independent numbers (bow/draw) in one panel
+// and so needs two independent ok/warn/uncertain states rather than one shared by the panel.
+function setValueState(valueEl, text, state) {
+  valueEl.textContent = text;
+  valueEl.classList.remove("ok", "warn", "uncertain");
+  valueEl.classList.add(state);
+}
+
+// Bow-arm angle as a plain number (or null if we can't tell) — pulled out of the readout
+// function below so the shot log can record the exact same value without duplicating the math.
+function bowArmAngleOf(landmarks) {
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowElbow = rightHanded ? L_ELBOW : R_ELBOW;
   const bowWrist = rightHanded ? L_WRIST : R_WRIST;
+  if (![bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) return null;
+  return angleAt(landmarks[bowShoulder], landmarks[bowElbow], landmarks[bowWrist]);
+}
 
-  if (![bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) {
-    setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
-    return;
-  }
-  const angle = angleAt(landmarks[bowShoulder], landmarks[bowElbow], landmarks[bowWrist]);
+function updateBowArmReadout(landmarks) {
+  const angle = bowArmAngleOf(landmarks);
   if (angle === null) {
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     return;
@@ -165,37 +187,114 @@ function torsoLength(landmarks, shoulderIdx, hipIdx) {
   return Math.hypot(s.x - h.x, s.y - h.y);
 }
 
-function updateDrawElbowReadout(landmarks) {
-  const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
-  const drawElbow = rightHanded ? R_ELBOW : L_ELBOW;
-  const drawHip = rightHanded ? R_HIP : L_HIP;
+// Shoulder drop for one shoulder: the vertical gap between that shoulder and its ear,
+// normalised by torso length and given as a percentage — bigger number = shoulder sits
+// further from the ear = more dropped, which is what "dropping my shoulders more" means.
+// Reported per shoulder (not averaged, see updateShoulderDropReadout below) because the
+// common compound fault is one shoulder — usually the bow shoulder, under load — creeping up
+// while the other stays fine; an average would hide exactly that.
+function shoulderDropOf(landmarks, shoulderIdx, sameEarIdx, otherEarIdx, ownHipIdx, otherShoulderIdx, otherHipIdx) {
+  if (!visible(landmarks, shoulderIdx)) return null;
+
+  // Side-on framing often means the far ear is occluded or low-confidence. Prefer the ear on
+  // the same side as the shoulder being measured, but fall back to the other one — for a
+  // purely vertical gap, which ear supplies the y-coordinate matters far less than having one.
+  const earIdx = visible(landmarks, sameEarIdx) ? sameEarIdx : visible(landmarks, otherEarIdx) ? otherEarIdx : null;
+  if (earIdx === null) return null;
+
+  // Same "own side preferred, other side as fallback" torso-length convention used everywhere
+  // else in this file.
+  const scale = torsoLength(landmarks, shoulderIdx, ownHipIdx) ?? torsoLength(landmarks, otherShoulderIdx, otherHipIdx);
+  if (!scale) return null;
+
+  const shoulder = landmarks[shoulderIdx];
+  const ear = landmarks[earIdx];
+  // Image y grows downward, so the ear normally sits above the shoulder (smaller y). That gap
+  // shrinks as the shoulder shrugs up toward the ear, and grows as it drops away from it.
+  return ((shoulder.y - ear.y) / scale) * 100;
+}
+
+// Both shoulders' drop in one call, so the readout and the shot log stay in sync using exactly
+// the same numbers.
+function shoulderDropSampleOf(landmarks) {
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowHip = rightHanded ? L_HIP : R_HIP;
+  const bowEar = rightHanded ? L_EAR : R_EAR;
+  const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
+  const drawHip = rightHanded ? R_HIP : L_HIP;
+  const drawEar = rightHanded ? R_EAR : L_EAR;
 
-  if (!visible(landmarks, drawShoulder) || !visible(landmarks, drawElbow)) {
-    setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
-    return;
+  return {
+    bow: shoulderDropOf(landmarks, bowShoulder, bowEar, drawEar, bowHip, drawShoulder, drawHip),
+    draw: shoulderDropOf(landmarks, drawShoulder, drawEar, bowEar, drawHip, bowShoulder, bowHip),
+  };
+}
+
+function updateShoulderDropReadout(landmarks) {
+  const { bow, draw } = shoulderDropSampleOf(landmarks);
+  for (const [pct, valueEl] of [[bow, valueShoulderBow], [draw, valueShoulderDraw]]) {
+    if (pct === null) {
+      setValueState(valueEl, "—", "uncertain");
+    } else {
+      setValueState(valueEl, `${Math.round(pct)}%`, pct >= SHOULDER_DROP_MIN_PCT ? "ok" : "warn");
+    }
   }
+}
 
-  // Scale reference: torso length (shoulder-to-hip), draw side preferred, bow side as fallback.
-  // Side-on framing makes the two shoulders nearly overlap in the image, so we use torso
-  // length rather than the shoulder line itself as the "how big is this person" yardstick.
-  const scale =
-    torsoLength(landmarks, drawShoulder, drawHip) ?? torsoLength(landmarks, bowShoulder, bowHip);
-  if (!scale) {
-    setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
-    return;
-  }
+// Draw-elbow alignment (replaces the old draw-elbow-height readout, which measured height off
+// the shoulder — a proxy for the wrong thing). What actually matters: at full draw, bow hand,
+// draw hand and draw elbow should form one straight line, the elbow sitting on the arrow's
+// line extended back past the anchor. So: the angle at the draw wrist between the ray to the
+// bow wrist and the ray to the draw elbow — 180° is perfectly in line.
+//
+// KNOWN LIMITATION: "in line with the arrow" is really three-dimensional. Side-on, the camera
+// can see whether the elbow is too high or too low, but has no way to see whether it's flared
+// out horizontally away from the arrow line — that component is pure depth from this angle.
+// This measures a real and important half of the goal, not the whole thing. Do not mistake it
+// for a complete check, and don't try to reconstruct the missing dimension from a single
+// side-on camera — it isn't there to reconstruct.
+function drawElbowAlignmentOf(landmarks) {
+  const drawWrist = rightHanded ? R_WRIST : L_WRIST;
+  const drawElbow = rightHanded ? R_ELBOW : L_ELBOW;
+  const bowWrist = rightHanded ? L_WRIST : R_WRIST;
 
-  const shoulder = landmarks[drawShoulder];
+  if (![drawWrist, drawElbow, bowWrist].every((i) => visible(landmarks, i))) return null;
+
+  const wrist = landmarks[drawWrist];
   const elbow = landmarks[drawElbow];
-  // Image y grows downward, so a smaller elbow.y (higher on screen) means the elbow is higher.
-  const verticalOffset = shoulder.y - elbow.y;
-  const degrees = (Math.atan2(verticalOffset, scale) * 180) / Math.PI;
+  const bow = landmarks[bowWrist];
 
-  const ok = degrees >= DRAW_ELBOW_HEIGHT_MIN && degrees <= DRAW_ELBOW_HEIGHT_MAX;
-  const sign = degrees >= 0 ? "+" : "";
-  setReadout(readoutElbow, valueElbow, `${sign}${Math.round(degrees)}°`, ok ? "ok" : "warn");
+  const angle = angleAt(bow, wrist, elbow);
+  if (angle === null) return null;
+  const deviation = 180 - angle; // 0 = dead in line with the arrow; bigger = further off, either way
+
+  // Direction (high/low) comes from vertical position ONLY — never from the sign of a cross
+  // product. A cross product's sign flips with the mirrored front camera and with the
+  // handedness toggle, so a fixed "positive = high" rule would silently report high as low for
+  // a left-handed archer, or on the front camera. Vertical position doesn't flip either way.
+  // So: extend the bow-wrist -> draw-wrist line out to the elbow's x, and compare the elbow's
+  // actual height to where that line would put it.
+  const dx = wrist.x - bow.x;
+  if (Math.abs(dx) < 1e-6) return null; // near-vertical line: can't tell high from low this way
+
+  const t = (elbow.x - bow.x) / dx;
+  const expectedY = bow.y + t * (wrist.y - bow.y);
+  // Image y grows downward: a smaller actual y than expected means the elbow sits higher.
+  const direction = elbow.y < expectedY ? "high" : elbow.y > expectedY ? "low" : "level";
+
+  return { deviation, direction };
+}
+
+function updateDrawElbowReadout(landmarks) {
+  const result = drawElbowAlignmentOf(landmarks);
+  if (result === null) {
+    setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
+    return;
+  }
+  const rounded = Math.round(result.deviation);
+  const text = rounded === 0 ? "in line" : `${rounded}° ${result.direction}`;
+  const ok = result.deviation <= DRAW_ELBOW_ALIGN_MAX_DEVIATION;
+  setReadout(readoutElbow, valueElbow, text, ok ? "ok" : "warn");
 }
 
 // The full-draw signal. Four things all have to be true at once:
@@ -244,7 +343,7 @@ function isAtFullDraw(landmarks, nowMs) {
   const anchorDist = Math.hypot(wrist.x - anchor.x, wrist.y - anchor.y) / scale;
   const handSep = Math.hypot(wrist.x - bowWristPos.x, wrist.y - bowWristPos.y) / scale;
 
-  const bowArmAngle = angleAt(landmarks[bowShoulder], landmarks[bowElbow], landmarks[bowWrist]);
+  const bowArmAngle = bowArmAngleOf(landmarks);
   if (bowArmAngle === null) return false;
 
   // Stillness: compare to where the draw wrist was last frame. Speed (distance moved per
@@ -261,18 +360,83 @@ function isAtFullDraw(landmarks, nowMs) {
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
   const stillOk = speed <= FULL_DRAW_STILL_MAX;
 
-  if (DEBUG) {
-    debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
-    // Keep this frame as "recent best" if it beats the current one, or if the current one has
-    // aged out — same one-variable trick as the stillness check above, just for display.
-    // >= (not >) on purpose: if the archer holds steady at their widest separation for a
-    // moment, keep refreshing to that latest frame rather than freezing on the first instant
-    // it was reached — the first instant is often still mid-motion (stillOk still false).
-    const expired = !peak || nowMs - peak.seenAt > DEBUG_PEAK_WINDOW_MS;
-    if (expired || handSep >= peak.handSep) peak = { ...debugInfo, seenAt: nowMs };
-  }
+  if (DEBUG) debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+
+  // Feed the shot log regardless of ?debug — the owner needs shot numbers/form readouts
+  // whether or not the diagnostic overlay is on; only the display of the extra fields below
+  // is debug-gated (see renderShotLog).
+  trackShotAttempt({
+    handSep,
+    bowArmAngle,
+    shoulderDrop: shoulderDropSampleOf(landmarks),
+    elbowAlign: drawElbowAlignmentOf(landmarks),
+    anchorOk,
+    armOk,
+    sepOk,
+    stillOk,
+  });
 
   return anchorOk && armOk && sepOk && stillOk;
+}
+
+// Attempt-boundary rule for the shot log: a draw attempt is "in progress" for as long as hand
+// separation stays at/above DRAW_ATTEMPT_MIN_SEP, tracking whichever frame in it had the
+// highest separation so far. It ends — and gets logged — the moment separation drops back
+// below that floor (hands back together at rest). This is the simplest rule that both (a)
+// doesn't split one long hold into several rows and (b) doesn't merge two separate shots taken
+// back-to-back into one. No timer involved: nothing here expires on its own, ever.
+function trackShotAttempt(sample) {
+  if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
+    if (!attempt || sample.handSep >= attempt.handSep) {
+      attempt = { ...sample, froze: attempt?.froze ?? false };
+    }
+  } else {
+    endAttempt();
+  }
+}
+
+// Ends whatever attempt is in progress (if any) and logs it. Called when hand separation drops
+// back to resting (from trackShotAttempt above) or when the pose is lost entirely mid-attempt
+// (from renderLoop) — either way, whatever was going on has stopped.
+function endAttempt() {
+  if (!attempt) return;
+  logShot(attempt);
+  attempt = null;
+}
+
+function logShot(entry) {
+  shotCount++;
+  log.unshift({ ...entry, shotNum: shotCount });
+  log = log.slice(0, SHOT_LOG_MAX);
+  renderShotLog();
+}
+
+// Plain-language shot log — this is what the owner actually reads, standing at the phone after
+// their end, not mid-shot, so it can be a normal-sized list rather than the big blunt ?debug
+// overlay. Extra per-shot detail (hand separation, the four trigger checks) only shows up when
+// ?debug is on; without it, this is just shot number / two form readouts / did it freeze.
+function renderShotLog() {
+  if (log.length === 0) {
+    shotLogEl.innerHTML = `<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    return;
+  }
+  const pct = (v) => (v == null ? "—" : `${Math.round(v)}%`);
+  shotLogEl.innerHTML = log
+    .map((e) => {
+      const arm = e.bowArmAngle == null ? "—" : `${Math.round(e.bowArmAngle)}°`;
+      const shoulders = e.shoulderDrop ? `bow ${pct(e.shoulderDrop.bow)} / draw ${pct(e.shoulderDrop.draw)}` : "—";
+      const elbow = !e.elbowAlign
+        ? "—"
+        : Math.round(e.elbowAlign.deviation) === 0
+          ? "in line"
+          : `${Math.round(e.elbowAlign.deviation)}° ${e.elbowAlign.direction}`;
+      const froze = e.froze ? "auto-froze" : "no freeze";
+      const debugBit = DEBUG
+        ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
+        : "";
+      return `<div class="shotlog-row">Shot ${e.shotNum} — bow arm ${arm}, shoulders ${shoulders}, elbow ${elbow} — ${froze}${debugBit}</div>`;
+    })
+    .join("");
 }
 
 // Pure state-machine transition for the auto-freeze logic — no DOM, no MediaPipe, easy to
@@ -325,27 +489,20 @@ function syncFreezeUI() {
 // ?debug-only readout of why the auto-freeze trigger is (or isn't) firing. No-op — not even
 // a DOM lookup beyond the one at startup — when ?debug isn't in the URL. Deliberately big and
 // blunt: this has to be readable from ~5 metres away while the owner is mid-shot, not tidy.
-// Hand separation gets top billing because it's the number most likely to need retuning; the
-// "recent best" line is what answers the real open question when the freeze never fires at
-// all — did the hands actually get far enough apart recently, or is something else the problem.
+// Hand separation gets top billing because it's the number most likely to need retuning. This
+// is a LIVE readout only — for anything that has to survive past the instant it happens (which
+// is everything the owner actually needs, per CLAUDE.md), see the shot log instead.
 function syncDebugOverlay() {
   if (!DEBUG) return;
   const otherChecks = (s) => `anchor ${s.anchorOk ? "ok" : "fail"} · arm ${s.armOk ? "ok" : "fail"} · still ${s.stillOk ? "ok" : "fail"}`;
-  const sepLine = (s) =>
-    `hand sep ${s.handSep.toFixed(2)} of ${FULL_DRAW_HAND_SEP_MIN} needed — ${s.sepOk ? "far enough apart" : "too close together"}`;
 
   const liveHtml = !debugInfo
     ? `<div class="debug-big debug-fail">hand sep: no pose seen</div>`
-    : `<div class="debug-big ${debugInfo.sepOk ? "debug-ok" : "debug-fail"}">${sepLine(debugInfo)}</div>`;
-
-  const bestHtml = !peak
-    ? ""
-    : `<div class="debug-mid ${peak.sepOk ? "debug-ok" : "debug-fail"}">recent best: ${sepLine(peak)}</div>
-       <div class="debug-small">that frame's other checks — ${otherChecks(peak)}</div>`;
+    : `<div class="debug-big ${debugInfo.sepOk ? "debug-ok" : "debug-fail"}">hand sep ${debugInfo.handSep.toFixed(2)} of ${FULL_DRAW_HAND_SEP_MIN} needed — ${debugInfo.sepOk ? "far enough apart" : "too close together"}</div>`;
 
   const stateHtml = `<div class="debug-small">state: ${freezeState.kind}${debugInfo ? " · " + otherChecks(debugInfo) : ""}</div>`;
 
-  debugEl.innerHTML = liveHtml + bestHtml + stateHtml;
+  debugEl.innerHTML = liveHtml + stateHtml;
 }
 
 function renderLoop() {
@@ -371,16 +528,23 @@ function renderLoop() {
   if (!landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
+    setValueState(valueShoulderBow, "—", "uncertain");
+    setValueState(valueShoulderDraw, "—", "uncertain");
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
     if (DEBUG) debugInfo = null;
+    endAttempt(); // pose lost mid-attempt counts as the attempt ending, same as hands relaxing
   } else {
     drawSkeleton(landmarks);
     updateBowArmReadout(landmarks);
+    updateShoulderDropReadout(landmarks);
     updateDrawElbowReadout(landmarks);
     atFullDraw = isAtFullDraw(landmarks, now);
   }
 
   freezeState = nextFreezeState(freezeState, atFullDraw, now);
+  // Mark the in-progress attempt as having triggered a freeze the moment it actually happens —
+  // this is the only place that knows, since nextFreezeState decides it one line above.
+  if (freezeState.kind === "frozen" && attempt) attempt.froze = true;
   syncFreezeUI();
   syncDebugOverlay();
 }
@@ -406,6 +570,14 @@ btnFreeze.addEventListener("click", () => {
   freezeState = isFrozen(freezeState) ? { kind: "cooldown" } : { kind: "manual" };
   syncFreezeUI();
 });
+
+// The one interaction the owner needs after they're done shooting: tap once to see everything
+// that got recorded while they couldn't look. Tap again to put it away. Content is kept fresh
+// as shots come in (see logShot), so there's nothing to render here beyond the toggle itself.
+btnLog.addEventListener("click", () => {
+  shotLogEl.classList.toggle("hidden");
+});
+renderShotLog(); // shows the "no shots yet" placeholder before the first one comes in
 
 async function main() {
   try {
@@ -464,6 +636,9 @@ function selfTest() {
   // disturb the real app.
   const savedHanded = rightHanded;
   const savedLastWrist = lastDrawWrist;
+  const savedAttempt = attempt;
+  const savedLog = log;
+  const savedShotCount = shotCount;
   rightHanded = true;
   const mkLandmarks = (overrides) => {
     const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 1 }));
@@ -574,8 +749,198 @@ function selfTest() {
     "wrist jumping far in 100ms (fast) should not read as holding still"
   );
 
+  // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand
+  // separation stays at/above DRAW_ATTEMPT_MIN_SEP, tracking its best (highest-separation)
+  // frame; it ends and gets logged the moment separation drops back below that floor. Reset to
+  // a clean slate here — the outer save/restore above puts it all back afterwards regardless.
+  attempt = null;
+  log = [];
+  shotCount = 0;
+  const sample = (handSep, extra = {}) => ({
+    handSep,
+    bowArmAngle: 178,
+    elbowHeight: 3,
+    anchorOk: true,
+    armOk: true,
+    sepOk: handSep >= FULL_DRAW_HAND_SEP_MIN,
+    stillOk: true,
+    ...extra,
+  });
+
+  trackShotAttempt(sample(0.1)); // resting, below the floor: no attempt yet
+  console.assert(log.length === 0, "resting below the floor should not start an attempt");
+  trackShotAttempt(sample(0.5)); // crosses the floor: attempt starts
+  trackShotAttempt(sample(0.8));
+  trackShotAttempt(sample(1.7)); // peak
+  trackShotAttempt(sample(1.7)); // held steady — several frames at/near the peak
+  trackShotAttempt(sample(1.6));
+  console.assert(log.length === 0, "a hold still in progress must not be logged yet");
+  console.assert(
+    attempt && attempt.handSep === 1.7,
+    "in-progress attempt should track its best (highest hand-sep) frame, not its latest"
+  );
+  trackShotAttempt(sample(0.05)); // hands come back together: attempt ends
+  console.assert(log.length === 1, "one long hold must log exactly one row, not one per frame");
+  console.assert(log[0].handSep === 1.7, "logged row should be the attempt's peak frame, not its last");
+  console.assert(log[0].shotNum === 1, "first logged attempt should be shot 1");
+
+  // A second, separate attempt must become its own row — including one that never gets close
+  // to full draw at all, which is the exact case the log exists to capture.
+  trackShotAttempt(sample(0.4));
+  trackShotAttempt(sample(0.5)); // never reaches FULL_DRAW_HAND_SEP_MIN this time
+  trackShotAttempt(sample(0.1)); // ends
+  console.assert(log.length === 2, "a second attempt must log as its own row, not merge into the first");
+  console.assert(
+    log[0].shotNum === 2 && log[0].handSep === 0.5,
+    "newest attempt should be first in the log, with its own (lower) peak — a near-miss is still recorded"
+  );
+  console.assert(log[1].shotNum === 1, "the earlier attempt should still be present, just not first");
+
+  // froze flag: renderLoop sets attempt.froze directly the instant a freeze actually triggers;
+  // it must survive later, higher-handSep updates of the very same attempt.
+  trackShotAttempt(sample(0.5));
+  attempt.froze = true; // simulates: if (freezeState.kind === "frozen" && attempt) attempt.froze = true;
+  trackShotAttempt(sample(1.8)); // a later, better frame in the SAME attempt
+  console.assert(attempt.froze === true, "froze must survive the attempt's best frame being updated");
+  trackShotAttempt(sample(0.05));
+  console.assert(log[0].froze === true, "an attempt that triggered a freeze should log froze: true");
+
+  // Losing the pose entirely also ends whatever attempt was in progress (endAttempt, called
+  // directly from renderLoop's !landmarks branch rather than through trackShotAttempt).
+  trackShotAttempt(sample(0.6));
+  endAttempt();
+  console.assert(
+    log.length === 4 && log[0].froze === false,
+    "pose loss mid-attempt should still log it, with froze: false since it never triggered"
+  );
+  console.assert(attempt === null, "ending an attempt must clear it so the next rise starts fresh");
+
+  // Cap: only the newest SHOT_LOG_MAX entries are kept, still newest-first.
+  for (let i = 0; i < SHOT_LOG_MAX + 3; i++) {
+    trackShotAttempt(sample(0.5));
+    trackShotAttempt(sample(0.05));
+  }
+  console.assert(log.length === SHOT_LOG_MAX, `log should cap at ${SHOT_LOG_MAX} entries, has ${log.length}`);
+  console.assert(
+    log[0].shotNum > log[SHOT_LOG_MAX - 1].shotNum,
+    "log should stay newest-first even once it's capped"
+  );
+
+  // --- Feature A: shoulder drop = ear-to-shoulder gap, normalised by torso length, as a %.
+  // Same-side ear preferred, falling back to the other ear (or to null) when it's occluded —
+  // side-on framing means one ear is very often out of view.
+  const dropHips = { 23: { x: 0.3, y: 0.7 }, 24: { x: 0.7, y: 0.7 } };
+  const dropLm1 = mkLandmarks({
+    ...dropHips,
+    11: { x: 0.3, y: 0.4 }, // L shoulder
+    7: { x: 0.3, y: 0.3 }, // L ear (same side) — gap 0.1, torso 0.3 -> 33.3%
+    8: { x: 0.7, y: 0.35 }, // R ear (other side) — deliberately different; must NOT be used
+  });
+  const drop1 = shoulderDropOf(dropLm1, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP);
+  console.assert(
+    drop1 !== null && Math.abs(drop1 - 33.33) < 0.1,
+    "shoulder drop should be the same-side ear-to-shoulder gap as a % of torso length"
+  );
+
+  const dropLm2 = mkLandmarks({
+    ...dropHips,
+    11: { x: 0.3, y: 0.4 },
+    7: { x: 0, y: 0, visibility: 0 }, // same-side ear occluded
+    8: { x: 0.7, y: 0.25 }, // other-side ear — gap 0.15, torso 0.3 -> 50%
+  });
+  const drop2 = shoulderDropOf(dropLm2, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP);
+  console.assert(
+    drop2 !== null && Math.abs(drop2 - 50) < 0.1,
+    "shoulder drop should fall back to the other ear when the same-side one isn't visible"
+  );
+
+  const dropLm3 = mkLandmarks({
+    ...dropHips,
+    11: { x: 0.3, y: 0.4 },
+    7: { x: 0, y: 0, visibility: 0 },
+    8: { x: 0, y: 0, visibility: 0 },
+  });
+  console.assert(
+    shoulderDropOf(dropLm3, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP) === null,
+    "shoulder drop should be uncertain (null), not a guess, when both ears are occluded"
+  );
+
+  const dropLm4 = mkLandmarks({
+    ...dropHips,
+    11: { x: 0, y: 0, visibility: 0 }, // shoulder itself occluded
+    7: { x: 0.3, y: 0.3 },
+    8: { x: 0.7, y: 0.3 },
+  });
+  console.assert(
+    shoulderDropOf(dropLm4, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP) === null,
+    "shoulder drop should be uncertain (null) when the shoulder itself isn't visible"
+  );
+
+  // --- Feature B: draw-elbow alignment. angleAt gives the deviation magnitude; direction
+  // (high/low) must come from vertical position only. The critical case: mirroring the whole
+  // geometry left-right (as handedness or the front camera both do) must NOT flip high/low,
+  // even though it would flip the sign of a cross product — which is exactly why this isn't
+  // implemented with one.
+  rightHanded = true;
+  const inLine = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.5 } });
+  const inLineResult = drawElbowAlignmentOf(inLine);
+  console.assert(
+    inLineResult !== null && Math.abs(inLineResult.deviation) < 0.01,
+    "elbow exactly on the extended bow-wrist -> draw-wrist line should read as ~0° deviation"
+  );
+
+  const highRH = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.4 } });
+  const highRHResult = drawElbowAlignmentOf(highRH);
+  console.assert(
+    highRHResult !== null && highRHResult.direction === "high" && highRHResult.deviation > 5,
+    "elbow physically higher than the extended line (smaller y) should report direction: high"
+  );
+
+  const lowRH = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.6 } });
+  const lowRHResult = drawElbowAlignmentOf(lowRH);
+  console.assert(
+    lowRHResult !== null && lowRHResult.direction === "low" && lowRHResult.deviation > 5,
+    "elbow physically lower than the extended line (bigger y) should report direction: low"
+  );
+
+  // Same two physical relationships, mirrored left-right (rightHanded: false swaps which wrist
+  // is "bow" vs "draw", the same as flipping the whole scene) — vertical position is invariant
+  // under a horizontal mirror, so the reported direction must not change.
+  rightHanded = false;
+  const highLH = mkLandmarks({
+    16: { x: 1.0, y: 0.5 }, // bow wrist (R_WRIST now, since rightHanded is false)
+    15: { x: 0.5, y: 0.5 }, // draw wrist (L_WRIST)
+    13: { x: 0.0, y: 0.4 }, // draw elbow (L_ELBOW) — still physically higher
+  });
+  const highLHResult = drawElbowAlignmentOf(highLH);
+  console.assert(
+    highLHResult !== null && highLHResult.direction === "high",
+    "mirrored (left-handed) geometry: elbow still physically higher must still report high, not low"
+  );
+
+  const lowLH = mkLandmarks({
+    16: { x: 1.0, y: 0.5 },
+    15: { x: 0.5, y: 0.5 },
+    13: { x: 0.0, y: 0.6 }, // still physically lower
+  });
+  const lowLHResult = drawElbowAlignmentOf(lowLH);
+  console.assert(
+    lowLHResult !== null && lowLHResult.direction === "low",
+    "mirrored (left-handed) geometry: elbow still physically lower must still report low, not high"
+  );
+
+  rightHanded = true;
+  const vertical = mkLandmarks({ 15: { x: 0.5, y: 0.2 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 0.5, y: 0.8 } });
+  console.assert(
+    drawElbowAlignmentOf(vertical) === null,
+    "a near-vertical bow-wrist -> draw-wrist line can't tell high from low, so this should be uncertain (null), not a guess"
+  );
+
   rightHanded = savedHanded;
   lastDrawWrist = savedLastWrist;
+  attempt = savedAttempt;
+  log = savedLog;
+  shotCount = savedShotCount;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
