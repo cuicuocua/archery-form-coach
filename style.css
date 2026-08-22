@@ -1,0 +1,136 @@
+:root {
+  --green: #2ecc71;
+  --amber: #f1c40f;
+  --grey: #9aa0a6;
+  --bg: #000;
+  --panel-bg: rgba(20, 20, 20, 0.72);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+}
+
+#stage {
+  position: relative;
+  width: 100vw;
+  height: 100dvh;
+  background: var(--bg);
+}
+
+/* Video fills the screen; mirrored only when using the front camera (toggled via JS class) */
+#video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#video.mirrored,
+#overlay.mirrored {
+  transform: scaleX(-1);
+}
+
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+#status {
+  position: absolute;
+  top: env(safe-area-inset-top, 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel-bg);
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: 14px;
+  z-index: 5;
+}
+
+#status.hidden {
+  display: none;
+}
+
+#readouts {
+  position: absolute;
+  top: calc(env(safe-area-inset-top, 12px) + 12px);
+  left: 12px;
+  right: 12px;
+  display: flex;
+  gap: 10px;
+  z-index: 5;
+}
+
+.readout {
+  flex: 1;
+  background: var(--panel-bg);
+  border-radius: 16px;
+  padding: 10px 14px;
+  color: #fff;
+  text-align: center;
+}
+
+.readout .label {
+  font-size: 13px;
+  opacity: 0.8;
+  margin-bottom: 4px;
+}
+
+.readout .value {
+  font-size: 30px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.readout.ok .value { color: var(--green); }
+.readout.warn .value { color: var(--amber); }
+.readout.uncertain .value { color: var(--grey); }
+
+#controls {
+  position: absolute;
+  bottom: env(safe-area-inset-bottom, 16px);
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  z-index: 5;
+  padding: 0 12px;
+}
+
+#controls button {
+  flex: 1;
+  max-width: 200px;
+  padding: 14px 10px;
+  border: none;
+  border-radius: 14px;
+  background: var(--panel-bg);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  backdrop-filter: blur(6px);
+}
+
+#controls button:active {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+#btn-freeze.active {
+  background: var(--amber);
+  color: #000;
+}

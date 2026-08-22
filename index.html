@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Archery Form Coach</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div id="status">Starting camera…</div>
+
+    <div id="readouts">
+      <div class="readout" id="readout-bowarm">
+        <div class="label">Bow-arm line</div>
+        <div class="value" id="value-bowarm">—</div>
+      </div>
+      <div class="readout" id="readout-elbow">
+        <div class="label">Draw-elbow height</div>
+        <div class="value" id="value-elbow">—</div>
+      </div>
+    </div>
+
+    <div id="controls">
+      <button id="btn-camera" title="Switch camera">🔄 Camera</button>
+      <button id="btn-hand" title="Switch handedness">🎯 Right-handed</button>
+      <button id="btn-freeze" title="Freeze frame">⏸ Freeze</button>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
