@@ -232,6 +232,18 @@ const STARTUP_MODEL_WATCHDOG_MS = 45000; // how long the pose-model DOWNLOAD ste
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
+// ===== DEBUG OVERLAY REFRESH — performance knob, not calibration; safe to change without a
+// coach, same family as SMOOTHING/POSE MODEL/ROI CROPPING above (kept here rather than inside
+// CALIBRATE WITH COACH, which is reserved for archery-form thresholds — see README's "The numbers
+// are placeholders"). syncDebugOverlay used to rebuild this panel's DOM (innerHTML) on every
+// single rendered frame, 30-60 times a second — no one can read a number changing that fast, so
+// that cost bought nothing, and measured (see PM's brief) it was landing on the exact main thread
+// the video now depends on to keep presenting smoothly on its own. This constant just puts a
+// floor under how often the panel's DOM actually gets rewritten; debugInfo itself is still
+// recomputed fresh every frame underneath, so what full draw needs to trigger, what gets logged
+// and what a clip records are all untouched — only how often the ?debug TEXT gets repainted.
+const DEBUG_OVERLAY_REFRESH_MS = 150; // minimum time between ?debug panel rewrites — about 6-7 times a second, plenty to read. RAISE to spend even less on this diagnostic-only panel (choppier to watch, never affects detection/logging); LOWER only if it ever needs to feel snappier than this, never down near a single frame's own interval
+
 // MediaPipe pose landmark indices (33-point model)
 const L_SHOULDER = 11, R_SHOULDER = 12;
 const L_ELBOW = 13, R_ELBOW = 14;
@@ -335,6 +347,10 @@ let lastDrawWrist = null;
 // Last frame's full-draw condition values, for the ?debug overlay only (see syncDebugOverlay).
 // Stays null whenever isAtFullDraw bails out before it can compute them.
 let debugInfo = null;
+
+// Last time (performance.now()) the ?debug panel's DOM was actually rewritten — see
+// DEBUG_OVERLAY_REFRESH_MS and syncDebugOverlay. -Infinity so the very first frame always paints.
+let lastDebugRenderMs = -Infinity;
 
 // Shot log: a persistent record the owner can check after they've finished shooting, because
 // they cannot read the screen or tap anything while actually on the line (see CLAUDE.md). One
@@ -2302,7 +2318,7 @@ function renderShotRow(e, stats, outliers, words) {
   const elbow = shotValueHtml(elbowText, e.elbowAlign?.signed ?? null, "°", e.shotNum, stats.elbow, ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION);
 
   const debugBit = DEBUG
-    ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
+    ? `<span class="shotlog-debug">hand sep ${e.handSep == null ? "uncertain" : e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
     : "";
   // Every reading, in the same units as the live readouts, kept for whoever eventually tunes the
   // CALIBRATE WITH COACH constants against a real session — but demoted to small print, not the
@@ -2781,8 +2797,15 @@ function paintCanvas(landmarks) {
 // Hand separation gets top billing because it's the number most likely to need retuning. This
 // is a LIVE readout only — for anything that has to survive past the instant it happens (which
 // is everything the owner actually needs, per CLAUDE.md), see the shot log instead.
-function syncDebugOverlay() {
+//
+// Throttled to DEBUG_OVERLAY_REFRESH_MS (see that constant) rather than rebuilding this DOM every
+// rendered frame — nowMs is renderLoop's own `now`, threaded in as an argument (like frameEligible
+// elsewhere in this file) so this stays a plain, directly-testable function rather than reading
+// performance.now() itself.
+function syncDebugOverlay(nowMs) {
   if (!DEBUG) return;
+  if (nowMs - lastDebugRenderMs < DEBUG_OVERLAY_REFRESH_MS) return;
+  lastDebugRenderMs = nowMs;
   const otherChecks = (s) => `anchor ${s.anchorOk ? "ok" : "fail"} · arm ${s.armOk ? "ok" : "fail"} · still ${s.stillOk ? "ok" : "fail"}`;
 
   const liveHtml = !debugInfo
@@ -2812,7 +2835,7 @@ function renderLoop() {
       attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
     if (!dueForIdleSample) {
       paintCanvas(null); // <video> keeps playing on its own; this only matters if a clip happens to be recording (see paintCanvas)
-      syncDebugOverlay();
+      syncDebugOverlay(now);
       return;
     }
     attentionLastIdleSampleMs = now; // this frame IS the idle sample — the next one is due no sooner than a full interval from now
@@ -2928,7 +2951,7 @@ function renderLoop() {
       : null;
   }
 
-  syncDebugOverlay();
+  syncDebugOverlay(now);
 }
 
 function updateHandButtonLabel() {
