@@ -162,6 +162,9 @@ html, body {
 }
 
 #shotlog .shotlog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 10px 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   font-size: 16px;
@@ -170,6 +173,15 @@ html, body {
 
 #shotlog .shotlog-row:last-child {
   border-bottom: none;
+}
+
+#shotlog .shotlog-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+#shotlog .shotlog-row-clip {
+  flex-shrink: 0;
 }
 
 #shotlog .shotlog-debug {
@@ -182,6 +194,47 @@ html, body {
 #shotlog .shotlog-empty {
   opacity: 0.7;
   font-size: 15px;
+}
+
+/* Persistent notice when clip recording isn't working — set once, shown on every render, never
+   cleared (see markClipsUnavailable in app.js). Sits above the summary block, so it's the first
+   thing visible whether or not any shots have been logged yet. */
+#shotlog .shotlog-banner {
+  background: rgba(241, 196, 15, 0.16);
+  border: 1px solid rgba(241, 196, 15, 0.45);
+  color: var(--amber);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  margin-bottom: 10px;
+}
+
+/* Big, obvious tap target for watching a shot's clip back — same reasoning as every other
+   control in this app: the owner is standing at the phone, possibly in sunlight, wearing a
+   release aid, not carefully lining up a small tap. */
+#shotlog .shotlog-play {
+  min-width: 84px;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 12px;
+  background: var(--green);
+  color: #06210f;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+#shotlog .shotlog-play:active {
+  opacity: 0.8;
+}
+
+/* Shown in place of the play button on a row with no clip (recording unsupported, or it failed
+   for just this one shot) — the row and its numbers are otherwise unaffected. */
+#shotlog .shotlog-noclip {
+  font-size: 12px;
+  opacity: 0.55;
+  white-space: nowrap;
 }
 
 #readouts {
@@ -276,4 +329,59 @@ html, body {
 
 #controls button:active {
   background: rgba(255, 255, 255, 0.25);
+}
+
+/* Full-screen clip player, opened by tapping "Watch" on a shot log row. Sits above even the
+   shot log (z-index 20 vs. 10) so it's an unambiguous full-screen takeover. The live camera view
+   and pose tracking underneath keep running the whole time it's open — closing just uncovers
+   them again, nothing to restart. */
+#clipplayer {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+}
+
+#clipplayer.hidden {
+  display: none;
+}
+
+#clipplayer video {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: #000;
+}
+
+#clipplayer-controls {
+  display: flex;
+  gap: 10px;
+  padding: 12px;
+  padding-bottom: calc(env(safe-area-inset-bottom, 12px) + 12px);
+  background: rgba(10, 10, 10, 0.92);
+}
+
+/* Slow motion (1× / 0.5× / 0.25×) plus Close, all sized like every other control in this app —
+   big enough to hit without looking carefully. Full speed is close to useless for form review,
+   which is the whole reason these buttons exist. */
+#clipplayer-controls button {
+  flex: 1;
+  padding: 16px 8px;
+  border: none;
+  border-radius: 14px;
+  background: var(--panel-bg);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+#clipplayer-controls .clipplayer-rate.active {
+  background: var(--green);
+  color: #06210f;
+}
+
+#clipplayer-close {
+  background: rgba(255, 255, 255, 0.15) !important;
 }

@@ -28,7 +28,9 @@ backwards and every number is nonsense.
 it. There used to be a freeze button here; it's gone, because you're five
 metres away holding a drawn bow and can never tap it, and by the time you walk
 over, whatever it froze has long since released itself. Everything the app
-needs you to see instead gets recorded to the shot log as it happens.
+needs you to see instead gets recorded to the shot log as it happens — including
+a short video of every draw, so you can watch the shot itself, not just the
+numbers it produced.
 
 **Afterwards, tap 📋 Log.** That's the one interaction you need, and you do it
 standing at the phone when you've finished. It lists your last ten draws.
@@ -73,6 +75,37 @@ most fully drawn.
 
 The log holds the last ten draws and lasts until you reload the page. Reloading
 clears it. There's no history between sessions.
+
+---
+
+## Watching a shot back
+
+Every row that has a clip gets a green **▶ Watch** button. Tap it and the clip
+opens full-screen: the exact video the app was recording, skeleton and all,
+covering the whole shot — raise, draw, hold, release, follow-through. Three
+buttons let you slow it down: **1×**, **0.5×**, **0.25×**. Full speed is
+basically useless for checking your own form; slow it down. **✕ Close** takes
+you back — the camera never stopped running behind the player, so nothing
+needs restarting.
+
+One clip per shot, not one long recording of the whole session. That's on
+purpose: a single running video would mean scrubbing through several minutes
+to find the ten seconds that mattered, standing at the phone, which is exactly
+the kind of thing this app exists to avoid.
+
+A row without a clip shows a plain **no clip** note instead of the button —
+your numbers are still there either way. That happens if your browser can't
+record video at all (rare) or if recording happened to fail for just that one
+shot; either way it never hides the shot itself.
+
+**Clips live in memory only**, exactly like the log — they never touch disk,
+and reloading the page loses them along with everything else. Watch them
+before you reload.
+
+If your browser can't record video at all, an amber line appears at the top
+of the log saying so, and it stays there for the rest of the session — not
+just a message that flashes by while you're not looking. Everything else
+(the readouts, the shot log, the numbers) keeps working regardless.
 
 ---
 

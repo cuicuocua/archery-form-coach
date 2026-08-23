@@ -52,13 +52,17 @@ Rules the PM follows:
 
 - `index.html` — page structure: video element, drawing canvas, status text,
   two readout panels, three control buttons (camera flip, handedness, shot
-  log).
+  log), and the full-screen clip player (video + slow-motion/close buttons)
+  that opens over everything else when a shot log row's clip is tapped.
 - `style.css` — full-screen dark UI, large tap targets, green/amber/grey
-  color states for readouts.
+  color states for readouts, plus the shot log's clip button/no-clip note and
+  the clip player's own styling.
 - `app.js` — all logic: MediaPipe setup, camera start/switch, per-frame pose
-  detection, skeleton drawing (via MediaPipe's own `DrawingUtils`), the two
-  angle calculations, the shot log, and the calibration constants block at
-  the top of the file.
+  detection, skeleton drawing (via MediaPipe's own `DrawingUtils`) burned into
+  the overlay canvas together with the raw camera frame — that combined
+  canvas is what per-shot clip recording actually captures — the two angle
+  calculations, the shot log, clip recording/playback, and the calibration
+  constants block at the top of the file.
 
 ## Key decisions
 
@@ -112,11 +116,33 @@ Rules the PM follows:
   by the app (selfTest still reads it directly). The `<video>` element is never
   paused after startup any more.
 
+- **Per-shot clips, not one long session recording.** What replaced the freeze
+  button: every draw attempt records its own short video (the overlay canvas —
+  camera frame plus skeleton — via `canvas.captureStream`, through
+  `MediaRecorder`), from the moment hand separation shows the raise starting
+  to about 2.5 seconds after the shot ends, so release and follow-through are
+  in it too. A single continuous recording of the whole session was
+  deliberately rejected: the owner would have to scrub through minutes of
+  video standing at the phone to find the ten seconds that mattered, which is
+  exactly the kind of live interaction this app exists to avoid (see "owner
+  cannot touch or read the phone" above) — a *recorded* thing he can review
+  is fine, a live thing he has to operate is not. Each finished clip attaches
+  to its shot's row in the log by shot number once ready; a row with no clip
+  (recording unsupported, or it failed for that one shot) still shows its
+  numbers, with a plain "no clip" note in place of the watch button. Clips are
+  capped at 20 seconds each as a safety valve, live in memory only exactly
+  like the shot log, and get `URL.revokeObjectURL`'d the moment their row
+  falls off the end of `SHOT_LOG_MAX`. If recording doesn't work at all in
+  the browser, or throws on start, a persistent line goes up at the top of the
+  shot log saying so — never just a console message, for the same "the owner
+  finds out later, not in the moment" reason as everything else here.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.
 - No server-side component — everything runs client-side in the browser.
-- No persistence/history of readings across sessions.
+- No persistence/history of readings across sessions — and, per the same rule,
+  no persistence of clips either. Both are memory-only and gone on reload.
 - No automated tests (this is a visual/physical prototype — verification is
   "open it and watch the skeleton track your body correctly").
 

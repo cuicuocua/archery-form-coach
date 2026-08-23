@@ -15,6 +15,16 @@
     <div id="debug" class="hidden"></div>
     <div id="shotlog" class="hidden"></div>
 
+    <div id="clipplayer" class="hidden">
+      <video id="clipplayer-video" playsinline controls></video>
+      <div id="clipplayer-controls">
+        <button type="button" class="clipplayer-rate active" data-rate="1">1×</button>
+        <button type="button" class="clipplayer-rate" data-rate="0.5">0.5×</button>
+        <button type="button" class="clipplayer-rate" data-rate="0.25">0.25×</button>
+        <button type="button" id="clipplayer-close">✕ Close</button>
+      </div>
+    </div>
+
     <div id="readouts">
       <div class="readout" id="readout-bowarm">
         <div class="label">Bow-arm line</div>

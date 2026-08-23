@@ -36,6 +36,24 @@ const SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION = 8; // percentage points from thi
 const ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION = 4; // degrees from this session's average
 // ===========================================================================
 
+// ===== SHOT CLIPS — recording settings. Not calibration like the block above, just knobs for
+// clip length/size; change freely without asking a coach first. =====
+const CLIP_TAIL_MS = 2500; // how long to keep recording AFTER endAttempt, so the release and follow-through make it into the clip, not just the draw
+const CLIP_MAX_MS = 20000; // hard ceiling on one clip's length, so a full-draw detection that gets stuck "in progress" can't record forever
+const CLIP_FRAME_RATE = 24; // fps requested from canvas.captureStream — modest on purpose, see CLIP_BITRATE
+const CLIP_BITRATE = 1_500_000; // ~1.5 Mbps target — keeps a clip a couple of MB, not tens, since these live in memory for the whole session
+// Tried in this order, first one the browser claims to support wins. iPhone Safari (the real
+// target) only understands the mp4 entries; desktop Chrome (used for dev) only understands the
+// webm ones — so both ends of that split need to be in the list, most-preferred first.
+const CLIP_MIME_CANDIDATES = [
+  "video/mp4;codecs=avc1.42E01E",
+  "video/mp4",
+  "video/webm;codecs=vp9",
+  "video/webm;codecs=vp8",
+  "video/webm",
+];
+// ===========================================================================
+
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
@@ -62,6 +80,16 @@ const debugEl = document.getElementById("debug");
 if (DEBUG) debugEl.classList.remove("hidden");
 const btnLog = document.getElementById("btn-log");
 const shotLogEl = document.getElementById("shotlog");
+const clipPlayerEl = document.getElementById("clipplayer");
+const clipPlayerVideo = document.getElementById("clipplayer-video");
+const clipPlayerClose = document.getElementById("clipplayer-close");
+const clipPlayerRateBtns = document.querySelectorAll(".clipplayer-rate");
+
+// Whether this browser can record a clip at all. Checked once, up front, rather than
+// discovering it the first time an attempt starts — that way the "clips unavailable" banner
+// (see markClipsUnavailable) can go up before the owner ever shoots, not after their first shot
+// quietly has no video.
+const CLIP_SUPPORTED = typeof MediaRecorder !== "undefined" && typeof canvas.captureStream === "function";
 
 let poseLandmarker = null;
 let stream = null;
@@ -87,6 +115,27 @@ const SHOT_LOG_MAX = 10;
 let shotCount = 0; // total attempts this session, keeps counting even once the log above fills up
 let log = []; // newest first
 let attempt = null; // the attempt currently in progress, if any — see trackShotAttempt below
+
+// The clip recording currently in progress or in its post-shot tail, if any — see
+// startClipRecording below. Only ever one of these at a time; a new attempt starting while the
+// previous clip is still in its tail cuts the old one short rather than running two at once.
+let activeRecording = null;
+
+// Set once, the first time clip recording turns out not to work in this browser (either it was
+// never supported, or MediaRecorder threw when we tried to start it) — and never cleared. Shown
+// as a persistent line at the top of the shot log for the rest of the session (see
+// markClipsUnavailable / renderShotLog), because the owner can't be watching a console or a
+// toast at the moment recording fails; they find out later, standing at the phone, so that's the
+// only place this can usefully be said.
+let clipsUnavailableReason = null;
+
+// True only while selfTest() below is running. trackShotAttempt calls startClipRecording every
+// time a fresh attempt begins, and selfTest drives trackShotAttempt directly with fake
+// landmarks, many times, with no real camera behind canvas — so without this guard, plain logic
+// tests would spin up real MediaRecorders against a 0×0 canvas and leave their timers running
+// into the real session that follows (selfTest always runs before main(), never instead of it).
+// The clip logic itself is tested separately below, by calling its pieces directly.
+let selfTestInProgress = false;
 
 async function initPoseLandmarker() {
   const vision = await FilesetResolver.forVisionTasks(
@@ -388,9 +437,13 @@ function isAtFullDraw(landmarks, nowMs) {
 // back-to-back into one. No timer involved: nothing here expires on its own, ever.
 function trackShotAttempt(sample) {
   if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
-    if (!attempt || sample.handSep >= attempt.handSep) {
+    const isNewAttempt = !attempt; // hands just left the resting position — a fresh attempt, not a continuation
+    if (isNewAttempt || sample.handSep >= attempt.handSep) {
       attempt = { ...sample };
     }
+    // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
+    // the time endAttempt fires the good part is already over.
+    if (isNewAttempt) startClipRecording();
   } else {
     endAttempt();
   }
@@ -401,15 +454,153 @@ function trackShotAttempt(sample) {
 // (from renderLoop) — either way, whatever was going on has stopped.
 function endAttempt() {
   if (!attempt) return;
-  logShot(attempt);
+  const shotNum = logShot(attempt);
   attempt = null;
+  // The clip that's been recording since this attempt began now knows which shot it belongs to,
+  // and can start counting down its post-release tail (see attachRecordingToShot).
+  attachRecordingToShot(shotNum);
 }
+
+// ===== SHOT CLIPS — recording. One clip per draw attempt, covering raise through
+// follow-through: starts in trackShotAttempt the moment an attempt begins, and is told which
+// shot it belongs to here in endAttempt once that's known. Every function below fails safe: if
+// anything here throws, the shot log and pose tracking must carry on exactly as if clips didn't
+// exist (see CLAUDE.md and the brief this was built from) — so every entry point is wrapped in
+// its own try/catch rather than trusting the caller to catch it.
+
+// Picks a MIME type by trying CLIP_MIME_CANDIDATES in order and returning the first one this
+// browser claims to support; null means "nothing on the list — let the browser pick its own
+// default" rather than refusing to record at all.
+function pickMimeType() {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") return null;
+  for (const type of CLIP_MIME_CANDIDATES) {
+    try {
+      if (MediaRecorder.isTypeSupported(type)) return type;
+    } catch {
+      // Some browsers throw on a type string they don't recognise rather than returning false —
+      // treat that exactly like "not supported" and keep trying the rest of the list.
+    }
+  }
+  return null;
+}
+
+// Latches the "clips don't work here" banner on, the first time it's true, and never clears it
+// — a later clip succeeding doesn't erase the fact that one failed, and the owner needs to see
+// this once they walk over, not have it silently disappear before then.
+function markClipsUnavailable(reason) {
+  if (clipsUnavailableReason) return;
+  clipsUnavailableReason = reason;
+  renderShotLog();
+}
+
+// Starts recording a new clip from the overlay canvas — called the instant an attempt begins.
+// If a previous clip is still running (normally: still in its 2.5s post-shot tail, because a new
+// attempt started before that timer fired), it gets cut short and finalised right now rather
+// than left to keep running alongside a second recorder.
+function startClipRecording() {
+  if (selfTestInProgress || !CLIP_SUPPORTED) return; // banner already went up at startup; nothing more to do per attempt
+  finalizeRecording(activeRecording);
+  try {
+    const mimeType = pickMimeType();
+    const options = { videoBitsPerSecond: CLIP_BITRATE };
+    if (mimeType) options.mimeType = mimeType;
+    const stream = canvas.captureStream(CLIP_FRAME_RATE);
+    const recorder = new MediaRecorder(stream, options);
+    const rec = { recorder, chunks: [], shotNum: null, finished: false, capTimer: null, tailTimer: null };
+    recorder.ondataavailable = (ev) => {
+      try {
+        if (ev.data && ev.data.size > 0) rec.chunks.push(ev.data);
+      } catch (err) {
+        console.error("archery-form-coach: clip data handling failed", err);
+      }
+    };
+    recorder.onerror = (ev) => console.error("archery-form-coach: clip recorder error", ev?.error ?? ev);
+    recorder.onstop = () => finishClipRecording(rec);
+    recorder.start();
+    // Absolute ceiling from the moment recording starts, independent of whether/when the attempt
+    // ever ends — this is what stops a stuck full-draw detection from recording forever.
+    rec.capTimer = setTimeout(() => finalizeRecording(rec), CLIP_MAX_MS);
+    activeRecording = rec;
+  } catch (err) {
+    activeRecording = null;
+    markClipsUnavailable("Clip recording isn't working in this browser — everything else still works, just no shot videos.");
+    console.error("archery-form-coach: clip recording failed to start", err);
+  }
+}
+
+// Called from endAttempt once a shot has just been logged and we know its number: tells the
+// still-running recording which row it belongs to, and starts the post-shot tail timer so the
+// release and follow-through get a couple more seconds of recording before it stops. If there is
+// no active recording (recording never started, or a stuck-attempt cap already cut it off before
+// this attempt ever ended), there's nothing to tell — this shot simply won't have a clip.
+function attachRecordingToShot(shotNum) {
+  if (!activeRecording || activeRecording.shotNum !== null) return;
+  activeRecording.shotNum = shotNum;
+  activeRecording.tailTimer = setTimeout(() => finalizeRecording(activeRecording), CLIP_TAIL_MS);
+}
+
+// Stops a recording (idempotent — safe to call twice, from both its cap timer and its tail timer
+// racing, or from a fresh attempt cutting it short) and clears it from activeRecording. The
+// actual blob only becomes available later, asynchronously, in the recorder's onstop handler —
+// see finishClipRecording.
+function finalizeRecording(rec) {
+  if (!rec || rec.finished) return;
+  rec.finished = true;
+  clearTimeout(rec.capTimer);
+  clearTimeout(rec.tailTimer);
+  try {
+    if (rec.recorder.state !== "inactive") rec.recorder.stop();
+  } catch (err) {
+    console.error("archery-form-coach: failed to stop clip recording", err);
+  }
+  if (activeRecording === rec) activeRecording = null;
+}
+
+// Runs once a stopped recorder has finished handing over its data. If this clip never got a shot
+// number (the stuck-attempt cap fired before the attempt ever ended) there's nothing to attach it
+// to, so it's dropped — the rare cost of the CLIP_MAX_MS safety valve.
+function finishClipRecording(rec) {
+  try {
+    if (!rec.chunks.length || rec.shotNum === null) return;
+    const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || "video/webm" });
+    if (blob.size === 0) return;
+    attachClipToShot(rec.shotNum, blob);
+  } catch (err) {
+    console.error("archery-form-coach: failed to finalise clip", err);
+  }
+}
+
+// Attaches a finished clip to its shot's row in the log, by shot number — reuniting the two,
+// since the clip finishes recording well after logShot already ran. If that shot has since been
+// bumped off the end of the log (SHOT_LOG_MAX newer attempts happened first), there is no row
+// left to attach it to: the blob is simply dropped, and since no object URL was ever created for
+// it, there's nothing to revoke either.
+function attachClipToShot(shotNum, blob) {
+  const entry = log.find((e) => e.shotNum === shotNum);
+  if (!entry) return;
+  entry.clipBlob = blob;
+  entry.clipUrl = URL.createObjectURL(blob);
+  entry.clipMimeType = blob.type;
+  renderShotLog();
+}
+
+// Releases a row's clip — its object URL and the blob itself — called when that row is about to
+// fall out of the log for good (see logShot below). Clips are memory-only, exactly like the log
+// they ride along with: nothing here is ever written to disk, so this is the only cleanup needed.
+function revokeClip(entry) {
+  if (entry.clipUrl) URL.revokeObjectURL(entry.clipUrl);
+}
+// ===========================================================================
 
 function logShot(entry) {
   shotCount++;
-  log.unshift({ ...entry, shotNum: shotCount });
+  const shotNum = shotCount;
+  log.unshift({ ...entry, shotNum });
+  const evicted = log.slice(SHOT_LOG_MAX);
   log = log.slice(0, SHOT_LOG_MAX);
+  evicted.forEach(revokeClip);
   renderShotLog();
+  return shotNum;
 }
 
 // One measure's stats across the shot log: the owner's own average, their spread (best-to-worst
@@ -536,7 +727,16 @@ function renderShotRow(e, stats) {
   const debugBit = DEBUG
     ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
     : "";
-  return `<div class="shotlog-row">Shot ${e.shotNum}${outlierMark}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div>`;
+
+  // A big, obvious watch button when this shot has a clip; a plain "no clip" note when it
+  // doesn't (recording unsupported, or it failed for just this one shot) — never nothing, so a
+  // missing clip never reads as a missing shot. data-shot carries the shot number for the click
+  // handler on shotLogEl (see openClipPlayer wiring) to look the entry back up by.
+  const clipBit = e.clipUrl
+    ? `<button type="button" class="shotlog-play" data-shot="${e.shotNum}">▶ Watch</button>`
+    : `<span class="shotlog-noclip">no clip</span>`;
+
+  return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum}${outlierMark}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
 }
 
 // Plain-language shot log — this is what the owner actually reads, standing at the phone after
@@ -546,8 +746,14 @@ function renderShotRow(e, stats) {
 // so the rows themselves can stay compact — bare signed numbers, no repeated phrase. Extra
 // per-shot detail (hand separation, the four trigger checks) only shows up when ?debug is on.
 function renderShotLog() {
+  // A clip-recording failure has to still be visible whenever the owner walks over and looks —
+  // not just at the moment it happened — so this goes at the very top, above everything else,
+  // every single render, for as long as clipsUnavailableReason is set (which is forever, once
+  // it's set at all — see markClipsUnavailable).
+  const banner = clipsUnavailableReason ? `<div class="shotlog-banner">${clipsUnavailableReason}</div>` : "";
+
   if (log.length === 0) {
-    shotLogEl.innerHTML = `<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${banner}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -564,11 +770,30 @@ function renderShotLog() {
 
   const rowsHtml = log.map((e) => renderShotRow(e, stats)).join("");
 
-  shotLogEl.innerHTML = `<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
+  shotLogEl.innerHTML = `${banner}<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
+}
+
+// Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
+// the canvas transparent so the <video> element underneath showed through on its own — visually
+// identical, but it meant the canvas itself had no picture in it, only skeleton lines. Now that
+// the canvas is what gets recorded (see startClipRecording — canvas.captureStream is the only
+// way to bake the skeleton into a clip), the canvas needs its own copy of the video frame every
+// time, landmarks or not, so a clip is never missing frames just because the pose was briefly
+// lost. canvas.width/height are set to the video's native resolution in startCamera, so this
+// plain draw lines up exactly with no cropping or letterboxing needed.
+//
+// Mirroring note: the front camera mirrors on-screen via a CSS transform on both #video and
+// #overlay (see style.css), which only affects how the browser displays the elements — it does
+// not touch the pixels drawn here. So a front-camera clip plays back unmirrored. That's fine
+// (the owner shoots on the rear camera) and is NOT a bug to "fix" by mirroring the canvas draw —
+// doing that would put every landmark coordinate on the wrong side of the frame.
+function drawVideoFrame() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 }
 
 function drawSkeleton(landmarks) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawVideoFrame();
   drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
     color: "#00e5ff",
     lineWidth: 3,
@@ -605,7 +830,7 @@ function renderLoop() {
   const landmarks = result.landmarks?.[0];
 
   if (!landmarks) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawVideoFrame(); // keep the clip (and the on-screen view) showing the camera even without a skeleton
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
@@ -647,7 +872,48 @@ btnHand.addEventListener("click", () => {
 btnLog.addEventListener("click", () => {
   shotLogEl.classList.toggle("hidden");
 });
-renderShotLog(); // shows the "no shots yet" placeholder before the first one comes in
+
+// The clip player: a full-screen takeover opened by tapping "Watch" on a shot log row. One
+// listener on the log's container (event delegation) rather than one per row, since rows are
+// replaced wholesale on every renderShotLog — a per-row listener would need re-attaching every
+// time and would leak the old ones.
+shotLogEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".shotlog-play");
+  if (!btn) return;
+  const shotNum = Number(btn.dataset.shot);
+  const entry = log.find((e) => e.shotNum === shotNum);
+  if (entry && entry.clipUrl) openClipPlayer(entry.clipUrl);
+});
+
+function openClipPlayer(url) {
+  clipPlayerVideo.src = url;
+  clipPlayerVideo.playbackRate = 1;
+  clipPlayerRateBtns.forEach((b) => b.classList.toggle("active", b.dataset.rate === "1"));
+  clipPlayerEl.classList.remove("hidden");
+  clipPlayerVideo.play().catch(() => {}); // autoplay can be blocked; native controls let them press play themselves either way
+}
+
+// Closing returns to the live view — the camera and pose tracking underneath never stopped
+// running while the player was open, so there's nothing to resume, just to uncover again.
+function closeClipPlayer() {
+  clipPlayerVideo.pause();
+  clipPlayerEl.classList.add("hidden");
+  clipPlayerVideo.removeAttribute("src");
+  clipPlayerVideo.load();
+}
+
+clipPlayerClose.addEventListener("click", closeClipPlayer);
+clipPlayerRateBtns.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    clipPlayerVideo.playbackRate = Number(btn.dataset.rate);
+    clipPlayerRateBtns.forEach((b) => b.classList.toggle("active", b === btn));
+  });
+});
+
+if (!CLIP_SUPPORTED) {
+  markClipsUnavailable("Clips unavailable in this browser — everything else still works, just no shot videos.");
+}
+renderShotLog(); // shows the "no shots yet" placeholder (and the banner above, if set) before the first shot comes in
 
 async function main() {
   try {
@@ -680,6 +946,7 @@ function selfTest() {
   const savedAttempt = attempt;
   const savedLog = log;
   const savedShotCount = shotCount;
+  selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   const mkLandmarks = (overrides) => {
     const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 1 }));
@@ -1070,6 +1337,77 @@ function selfTest() {
   const spreadShot3 = shotValueHtml("65%", 65, "%", 3, spreadStats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
   console.assert(spreadShot3.flagged === true, "a reading that genuinely exceeds the display cutoff should still be flagged");
 
+  // --- Shot clips: MIME selection order, attaching a blob to the right shot number, discarding
+  // one whose shot has fallen off the log, and revoking a clip when eviction removes its row.
+  // These call the clip functions directly rather than through startClipRecording, which is
+  // deliberately suppressed during selfTest (see selfTestInProgress) — there's no real camera
+  // here to record from, only the bookkeeping around a recording, which is what's under test.
+  {
+    if (typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function") {
+      const savedIsTypeSupported = MediaRecorder.isTypeSupported;
+      MediaRecorder.isTypeSupported = (t) => t === "video/webm;codecs=vp8";
+      console.assert(
+        pickMimeType() === "video/webm;codecs=vp8",
+        "pickMimeType should return the first candidate (in CLIP_MIME_CANDIDATES order) the browser claims to support"
+      );
+      MediaRecorder.isTypeSupported = () => false;
+      console.assert(
+        pickMimeType() === null,
+        "pickMimeType should return null (let the browser pick its own default) when nothing on the list is supported"
+      );
+      MediaRecorder.isTypeSupported = savedIsTypeSupported;
+    } else {
+      console.assert(pickMimeType() === null, "pickMimeType should return null when MediaRecorder isn't available at all");
+    }
+
+    // Attaching: a blob attaches to the log row with the matching shot number, and only that row.
+    log = [{ shotNum: 5 }, { shotNum: 4 }];
+    const blobA = new Blob(["a"], { type: "video/webm" });
+    attachClipToShot(4, blobA);
+    const rowFour = log.find((e) => e.shotNum === 4);
+    const rowFive = log.find((e) => e.shotNum === 5);
+    console.assert(
+      rowFour.clipUrl && rowFour.clipBlob === blobA,
+      "a clip should attach to the log row whose shotNum matches, gaining a clipBlob and a playable clipUrl"
+    );
+    console.assert(rowFive.clipUrl === undefined, "a clip attaching to one row must not touch any other row");
+    URL.revokeObjectURL(rowFour.clipUrl); // tidy up the object URL this test itself created
+
+    // Discarding: a shot number no longer in the log (already bumped off the end) gets nothing
+    // attached, and nothing throws — this is the normal case for a clip that finishes recording
+    // well after its shot, once SHOT_LOG_MAX newer attempts have already happened.
+    log = [{ shotNum: 9 }];
+    const blobB = new Blob(["b"], { type: "video/webm" });
+    attachClipToShot(3, blobB); // shot 3 fell off the log already
+    console.assert(
+      log.length === 1 && log[0].clipUrl === undefined,
+      "attaching a clip for a shot that's no longer in the log must be a silent no-op, not attach to an unrelated row"
+    );
+
+    // Revoking on eviction: logShot must revoke the object URL of any row it pushes off the end
+    // of SHOT_LOG_MAX, so a clip's memory doesn't outlive the row it belonged to.
+    const revokedUrls = [];
+    const savedRevoke = URL.revokeObjectURL;
+    URL.revokeObjectURL = (u) => revokedUrls.push(u);
+    log = [];
+    shotCount = 0;
+    for (let i = 0; i < SHOT_LOG_MAX; i++) {
+      trackShotAttempt(sample(0.5));
+      trackShotAttempt(sample(0.05)); // ends the attempt, logs it
+    }
+    console.assert(log.length === SHOT_LOG_MAX, "setup: log should be exactly full before the eviction check");
+    const oldestUrl = "blob:fake-oldest-for-selftest";
+    log[log.length - 1].clipUrl = oldestUrl; // pretend the row about to be evicted has a clip attached
+    trackShotAttempt(sample(0.5));
+    trackShotAttempt(sample(0.05)); // one more attempt: pushes the oldest row (the one just tagged) off the end
+    console.assert(
+      revokedUrls.includes(oldestUrl),
+      "evicting a row that has a clip attached must revoke its object URL"
+    );
+    URL.revokeObjectURL = savedRevoke;
+  }
+
+  selfTestInProgress = false;
   rightHanded = savedHanded;
   lastDrawWrist = savedLastWrist;
   attempt = savedAttempt;
