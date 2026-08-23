@@ -96,6 +96,15 @@ nothing. If a measurement's readings were all "uncertain" that session, it
 says nothing about it at all rather than reaching for a claim it can't back
 up.
 
+The camera itself has a little wobble in it even when nothing is moving —
+that's just how a phone camera at five metres works. The app knows roughly
+how much, and won't call that wobble a trend or single out a shot over it:
+if a number's own session-to-session variation could plausibly just be the
+camera's own noise, it gets called steady, not drifting. The very best
+sessions you shoot are exactly where this matters most — a session with
+almost no real variation is also the one where ordinary camera noise looks
+biggest by comparison.
+
 Each row underneath names the shot, says in plain English what — if anything
 — stood out about it, and gives you the Watch button. The raw degrees and
 percent are still there too, in small print under each shot, for whoever
