@@ -276,6 +276,17 @@ const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the 
 // and what a clip records are all untouched — only how often the ?debug TEXT gets repainted.
 const DEBUG_OVERLAY_REFRESH_MS = 150; // minimum time between ?debug panel rewrites — about 6-7 times a second, plenty to read. RAISE to spend even less on this diagnostic-only panel (choppier to watch, never affects detection/logging); LOWER only if it ever needs to feel snappier than this, never down near a single frame's own interval
 
+// A momentary event (an attempt opening, the raise trigger firing, a shot getting logged, a
+// single frame being eligible to log from) can be true for exactly one frame at 30-60fps. With
+// the panel above already throttled to DEBUG_OVERLAY_REFRESH_MS, anything shorter than that
+// refresh isn't just hard to see — the render can land on a tick that never sampled the frame it
+// happened on at all, so the annunciator for it would never light. Each such event instead
+// records a timestamp (see debugEvents below) the instant it happens, and its lamp stays lit for
+// this long afterwards — long enough that the panel's own throttled refresh is guaranteed to
+// catch it at least once. Display-only: nothing anywhere reads these timestamps except
+// syncDebugOverlay, so this can never feed back into detection, gating, measurement or logging.
+const DEBUG_EVENT_LATCH_MS = 400;
+
 // MediaPipe pose landmark indices (33-point model)
 const L_SHOULDER = 11, R_SHOULDER = 12;
 const L_ELBOW = 13, R_ELBOW = 14;
@@ -300,7 +311,16 @@ const valueShoulderDraw = document.getElementById("value-shoulder-draw");
 const readoutElbow = document.getElementById("readout-elbow");
 const valueElbow = document.getElementById("value-elbow");
 const debugEl = document.getElementById("debug");
-if (DEBUG) debugEl.classList.remove("hidden");
+// Element references into the panel buildDebugPanel builds below, keyed by each node's own
+// data-x attribute. Declared up here (not down with the rest of the ?debug runtime state,
+// further below) specifically so buildDebugPanel — called a few lines down, before any of that
+// later state exists yet — can assign to it without a temporal-dead-zone error.
+let dbgRefs = null;
+if (DEBUG) {
+  debugEl.classList.remove("hidden");
+  document.body.classList.add("debug-mode"); // see the ?debug LAYOUT block in style.css — the only thing that turns the two-column grid on
+  buildDebugPanel(); // built once, here, before any frame renders — see its own comment for why
+}
 const btnLog = document.getElementById("btn-log");
 const shotLogEl = document.getElementById("shotlog");
 // renderShotLog() writes into this inner scrolling element, never into shotLogEl itself — the
@@ -376,13 +396,79 @@ let mirrorToggled = false;
 // below. Deliberately just one remembered frame, not a history buffer — cheap and enough.
 let lastDrawWrist = null;
 
-// Last frame's full-draw condition values, for the ?debug overlay only (see syncDebugOverlay).
-// Stays null whenever isAtFullDraw bails out before it can compute them.
-let debugInfo = null;
+// Builds a fresh "nothing computed yet/this bail" debugInfo object — the ?debug panel's
+// NEVER-BLANK guarantee lives here. `reason` is a plain-language sentence naming why isAtFullDraw
+// couldn't get all the way through this frame (or null on a frame that succeeded); every other
+// field defaults to null (shown as "—" in the panel) rather than being left undefined, so the
+// panel's rendering code never has to guess which fields exist on a given call. debugInfo is
+// ALWAYS one of these objects, never bare null — see isAtFullDraw and renderLoop's pose-lost
+// branch, both of which only ever call this rather than assigning null directly.
+function emptyDebugInfo(reason) {
+  return {
+    reason,
+    handSep: null, sepOk: null,
+    anchorDist: null, anchorOk: null,
+    bowArmAngle: null, armOk: null,
+    speed: null, stillOk: null,
+  };
+}
+
+// Last frame's full-draw condition values, for the ?debug panel only (see syncDebugOverlay).
+// Always a real object (see emptyDebugInfo) — never bare null, even on a frame isAtFullDraw
+// bails out of early, so the panel always has a `reason` to show instead of going blank.
+let debugInfo = emptyDebugInfo("not started yet");
+
+// Names which of a set of landmarks aren't confidently visible, in plain language, for the
+// ?debug panel's never-blank bail-reason text (see isAtFullDraw). `checks` is a list of
+// [landmarkIndex, plainName] pairs. Pure — no module state — so selfTest can call it directly.
+function describeMissingLandmarks(landmarks, checks) {
+  return checks.filter(([idx]) => !visible(landmarks, idx)).map(([, name]) => name);
+}
 
 // Last time (performance.now()) the ?debug panel's DOM was actually rewritten — see
 // DEBUG_OVERLAY_REFRESH_MS and syncDebugOverlay. -Infinity so the very first frame always paints.
 let lastDebugRenderMs = -Infinity;
+
+// ===== ?debug PANEL — runtime state, all of it display-only. Nothing in this block is ever read
+// by any detection, gating, measurement or logging code — only by buildDebugPanel/syncDebugOverlay
+// further down. Kept together so it's obvious at a glance which module-level variables exist
+// purely to feed the diagnostic panel and can never influence what the app actually does.
+//
+// debugEvents: performance.now() timestamps of the most recent occurrence of each MOMENTARY event
+// (see DEBUG_EVENT_LATCH_MS above for why these need a timestamp rather than a plain boolean) — 0
+// means "never happened this session". isDebugEventLit (below) is the only thing that reads these.
+let debugEvents = { attemptStarted: 0, raiseFired: 0, frameEligible: 0, shotLogged: 0 };
+// Live value of the raise trigger's own signal (see bowArmRaiseHeight/updateRaiseTrigger) —
+// captured every frame that can read it at all, purely so the TRIGGERS/STATE section can show the
+// actual number next to RAISE_TRIGGER_UP_FRACTION, not just the armed/unarmed boolean.
+let debugRaiseHeight = null;
+// Whether the crop box used THIS frame was stable (see cropBoxIsStable) — captured in renderLoop
+// right where that's already computed for frameEligible, so the panel can show it as its own
+// continuous lamp without recomputing crop-box geometry a second time.
+let lastCropBoxStable = false;
+// Whether a pose was actually found the last time detection genuinely ran (full-rate frame, or an
+// idle-rate sample) — NOT updated on an idle-throttle tick that skipped detection entirely, so the
+// panel correctly keeps showing the last real answer through an idle gap instead of flickering to
+// "not seen" for a reason that has nothing to do with whether the archer is there.
+let lastPoseSeen = false;
+// How long the most recent detectForVideo call took, and an instantaneous rendered-frame-rate
+// figure recomputed every renderLoop call — a live companion to the one-time startup measurement
+// already reported in modelStatusLine (see POSE MODEL above), for the SESSION section's tracking-
+// health line. debugLastFrameTs is the bookkeeping timestamp debugInstantFps is derived from.
+let lastInferenceMs = null;
+let debugLastFrameTs = null;
+let debugInstantFps = null;
+// (dbgRefs itself is declared up near debugEl, before buildDebugPanel's own call site — see that
+// declaration's comment for why it has to live there instead of here with the rest of this state.)
+
+// Is a momentary event's lamp still lit? True from the instant its timestamp is recorded through
+// DEBUG_EVENT_LATCH_MS afterwards; 0 (never happened) is always unlit. Pure — no module state —
+// so selfTest can drive it directly with fixture timestamps, including proving it goes dark once
+// the window passes.
+function isDebugEventLit(eventTs, nowMs) {
+  return eventTs !== 0 && nowMs - eventTs <= DEBUG_EVENT_LATCH_MS;
+}
+// ===========================================================================
 
 // Shot log: a persistent record the owner can check after they've finished shooting, because
 // they cannot read the screen or tap anything while actually on the line (see CLAUDE.md). One
@@ -1323,11 +1409,16 @@ let raiseArmed = false;
 // — never guess, same convention as every other signal in this file — so raiseArmed simply holds
 // whatever it was. Pure state transition only; trackShotAttempt below decides what a raise
 // actually DOES (open an attempt, start a clip recording).
-function updateRaiseTrigger(landmarks, frameWidth, frameHeight) {
+// nowMs defaults to a real clock read so every existing call site (several in selfTest) keeps
+// working unchanged — it only matters for the ?debug panel's momentary RAISE FIRED lamp (see
+// DEBUG_EVENT_LATCH_MS above), which isAtFullDraw's own call passes its real nowMs into instead.
+function updateRaiseTrigger(landmarks, frameWidth, frameHeight, nowMs = performance.now()) {
   const height = bowArmRaiseHeight(landmarks, frameWidth, frameHeight);
+  if (DEBUG) debugRaiseHeight = height; // display-only — see debugRaiseHeight's own comment
   if (height === null) return;
   if (!raiseArmed && height >= RAISE_TRIGGER_UP_FRACTION) {
     raiseArmed = true;
+    if (DEBUG) debugEvents.raiseFired = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
   } else if (raiseArmed && height <= RAISE_TRIGGER_DOWN_FRACTION) {
     raiseArmed = false;
   }
@@ -1487,16 +1578,31 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const drawHip = rightHanded ? R_HIP : L_HIP;
   const bowHip = rightHanded ? L_HIP : R_HIP;
 
-  if (DEBUG) debugInfo = null; // cleared unless we make it all the way through below
+  // NEVER-BLANK default: cleared to a fresh "nothing computed yet this frame" object rather than
+  // bare null, so that even if a future bail path below forgets to set a more specific reason,
+  // the panel still shows something honest ("full draw check not yet run this frame") instead of
+  // going blank — see emptyDebugInfo's own comment. Every bail branch below overwrites this with
+  // its own specific reason; only a path nobody has written yet would ever leave this generic one
+  // standing, and even that is a real, readable sentence rather than silence.
+  if (DEBUG) debugInfo = emptyDebugInfo("full draw check not yet run this frame");
 
   // RAISE TRIGGER: independent of the stricter visibility this function's own full-draw checks
   // need below — see bowArmRaiseHeight's own comment. Updated (and fed to trackShotAttempt via
   // sample.raiseArmed, both here and below) on every frame this CAN be read at all, even one
   // where the rest of this function can't proceed (e.g. the draw elbow is briefly occluded) — the
   // raise must fire as easily as possible: fail toward recording.
-  updateRaiseTrigger(landmarks, frameWidth, frameHeight);
+  updateRaiseTrigger(landmarks, frameWidth, frameHeight, nowMs);
 
   if (![drawWrist, bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) {
+    if (DEBUG) {
+      const missing = describeMissingLandmarks(landmarks, [
+        [drawWrist, "draw wrist"],
+        [bowShoulder, "bow shoulder"],
+        [bowElbow, "bow elbow"],
+        [bowWrist, "bow wrist"],
+      ]);
+      debugInfo = emptyDebugInfo(`${missing.join(", ")} not confidently visible`);
+    }
     trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -1510,6 +1616,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   } else if (visible(landmarks, NOSE)) {
     anchorNorm = landmarks[NOSE];
   } else {
+    if (DEBUG) debugInfo = emptyDebugInfo("no anchor landmark — mouth and nose not confidently visible");
     trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -1523,6 +1630,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
     torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ??
     torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight);
   if (!scale) {
+    if (DEBUG) debugInfo = emptyDebugInfo("no torso scale — hip not confidently visible on either side");
     trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -1535,7 +1643,8 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const bowArmAngle = bowArmAngleOf(landmarks, frameWidth, frameHeight);
   if (bowArmAngle === null) {
     // handSep is already known at this point (computed above) even though the bow arm's own
-    // angle isn't — no reason to throw away a real reading here.
+    // angle isn't — no reason to throw away a real reading here, including on the ?debug panel.
+    if (DEBUG) debugInfo = { ...emptyDebugInfo("bow-arm angle unavailable — shoulder/elbow/wrist are degenerate (identical positions)"), handSep };
     trackShotAttempt({ handSep, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -1559,7 +1668,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
   const stillOk = speed <= FULL_DRAW_STILL_MAX;
 
-  if (DEBUG) debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+  if (DEBUG) debugInfo = { reason: null, anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
 
   const atFullDraw = anchorOk && armOk && sepOk && stillOk;
 
@@ -1642,6 +1751,7 @@ function trackShotAttempt(sample, nowMs) {
         eligibleSeen: 0,
         reachedFullDraw: false,
       };
+      if (DEBUG) debugEvents.attemptStarted = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
       // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
       // the time endAttempt fires the good part is already over. Starts regardless of this
       // frame's eligibility — the clip is a recording of what happened, not a measurement.
@@ -1842,6 +1952,7 @@ function endAttempt(nowMs) {
   // eligible frames, computed independently — see medianSampleOf's own comment for the full
   // reasoning and what this replaced.
   const shotNum = logShot({ ...medianSampleOf(a.eligibleFrames), startMs: a.startMs, reachedFullDraw: a.reachedFullDraw });
+  if (DEBUG) debugEvents.shotLogged = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
@@ -3147,35 +3258,256 @@ function paintCanvas(landmarks) {
   }
 }
 
-// ?debug-only readout of why the full-draw trigger is (or isn't) firing. No-op — not even
-// a DOM lookup beyond the one at startup — when ?debug isn't in the URL. Deliberately big and
-// blunt: this has to be readable from ~5 metres away while the owner is mid-shot, not tidy.
-// Hand separation gets top billing because it's the number most likely to need retuning. This
-// is a LIVE readout only — for anything that has to survive past the instant it happens (which
-// is everything the owner actually needs, per CLAUDE.md), see the shot log instead.
+// Builds the ?debug panel's entire DOM ONCE, at startup — see DEBUG_OVERLAY_REFRESH_MS's own
+// comment for why rebuilding this via innerHTML every frame was a real, measured stutter bug.
+// After this call, syncDebugOverlay only ever touches textContent/className/classList on the
+// nodes captured into dbgRefs here — strictly less DOM work per refresh than the panel this
+// replaced, which rebuilt via innerHTML on every throttled tick.
 //
-// Throttled to DEBUG_OVERLAY_REFRESH_MS (see that constant) rather than rebuilding this DOM every
-// rendered frame — nowMs is renderLoop's own `now`, threaded in as an argument (like frameEligible
-// elsewhere in this file) so this stays a plain, directly-testable function rather than reading
-// performance.now() itself.
-function syncDebugOverlay(nowMs) {
+// Four sections, in the order the owner asked for: FULL DRAW (the four gates plus the summary),
+// TRIGGERS/STATE (what the app is doing right now, as an annunciator-style lamp grid per the
+// owner's own follow-up brief — dark-and-outlined when off, solid green when lit), MEASURES (the
+// same numbers #readouts shows), SESSION (running totals plus tracking health). One static
+// template literal, not per-field createElement calls — cheap to build once, and every value node
+// carries a data-x attribute this function uses to populate dbgRefs right afterwards.
+function buildDebugPanel() {
+  debugEl.innerHTML = `
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Full draw</h2>
+      <div class="dbg-reason" data-x="reason"></div>
+      <div class="dbg-row">
+        <span class="dbg-name">Anchor dist</span>
+        <span class="dbg-val" data-x="g-anchor-val">—</span>
+        <span class="dbg-thresh" data-x="g-anchor-thresh"></span>
+        <span class="dbg-lamp" data-x="g-anchor-lamp">ANCHOR</span>
+      </div>
+      <div class="dbg-row">
+        <span class="dbg-name">Bow-arm angle</span>
+        <span class="dbg-val" data-x="g-arm-val">—</span>
+        <span class="dbg-thresh" data-x="g-arm-thresh"></span>
+        <span class="dbg-lamp" data-x="g-arm-lamp">ARM</span>
+      </div>
+      <div class="dbg-row">
+        <span class="dbg-name">Hand separation</span>
+        <span class="dbg-val" data-x="g-sep-val">—</span>
+        <span class="dbg-thresh" data-x="g-sep-thresh"></span>
+        <span class="dbg-lamp" data-x="g-sep-lamp">SEP</span>
+      </div>
+      <div class="dbg-row">
+        <span class="dbg-name">Stillness (speed)</span>
+        <span class="dbg-val" data-x="g-still-val">—</span>
+        <span class="dbg-thresh" data-x="g-still-thresh"></span>
+        <span class="dbg-lamp" data-x="g-still-lamp">STILL</span>
+      </div>
+      <div class="dbg-summary">
+        <span class="dbg-name">AT FULL DRAW</span>
+        <span class="dbg-lamp" data-x="g-fulldraw-lamp" style="min-width:7em">FULL DRAW</span>
+      </div>
+    </section>
+
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Triggers / state</h2>
+      <div class="dbg-lamps">
+        <div class="dbg-lampcell"><span class="dbg-lamp" data-x="t-attention-lamp">ATTN</span><div class="dbg-lampcaption">attention engaged</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp" data-x="t-raise-lamp">RAISE</span><div class="dbg-lampcaption">raise armed</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp" data-x="t-attempt-lamp">OPEN</span><div class="dbg-lampcaption">attempt open</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp" data-x="t-cropstable-lamp">STABLE</span><div class="dbg-lampcaption">crop box stable</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp" data-x="t-pose-lamp">POSE</span><div class="dbg-lampcaption">pose seen</div></div>
+      </div>
+      <div class="dbg-lamps">
+        <div class="dbg-lampcell"><span class="dbg-lamp dbg-lamp-event" data-x="t-ev-attempt">START</span><div class="dbg-lampcaption">attempt started</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp dbg-lamp-event" data-x="t-ev-raise">FIRED</span><div class="dbg-lampcaption">raise fired</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp dbg-lamp-event" data-x="t-ev-eligible">ELIGIBLE</span><div class="dbg-lampcaption">frame eligible</div></div>
+        <div class="dbg-lampcell"><span class="dbg-lamp dbg-lamp-event" data-x="t-ev-shot">LOGGED</span><div class="dbg-lampcaption">shot logged</div></div>
+      </div>
+      <div class="dbg-row">
+        <span class="dbg-name">Raise height</span>
+        <span class="dbg-val" data-x="t-raise-val">—</span>
+        <span class="dbg-thresh" data-x="t-raise-thresh"></span>
+        <span></span>
+      </div>
+      <div class="dbg-row dbg-row-2col">
+        <span class="dbg-name">Attempt</span>
+        <span class="dbg-val" data-x="t-attempt-detail">none</span>
+      </div>
+      <div class="dbg-row dbg-row-2col">
+        <span class="dbg-name">Settling</span>
+        <span class="dbg-val" data-x="t-settle-detail">—</span>
+      </div>
+      <div class="dbg-row">
+        <span class="dbg-name">Hand sep vs attempt floor</span>
+        <span class="dbg-val" data-x="t-boundary-val">—</span>
+        <span class="dbg-thresh" data-x="t-boundary-thresh"></span>
+        <span class="dbg-pf" data-x="t-boundary-pf"></span>
+      </div>
+    </section>
+
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Measures</h2>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Bow-arm line</span><span class="dbg-val" data-x="m-bowarm">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Shoulder drop (bow)</span><span class="dbg-val" data-x="m-shoulder-bow">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Shoulder drop (draw)</span><span class="dbg-val" data-x="m-shoulder-draw">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Elbow ↔ arrow line</span><span class="dbg-val" data-x="m-elbow">—</span></div>
+    </section>
+
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Session</h2>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Arrows</span><span class="dbg-val" data-x="s-arrows">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Rows logged</span><span class="dbg-val" data-x="s-rows">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Movements ignored</span><span class="dbg-val" data-x="s-ignored">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Unsettled attempts</span><span class="dbg-val" data-x="s-unsettled">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Attention idle periods</span><span class="dbg-val" data-x="s-idle">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Pose</span><span class="dbg-val" data-x="s-pose">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Torso scale</span><span class="dbg-val" data-x="s-scale">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">ROI cropping</span><span class="dbg-val" data-x="s-roi">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Model</span><span class="dbg-val" data-x="s-model">measuring…</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Last inference</span><span class="dbg-val" data-x="s-inference">—</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Rendered fps</span><span class="dbg-val" data-x="s-fps">—</span></div>
+    </section>
+  `;
+  dbgRefs = {};
+  debugEl.querySelectorAll("[data-x]").forEach((el) => {
+    dbgRefs[el.dataset.x] = el;
+  });
+}
+
+// ?debug panel's per-refresh update. No-op (not even a DOM lookup) when ?debug isn't in the URL.
+// Throttled to DEBUG_OVERLAY_REFRESH_MS exactly as before — only TEXT/CLASS updates happen on the
+// nodes buildDebugPanel already created, never a DOM rebuild (see that function's own comment).
+//
+// `landmarks` has three distinct meanings, not two — this is the mechanism behind the panel's
+// "never go blank, and never lie about being fresh" behaviour during an idle gap:
+//   - a real array: a pose was found this frame — MEASURES/torso-scale are recomputed fresh.
+//   - null: detection genuinely ran this frame and found nobody — MEASURES show "uncertain" and
+//     lastPoseSeen goes false (set by the caller, not here).
+//   - undefined (the argument simply omitted): this call came from an attention-gating idle tick
+//     that skipped detection entirely — MEASURES/torso-scale are left exactly as last drawn,
+//     since there is no fresher truth to show and redrawing "uncertain" would be a false claim
+//     that tracking was lost, not merely un-sampled this instant.
+// The FULL DRAW section and most of TRIGGERS/STATE don't need this distinction at all: they read
+// straight from debugInfo/module state, which idle ticks simply never touch, so they already hold
+// their last real value through an idle gap for free.
+function syncDebugOverlay(nowMs, landmarks, frameWidth, frameHeight) {
   if (!DEBUG) return;
   if (nowMs - lastDebugRenderMs < DEBUG_OVERLAY_REFRESH_MS) return;
   lastDebugRenderMs = nowMs;
-  const otherChecks = (s) => `anchor ${s.anchorOk ? "ok" : "fail"} · arm ${s.armOk ? "ok" : "fail"} · still ${s.stillOk ? "ok" : "fail"}`;
+  const r = dbgRefs;
+  const d = debugInfo; // always a real object — see emptyDebugInfo's own comment
 
-  const liveHtml = !debugInfo
-    ? `<div class="debug-big debug-fail">hand sep: no pose seen</div>`
-    : `<div class="debug-big ${debugInfo.sepOk ? "debug-ok" : "debug-fail"}">hand sep ${debugInfo.handSep.toFixed(2)} of ${FULL_DRAW_HAND_SEP_MIN} needed — ${debugInfo.sepOk ? "far enough apart" : "too close together"}</div>`;
+  const fmt = (v, digits = 2) => (v == null ? "—" : v.toFixed(digits));
+  const fmtDeg = (v) => (v == null ? "—" : `${Math.round(v)}°`);
+  const setLamp = (el, lit) => el.classList.toggle("lit", !!lit);
+  const okClass = (ok) => (ok == null ? "uncertain" : ok ? "ok" : "warn");
 
-  const checksHtml = debugInfo ? `<div class="debug-small">${otherChecks(debugInfo)}</div>` : "";
+  // ----- FULL DRAW: the never-blank reason line, then the four gates plus their summary lamp. -----
+  r["reason"].textContent = d.reason ?? "reading normally — full draw check completed this frame";
+  r["reason"].classList.toggle("dbg-reason-bail", !!d.reason);
+  r["reason"].classList.toggle("dbg-reason-ok", !d.reason);
 
-  debugEl.innerHTML = liveHtml + checksHtml;
+  const setGate = (key, value, ok, threshText, fmtFn) => {
+    r[`${key}-val`].textContent = fmtFn(value);
+    r[`${key}-val`].className = `dbg-val ${okClass(ok)}`;
+    r[`${key}-thresh`].textContent = threshText;
+    setLamp(r[`${key}-lamp`], ok === true);
+  };
+  setGate("g-anchor", d.anchorDist, d.anchorOk, `≤ ${FULL_DRAW_ANCHOR_MAX}`, fmt);
+  setGate("g-arm", d.bowArmAngle, d.armOk, `≥ ${FULL_DRAW_BOW_ARM_MIN}°`, fmtDeg);
+  setGate("g-sep", d.handSep, d.sepOk, `≥ ${FULL_DRAW_HAND_SEP_MIN}`, fmt);
+  setGate("g-still", d.speed, d.stillOk, `≤ ${FULL_DRAW_STILL_MAX}`, fmt);
+  setLamp(r["g-fulldraw-lamp"], d.anchorOk === true && d.armOk === true && d.sepOk === true && d.stillOk === true);
+
+  // ----- TRIGGERS / STATE -----
+  setLamp(r["t-attention-lamp"], attentionEngaged);
+  setLamp(r["t-raise-lamp"], raiseArmed);
+  setLamp(r["t-attempt-lamp"], attempt !== null);
+  setLamp(r["t-cropstable-lamp"], lastCropBoxStable);
+  setLamp(r["t-pose-lamp"], lastPoseSeen);
+
+  setLamp(r["t-ev-attempt"], isDebugEventLit(debugEvents.attemptStarted, nowMs));
+  setLamp(r["t-ev-raise"], isDebugEventLit(debugEvents.raiseFired, nowMs));
+  setLamp(r["t-ev-eligible"], isDebugEventLit(debugEvents.frameEligible, nowMs));
+  setLamp(r["t-ev-shot"], isDebugEventLit(debugEvents.shotLogged, nowMs));
+
+  r["t-raise-val"].textContent = fmt(debugRaiseHeight);
+  r["t-raise-thresh"].textContent = `≥ ${RAISE_TRIGGER_UP_FRACTION} up / ≤ ${RAISE_TRIGGER_DOWN_FRACTION} down`;
+
+  if (attempt) {
+    const drawing = attempt.startMs !== null;
+    const elapsedMs = nowMs - (drawing ? attempt.startMs : attempt.watchStartedAt);
+    r["t-attempt-detail"].textContent =
+      `open ${(elapsedMs / 1000).toFixed(1)}s (${drawing ? "drawing" : "raise phase"}) — peak sep ${fmt(attempt.peakHandSep)} — real-draw clock ${drawing ? "started" : "not started yet"}`;
+  } else {
+    r["t-attempt-detail"].textContent = "none";
+  }
+
+  r["t-settle-detail"].textContent =
+    `${settledFrames}/${SETTLE_FRAMES_REQUIRED} frames` +
+    (ROI_CROPPING_ENABLED ? `, crop box ${lastCropBoxStable ? "stable" : "not stable"}` : "");
+
+  const boundaryOk = d.handSep == null ? null : d.handSep >= DRAW_ATTEMPT_MIN_SEP;
+  r["t-boundary-val"].textContent = fmt(d.handSep);
+  r["t-boundary-thresh"].textContent = `≥ ${DRAW_ATTEMPT_MIN_SEP}`;
+  r["t-boundary-pf"].textContent = boundaryOk == null ? "—" : boundaryOk ? "PASS" : "FAIL";
+  r["t-boundary-pf"].className = `dbg-pf ${okClass(boundaryOk)}`;
+
+  // ----- MEASURES + torso scale — only when THIS call actually carries a fresh sample (see this
+  // function's own comment on the three meanings of `landmarks`). An idle tick (landmarks
+  // undefined) leaves these exactly as last drawn rather than redrawing a false "uncertain". -----
+  if (landmarks !== undefined) {
+    const setMeasure = (key, value, ok, fmtFn) => {
+      r[key].textContent = value == null ? "— uncertain" : fmtFn(value);
+      r[key].className = `dbg-val ${okClass(value == null ? null : ok)}`;
+    };
+    const bowArmAngle = landmarks ? bowArmAngleOf(landmarks, frameWidth, frameHeight) : null;
+    setMeasure("m-bowarm", bowArmAngle, bowArmAngle != null && bowArmAngle >= BOW_ARM_ANGLE_MIN && bowArmAngle <= BOW_ARM_ANGLE_MAX, fmtDeg);
+    const shoulders = landmarks ? shoulderDropSampleOf(landmarks, frameWidth, frameHeight) : { bow: null, draw: null };
+    setMeasure("m-shoulder-bow", shoulders.bow, shoulders.bow != null && shoulders.bow >= SHOULDER_DROP_MIN_PCT, (v) => `${Math.round(v)}%`);
+    setMeasure("m-shoulder-draw", shoulders.draw, shoulders.draw != null && shoulders.draw >= SHOULDER_DROP_MIN_PCT, (v) => `${Math.round(v)}%`);
+    const elbow = landmarks ? drawElbowAlignmentOf(landmarks, frameWidth, frameHeight) : null;
+    setMeasure(
+      "m-elbow",
+      elbow,
+      elbow != null && elbow.deviation <= DRAW_ELBOW_ALIGN_MAX_DEVIATION,
+      (v) => (Math.round(v.deviation) === 0 ? "in line" : `${Math.round(v.deviation)}° ${v.direction}`)
+    );
+
+    const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
+    const bowHip = rightHanded ? L_HIP : R_HIP;
+    const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
+    const drawHip = rightHanded ? R_HIP : L_HIP;
+    const torsoScale = landmarks
+      ? torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ?? torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight)
+      : null;
+    r["s-scale"].textContent = torsoScale == null ? "—" : `${torsoScale.toFixed(1)}px`;
+  }
+
+  // ----- SESSION — running totals and pure module state; always safe to refresh regardless of
+  // whether this call carries a fresh landmarks sample. -----
+  r["s-arrows"].textContent = String(fullDrawShotCount);
+  r["s-rows"].textContent = String(shotCount);
+  r["s-ignored"].textContent = String(rejectedAttemptCount);
+  r["s-unsettled"].textContent = String(unsettledAttemptCount);
+  r["s-idle"].textContent = String(attentionIdlePeriods);
+  r["s-pose"].textContent = lastPoseSeen ? "seen" : "not seen";
+  r["s-roi"].textContent = !ROI_CROPPING_ENABLED ? "disabled" : currentCropBox ? "active" : "no box yet";
+  r["s-model"].textContent = modelStatusLine ?? "measuring…";
+  r["s-inference"].textContent = lastInferenceMs == null ? "—" : `${lastInferenceMs.toFixed(1)}ms`;
+  r["s-fps"].textContent = debugInstantFps == null ? "—" : debugInstantFps.toFixed(1);
 }
 
 function renderLoop() {
   requestAnimationFrame(renderLoop);
   const now = performance.now();
+
+  // Display-only: a live "rendered fps" figure for the ?debug SESSION section, recomputed from
+  // consecutive renderLoop calls — this callback runs every rAF tick regardless of attention
+  // gating (only the detection work below is ever skipped), so this is the same "whole frame,
+  // drawing included" quantity the one-time POSE MODEL warm-up measurement reports, just live.
+  // Guarded by DEBUG so it costs nothing outside ?debug.
+  if (DEBUG) {
+    if (debugLastFrameTs !== null) debugInstantFps = 1000 / (now - debugLastFrameTs);
+    debugLastFrameTs = now;
+  }
 
   if (!poseLandmarker || video.readyState < 2) return;
 
@@ -3191,6 +3523,10 @@ function renderLoop() {
       attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
     if (!dueForIdleSample) {
       paintCanvas(null); // <video> keeps playing on its own; this only matters if a clip happens to be recording (see paintCanvas)
+      // landmarks argument omitted (undefined), not null: this tick never ran detection at all —
+      // see syncDebugOverlay's own comment on the difference — so the panel keeps showing its
+      // last real reading through the idle gap instead of flashing "not seen" for a reason that
+      // has nothing to do with whether the archer is actually there.
       syncDebugOverlay(now);
       return;
     }
@@ -3221,7 +3557,9 @@ function renderLoop() {
 
   const inferenceStart = performance.now();
   const result = poseLandmarker.detectForVideo(detectionSource, now);
-  measurePoseModelPerf(performance.now() - inferenceStart, now);
+  const inferenceMs = performance.now() - inferenceStart;
+  if (DEBUG) lastInferenceMs = inferenceMs; // display-only, see its own comment
+  measurePoseModelPerf(inferenceMs, now);
   let rawLandmarks = result.landmarks?.[0];
 
   // The model just saw a close-up crop, so its landmarks came back in CROP-LOCAL normalised
@@ -3240,6 +3578,12 @@ function renderLoop() {
   // from here to the end of this same frame already runs against the fresh, reset state.
   updateAttentionState(now, rawLandmarks, frameWidth, frameHeight);
 
+  // Display-only: this frame's smoothed landmarks (or null, on genuine pose loss), for
+  // syncDebugOverlay's MEASURES/torso-scale section at the bottom of this function — declared
+  // out here because the success branch below sets it inside its own block scope. Never read by
+  // anything except the ?debug panel.
+  let landmarksForDebug = null;
+
   if (!rawLandmarks) {
     updateCue(true, false); // "not seeing you" — set before endAttempt below, so a rejected/logged flash this same frame knows to hand back to "lost", not "resting", once it clears
     paintCanvas(null); // no skeleton to draw; <video> keeps the on-screen view alive on its own, and paintCanvas still bakes the picture in if a clip is recording
@@ -3247,7 +3591,10 @@ function renderLoop() {
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
-    if (DEBUG) debugInfo = null;
+    if (DEBUG) {
+      debugInfo = emptyDebugInfo("no pose detected this frame");
+      lastPoseSeen = false;
+    }
     // Tracking just lost the archer entirely — whatever the filters were smoothing toward is now
     // stale. Reset so a fresh detection later starts clean rather than being dragged from
     // wherever the skeleton was last seen (see LandmarkSmoother).
@@ -3270,6 +3617,8 @@ function renderLoop() {
     // coordinate system that doesn't itself change shape from frame to frame the way a moving
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
+    landmarksForDebug = landmarks; // display-only — see its own declaration and syncDebugOverlay's call at the bottom of this function
+    if (DEBUG) lastPoseSeen = true;
     paintCanvas(landmarks);
     updateBowArmReadout(landmarks, frameWidth, frameHeight);
     updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
@@ -3287,8 +3636,10 @@ function renderLoop() {
     // variable gets overwritten for next frame, then threaded through as an explicit argument
     // (like nowMs already is) so selfTest can drive it too.
     const cropBoxStableThisFrame = cropBoxIsStable(usedCropBox, prevUsedCropBox);
+    if (DEBUG) lastCropBoxStable = cropBoxStableThisFrame; // display-only, see its own declaration
     prevUsedCropBox = usedCropBox;
     const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
+    if (DEBUG && frameEligible) debugEvents.frameEligible = now; // display-only latch, see DEBUG_EVENT_LATCH_MS
     isAtFullDraw(landmarks, now, frameEligible, frameWidth, frameHeight);
     // `attempt` (module-level, see trackShotAttempt) is already up to date for THIS frame — the
     // isAtFullDraw call above just ran it. Read it straight rather than threading a return value
@@ -3307,7 +3658,7 @@ function renderLoop() {
       : null;
   }
 
-  syncDebugOverlay(now);
+  syncDebugOverlay(now, landmarksForDebug, frameWidth, frameHeight);
 }
 
 function updateHandButtonLabel() {
@@ -3746,6 +4097,80 @@ function selfTest() {
   console.assert(
     isAtFullDraw(drifted, 600, true, NOOP_W, NOOP_H) === false,
     "wrist jumping far in 100ms (fast) should not read as holding still"
+  );
+
+  // --- ?debug NEVER-BLANK: isAtFullDraw must leave debugInfo as a real, non-null object naming a
+  // plain-language reason on every bail path it can take, never bare null or an object with no
+  // reason — a blank ?debug panel was exactly the bug this redesign exists to fix. debugInfo is
+  // only ever written `if (DEBUG)` (see isAtFullDraw itself), so this whole block is correctly a
+  // no-op — not a false pass — on a page loaded without ?debug in the URL.
+  if (DEBUG) {
+    lastDrawWrist = null;
+    const missingDrawWrist = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31, visibility: 0 } });
+    isAtFullDraw(missingDrawWrist, 0, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo !== null && typeof debugInfo.reason === "string" && debugInfo.reason.length > 0,
+      "a missing required landmark must leave debugInfo with a real, non-empty reason — never blank"
+    );
+    console.assert(
+      debugInfo.reason.includes("draw wrist"),
+      `the missing-landmark reason should name the actual joint that's missing (got ${JSON.stringify(debugInfo.reason)})`
+    );
+
+    lastDrawWrist = null;
+    const noAnchor = mkLandmarks({
+      ...base,
+      9: { x: 0.5, y: 0.3, visibility: 0 }, // mouth L hidden
+      10: { x: 0.5, y: 0.3, visibility: 0 }, // mouth R hidden
+      0: { x: 0.5, y: 0.25, visibility: 0 }, // nose hidden too — no fallback anchor left at all
+      15: { x: 0.0, y: 0.3 },
+      16: { x: 0.52, y: 0.31 },
+    });
+    isAtFullDraw(noAnchor, 0, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo.reason && debugInfo.reason.includes("anchor"),
+      `losing both mouth and nose should report a no-anchor reason (got ${JSON.stringify(debugInfo.reason)})`
+    );
+
+    lastDrawWrist = null;
+    const noScale = mkLandmarks({
+      ...base,
+      23: { x: 0.3, y: 0.6, visibility: 0 }, // bow hip hidden
+      24: { x: 0.5, y: 0.6, visibility: 0 }, // draw hip hidden too — no fallback scale left either
+      15: { x: 0.0, y: 0.3 },
+      16: { x: 0.52, y: 0.31 },
+    });
+    isAtFullDraw(noScale, 0, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo.reason && debugInfo.reason.includes("torso scale"),
+      `losing both hips should report a no-torso-scale reason (got ${JSON.stringify(debugInfo.reason)})`
+    );
+
+    // A genuine full draw, for contrast: the never-blank fix must not turn a perfectly good,
+    // fully-readable frame into a fake bail — reason must clear back to null and the real numbers
+    // must still be there.
+    lastDrawWrist = null;
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H);
+    console.assert(debugInfo.reason === null, "a fully-readable full-draw frame must clear the bail reason, not invent one");
+    console.assert(
+      typeof debugInfo.handSep === "number" && typeof debugInfo.bowArmAngle === "number",
+      "a fully-readable frame's debugInfo must carry its real computed numbers"
+    );
+  }
+
+  // --- ?debug momentary-event lamps (see DEBUG_EVENT_LATCH_MS): a same-frame event must still
+  // read as lit by the time the panel's own throttled refresh gets to it, and must go dark again
+  // once the latch window has genuinely passed — the whole point of latching at all. Pure
+  // function, no ?debug/module state involved, so this runs unconditionally either way.
+  console.assert(isDebugEventLit(0, 1000) === false, "an event that never happened (timestamp 0) must never read as lit");
+  console.assert(isDebugEventLit(1000, 1000) === true, "an event that just happened this instant must be lit");
+  console.assert(
+    isDebugEventLit(1000, 1000 + DEBUG_EVENT_LATCH_MS) === true,
+    "an event must still be lit exactly at the edge of its own latch window"
+  );
+  console.assert(
+    isDebugEventLit(1000, 1000 + DEBUG_EVENT_LATCH_MS + 1) === false,
+    "an event must go dark once its latch window has genuinely passed — a latch that never turns off would hide every OTHER momentary event by staying lit forever"
   );
 
   // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand

@@ -7,6 +7,14 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <!-- ?debug diagnostic panel — a direct child of <body>, not of #stage, so a two-column
+       body.debug-mode grid layout (see style.css) can put it in its own 40% column with #stage
+       (camera + skeleton) in the other 60% column, per the owner's brief: "cut the space
+       vertically in 2 pieces". It stays display:none (via .hidden, only ever removed when
+       ?debug is in the URL — see app.js) in every other build, so this move changes nothing
+       about normal (non-debug) behaviour or layout. Its content is built once at startup
+       (buildDebugPanel in app.js) and only text/classes are touched after that. -->
+  <div id="debug" class="hidden"></div>
   <div id="stage">
     <div id="camerabox">
       <video id="video" autoplay playsinline muted></video>
@@ -15,7 +23,6 @@
     <div id="cue"></div>
 
     <div id="status">Starting camera…</div>
-    <div id="debug" class="hidden"></div>
     <div id="shotlog" class="hidden">
       <div id="shotlog-header">
         <button type="button" id="shotlog-share">⇪ Share</button>
