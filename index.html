@@ -17,7 +17,11 @@
     <div id="status">Starting camera…</div>
     <div id="debug" class="hidden"></div>
     <div id="shotlog" class="hidden">
-      <button type="button" id="shotlog-close">✕ Close</button>
+      <div id="shotlog-header">
+        <button type="button" id="shotlog-share">⇪ Share</button>
+        <button type="button" id="shotlog-close">✕ Close</button>
+      </div>
+      <textarea id="shotlog-sharetext" class="hidden" readonly></textarea>
       <div id="shotlog-content"></div>
     </div>
 

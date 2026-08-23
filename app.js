@@ -264,6 +264,8 @@ const shotLogEl = document.getElementById("shotlog");
 // scroll it out of reach. See HANDOVER.md Stage 1a.
 const shotLogContentEl = document.getElementById("shotlog-content");
 const shotLogCloseBtn = document.getElementById("shotlog-close");
+const shotLogShareBtn = document.getElementById("shotlog-share");
+const shotLogShareTextEl = document.getElementById("shotlog-sharetext");
 const clipPlayerEl = document.getElementById("clipplayer");
 const clipPlayerVideo = document.getElementById("clipplayer-video");
 const clipPlayerClose = document.getElementById("clipplayer-close");
@@ -618,7 +620,7 @@ function setModelStatusLine(avgMs, renderedFps) {
 // in the REGION-OF-INTEREST CROPPING constants above. The offscreen canvas below is never added
 // to the page (document.createElement, not appendChild) — it exists purely as an intermediate
 // image for MediaPipe to look at; it is NEVER what gets drawn to the visible #overlay canvas or
-// recorded into a shot's clip (see drawVideoFrame/drawSkeleton further down — those always draw
+// recorded into a shot's clip (see paintCanvas/drawVideoFrame further down — those always draw
 // the full camera frame). Cropping is an inference-input concern only.
 const roiCanvas = document.createElement("canvas");
 roiCanvas.width = ROI_CANVAS_SIZE;
@@ -1019,10 +1021,9 @@ async function startCamera() {
     await waitForVideoReady();
   }
 
-  // No CSS mirroring here any more — see effectiveMirror/withMirror below for why. The <video>
-  // element itself is left completely alone (never flipped, never classed); the canvas painted
-  // on top of it is opaque every frame (see drawVideoFrame) and is what actually gets mirrored,
-  // in its pixels, when that's called for.
+  // Nothing to do for mirroring here — see effectiveMirror/withMirror/syncMirrorClasses for how
+  // it actually gets applied (a CSS class kept in sync every frame from paintCanvas), not
+  // anything startCamera itself needs to set up.
   sizeCanvasToVideo();
 }
 
@@ -2431,25 +2432,165 @@ function renderShotLog() {
   shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
-// Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
-// the canvas transparent so the <video> element underneath showed through on its own — visually
-// identical, but it meant the canvas itself had no picture in it, only skeleton lines. Now that
-// the canvas is what gets recorded (see startClipRecording — canvas.captureStream is the only
-// way to bake the skeleton into a clip), the canvas needs its own copy of the video frame every
-// time, landmarks or not, so a clip is never missing frames just because the pose was briefly
-// lost. canvas.width/height are set to the video's native resolution in startCamera, so this
-// plain draw lines up exactly with no cropping or letterboxing needed. Always draws the RAW,
-// unmirrored video frame — see withMirror below for where the flip actually happens; this
-// function has no idea whether the current picture is mirrored or not, deliberately.
+// ===== SHARE — the owner's only route to a full session's numbers. He can't remember to add
+// ?debug before he starts shooting (he isn't even holding the phone by then), and a screenshot
+// loses whatever's off the bottom of the screen and isn't machine-readable at the other end. So
+// Share always includes everything ?debug shows on a row (hand sep, the four trigger booleans)
+// PLUS the session-level lines renderShotLog already computes — regardless of ?debug.
 //
-// This fully repaints canvas.width × canvas.height every call (clearRect then a drawImage that
-// covers the same rectangle), so the <video> element underneath — which sits at the same CSS
-// box (inset: 0, 100% × 100%) as this canvas — can never show through at an edge, even if the
-// two elements' internal pixel dimensions differ (they can: canvas.width/height are the video's
-// native capture resolution, while the CSS box both are stretched into is the on-screen viewport
-// size). "Stretched into a differently-sized box" is not "gaps at the edges" — both elements
-// always cover their entire box, just at different effective scales, so there is no seam for the
-// unflipped video to leak through.
+// buildShareText is the ONE pure function that does the actual text generation — entries (a
+// log-shaped array, any order) and a plain counters object in, one string out. No DOM, no
+// navigator, no module state read directly, so selfTest can assert on it exactly like
+// summarizeShots/narrateMeasure above. `entries` is deliberately just "whatever log currently
+// holds", the same SHOT_LOG_MAX-capped list renderShotLog reads — counters.shotCount is the true
+// session total, and the two can disagree (see the truncation notice below) whenever more than
+// SHOT_LOG_MAX arrows have been shot.
+function buildShareText(entries, counters) {
+  const {
+    shotCount,
+    rejectedAttemptCount,
+    unsettledAttemptCount,
+    attentionIdlePeriods,
+    attentionLateWakeCount,
+    clipsUnavailableReason,
+    modelStatusLine,
+    rightHanded,
+    mirrored,
+    cameraWidth,
+    cameraHeight,
+  } = counters;
+
+  const lines = [];
+  lines.push("Archery form coach — session share");
+  // Context that changes how every number below should be read: which arm is "bow", whether the
+  // picture (and therefore the clips) are mirrored, and the actual capture resolution — geometry
+  // fixes in this app have already been sensitive to exactly these settings (see CLAUDE.md).
+  lines.push(`Camera ${cameraWidth ?? "?"}x${cameraHeight ?? "?"} · ${rightHanded ? "right-handed" : "left-handed"} · mirror ${mirrored ? "on" : "off"}`);
+  if (modelStatusLine) lines.push(modelStatusLine);
+
+  lines.push("");
+  lines.push(`Arrows this session: ${shotCount}`);
+  // The log only ever keeps the newest SHOT_LOG_MAX entries — without this line, a 30-arrow
+  // session sharing only its last 10 draws would silently look like a complete 10-arrow session,
+  // and threshold retuning done against it would be working from a biased sample without knowing.
+  if (entries.length < shotCount) {
+    lines.push(`NOTE: only the most recent ${entries.length} of ${shotCount} draws are included below — the log only keeps the last ${entries.length}.`);
+  }
+  lines.push(`Movements ignored (not real draws): ${rejectedAttemptCount}`);
+  lines.push(`Arrows drawn before settling (not recorded): ${unsettledAttemptCount}`);
+  lines.push(
+    `Attention idle periods: ${attentionIdlePeriods}${attentionLateWakeCount ? ` (${attentionLateWakeCount} late wake${attentionLateWakeCount === 1 ? "" : "s"})` : ""}`
+  );
+  if (clipsUnavailableReason) lines.push(`Clip recording: ${clipsUnavailableReason}`);
+
+  // Same consistency wording renderShotLog puts in the app itself (narrateMeasure) — reusing it
+  // rather than re-deriving a second version keeps the shared text and the on-screen log always
+  // in agreement.
+  lines.push("");
+  lines.push("Consistency:");
+  const measures = [
+    narrateMeasure(entries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG),
+    narrateMeasure(entries, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(entries, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(entries, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG),
+  ].filter(Boolean);
+  if (measures.length === 0) lines.push("  Not enough shots yet for a consistency read.");
+  else measures.forEach((m) => lines.push(`  ${m.text}`));
+
+  // One draw per line, oldest first (entries itself is newest-first, same order the log/render
+  // read it in) — chronological reads naturally top-to-bottom for a session review, and matches
+  // shot numbering order.
+  lines.push("");
+  lines.push("Draws (oldest first):");
+  const chronological = [...entries].sort((a, b) => a.shotNum - b.shotNum);
+  if (chronological.length === 0) lines.push("  (none)");
+  else chronological.forEach((e) => lines.push(shareLineForEntry(e)));
+
+  const clipFailures = chronological.filter((e) => e.clipFailReason);
+  if (clipFailures.length) {
+    lines.push("");
+    lines.push("Clip failures:");
+    clipFailures.forEach((e) => lines.push(`  Shot ${e.shotNum}: ${e.clipFailReason}`));
+  }
+
+  return lines.join("\n");
+}
+
+// Formatters shared by shareLineForEntry below — each renders a measure's own null (uncertain,
+// below MIN_VISIBILITY — see shoulderDropOf/bowArmAngleOf/drawElbowAlignmentOf) as the honest word
+// "uncertain", never a fake 0/0%/pass, so a retuning session can't mistake "wasn't measured" for
+// "measured as zero".
+function shareDeg(v) { return v == null ? "uncertain" : `${Math.round(v)}deg`; }
+function shareSignedDeg(v) { return v == null ? "uncertain" : `${v >= 0 ? "+" : ""}${Math.round(v)}deg`; }
+function sharePct(v) { return v == null ? "uncertain" : `${Math.round(v)}%`; }
+function sharePassFail(v) { return v == null ? "unknown" : v ? "pass" : "fail"; }
+
+// One logged draw as one labelled line: shot number, all four form readouts, hand separation (the
+// key figure the threshold retune needs — see CLAUDE.md/HANDOVER.md), the pass/fail of each of the
+// four full-draw trigger conditions, whether it reached true full draw, and whether it has a clip.
+// Always includes everything a ?debug row shows, regardless of whether ?debug is set — that gate
+// only applies to the LIVE on-screen row (see renderShotRow's debugBit); it never applies here.
+function shareLineForEntry(e) {
+  const recorded = e.clipUrl ? "yes" : "no";
+  const failBit = e.clipFailReason ? ` clipFailReason="${e.clipFailReason}"` : "";
+  return (
+    `shot=${e.shotNum} bowArm=${shareDeg(e.bowArmAngle)} shoulderBow=${sharePct(e.shoulderDrop?.bow ?? null)} ` +
+    `shoulderDraw=${sharePct(e.shoulderDrop?.draw ?? null)} elbow=${shareSignedDeg(e.elbowAlign?.signed ?? null)} ` +
+    `handSep=${e.handSep == null ? "uncertain" : e.handSep.toFixed(3)} anchor=${sharePassFail(e.anchorOk)} arm=${sharePassFail(e.armOk)} ` +
+    `sep=${sharePassFail(e.sepOk)} still=${sharePassFail(e.stillOk)} fullDraw=${e.reachedFullDraw ? "yes" : "no"} recorded=${recorded}${failBit}`
+  );
+}
+
+// Gets buildShareText's string off the phone. Three steps, each only tried if the one before it
+// is unavailable or actually failed — the owner must never tap Share and get nothing with no idea
+// why. (1) The iOS share sheet — the natural route on his device: one tap, then AirDrop to his
+// Mac, or into Notes/Messages. Unsupported on desktop Safari and some contexts, and it throws if
+// not called from a genuine user gesture (which this always is — only ever called from the Share
+// button's own click handler). (2) The clipboard. (3) A selectable on-screen text block he can
+// copy by hand — the guaranteed-to-work last resort.
+async function shareSessionText(text) {
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: "Archery form coach — session share", text });
+      return;
+    } catch (err) {
+      // AbortError means the owner opened the share sheet and backed out himself — that's not a
+      // failure to fall back from, he just changed his mind. Anything else (unsupported context,
+      // not a real user gesture, a share target rejecting it) falls through to the clipboard.
+      if (err && err.name === "AbortError") return;
+    }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      flashShareButton("Copied!");
+      return;
+    } catch (err) {
+      // fall through to the manual copy block below
+    }
+  }
+  showShareFallbackText(text);
+}
+
+// Briefly relabels the Share button to confirm the clipboard copy actually happened — the owner
+// gets no OS-level confirmation for navigator.clipboard the way he does for the native share
+// sheet, so without this a silent success and a silent failure would look identical to him.
+function flashShareButton(label) {
+  const original = shotLogShareBtn.textContent;
+  shotLogShareBtn.textContent = label;
+  setTimeout(() => { shotLogShareBtn.textContent = original; }, 1500);
+}
+
+// Last resort: neither the share sheet nor the clipboard worked. A plain, pre-selected, readonly
+// textarea the owner can press-and-hold to copy by hand — guaranteed to work with no permissions
+// or APIs at all, which is the whole point of it being the last step in the chain.
+function showShareFallbackText(text) {
+  shotLogShareTextEl.value = text;
+  shotLogShareTextEl.classList.remove("hidden");
+  shotLogShareTextEl.focus();
+  shotLogShareTextEl.select();
+}
+
 // ===== SHOOTING CUES — HANDOVER.md Stage 2. He can't touch or read the phone while shooting, and
 // lost freeze meant he had no way to tell mid-end whether the app was even working. Four states,
 // exactly the four he asked for (see HANDOVER.md "Answered by the owner" — he named two things
@@ -2457,7 +2598,10 @@ function renderShotLog() {
 // seeing him and calm, watching a live draw, and the one-shot outcome once a draw ends. No new
 // detection logic here — every state is read straight off state this file already tracks for
 // other reasons (tracking loss, the module-level `attempt`, and endAttempt's own verdict). Lives
-// on #cue, a plain DOM element layered over #camerabox (see index.html/style.css), never on
+// on #cue, a plain DOM element covering the whole #stage — deliberately NOT #camerabox: anchored
+// to the camera box, the border lands off-screen entirely on any axis where the camera and screen
+// aspect ratios agree and no letterbox gutter exists, silently hiding the most important state.
+// See index.html/style.css. Never drawn on
 // #overlay: #overlay is what canvas.captureStream() records into every clip (see
 // startClipRecording), so anything painted there would be baked into the owner's saved footage
 // without him ever finding out until he watched one back.
@@ -2516,13 +2660,28 @@ function signalOutcome(logged) {
 }
 // ===========================================================================
 
+// Draws the current camera frame into the overlay canvas, unmirrored. Only used while a clip is
+// actively recording (see paintCanvas below) — canvas.captureStream is the only way to bake the
+// picture into a clip, so the canvas needs its own copy of the video frame for exactly that
+// window, landmarks or not, so a clip is never missing frames just because the pose was briefly
+// lost. canvas.width/height are set to the video's native resolution in startCamera, so this
+// plain draw lines up exactly with no cropping or letterboxing needed. See withMirror below for
+// where the flip actually happens; this function has no idea whether the current picture is
+// mirrored or not, deliberately.
+//
+// This fully repaints canvas.width × canvas.height every call (clearRect then a drawImage that
+// covers the same rectangle) — the same box <video> sits in underneath (inset: 0, 100% × 100%),
+// so while this is drawing there is no seam at any edge for the unflipped video to leak through.
 function drawVideoFrame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 }
 
-function drawSkeleton(landmarks) {
-  drawVideoFrame();
+// The skeleton lines/dots only — no video frame. Pulled out on its own so paintCanvas can draw
+// it either on top of a freshly-composited video frame (recording) or straight onto a transparent
+// canvas (not recording, <video> shows through on its own) without duplicating the two
+// drawingUtils calls in both places.
+function drawSkeletonLines(landmarks) {
   drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
     color: "#00e5ff",
     lineWidth: 3,
@@ -2530,16 +2689,12 @@ function drawSkeleton(landmarks) {
   drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", radius: 4 });
 }
 
-// Runs one frame's worth of canvas drawing (video frame, and the skeleton on top of it when
-// there is one) inside a horizontal flip, when effectiveMirror says this frame should be
-// mirrored. This is now the ONLY place mirroring happens in the whole app — replacing the old
-// CSS `.mirrored` class on #video/#overlay, which only changed how the browser displayed those
-// elements and never touched a single pixel. That mattered because clips are recorded straight
-// off this canvas (canvas.captureStream, see startClipRecording): a CSS transform is invisible
-// to a pixel-capture stream, so the old approach meant a mirrored on-screen view recorded an
-// UNmirrored clip — the owner would watch back something that didn't match what he saw live.
-// Doing the flip here instead means the canvas's own pixels are mirrored, so whatever the owner
-// saw on screen is exactly what the recorder captured.
+// Runs one frame's worth of canvas drawing inside a horizontal flip, when effectiveMirror says
+// this frame should be mirrored. Only used while a clip is recording (see paintCanvas) — the rest
+// of the time mirroring is a CSS class instead (see syncMirrorClasses/style.css), because a CSS
+// transform is invisible to canvas.captureStream: a clip is recorded straight off this canvas's
+// own pixels, so whatever the owner sees mirrored on screen while recording has to be mirrored IN
+// THE CANVAS, not just in CSS, or the clip he watches back won't match what he saw live.
 //
 // The flip is pure presentation: it happens in ctx's transform, applied only to what gets drawn
 // AFTER it, and is undone (ctx.restore) before this function returns. It never touches a
@@ -2560,6 +2715,63 @@ function withMirror(drawFn) {
     drawFn();
   } finally {
     ctx.restore();
+  }
+}
+
+// Pure: should the #overlay canvas element carry the CSS .mirrored class (see style.css) this
+// frame? Only when the picture should appear mirrored AND nothing is currently baking a
+// pixel-level mirror into the canvas itself (see withMirror) — stacking both would flip an
+// already-mirrored recording's picture back to unmirrored on screen. Kept pure and tiny so
+// selfTest can check the full truth table directly, the same convention effectiveMirror uses.
+function canvasShouldMirrorViaCss(mirror, recording) {
+  return mirror && !recording;
+}
+
+// Keeps #video and #overlay's CSS mirror state in sync with effectiveMirror (facingMode/
+// mirrorToggled) and with whether a clip is currently recording (activeRecording) — see
+// canvasShouldMirrorViaCss. Called every frame from paintCanvas below rather than from every
+// place any of those three things can change: a missed call site there would show the wrong
+// picture with nothing to catch it, where a classList.toggle a frame late costs nothing visible.
+function syncMirrorClasses() {
+  const mirror = effectiveMirror(facingMode, mirrorToggled);
+  const recording = !!activeRecording;
+  video.classList.toggle("mirrored", mirror);
+  canvas.classList.toggle("mirrored", canvasShouldMirrorViaCss(mirror, recording));
+}
+
+// One frame's worth of drawing onto the overlay canvas — the single place renderLoop now goes to
+// put anything on screen. landmarks is this frame's smoothed landmarks, or null when there's
+// nothing to draw a skeleton from (pose lost, or an idle-throttled tick that skipped detection).
+//
+// FIELD BUG this replaced: the canvas used to be repainted with an opaque copy of the video frame
+// every single call, which is the only thing that made <video> (sitting underneath, same box)
+// invisible — so the picture the owner saw was a canvas repaint gated behind the ENTIRE rest of
+// this function's caller (renderLoop), including the synchronous, blocking pose-detection call.
+// The visible image could therefore never update faster than one inference pass per frame — at
+// the owner's own measured ~27.8ms/frame, that is the ~28.6fps his own shot log already reported,
+// and any slowdown in inference (a re-acquisition after losing the archer, a hot phone throttling
+// itself) showed up directly as the PICTURE stuttering, not just the skeleton lagging behind it.
+// Confirmed by measurement (see the PM's brief): with detection artificially delayed by a fixed
+// amount, the old code's on-screen repaint rate tracked 1/delay almost exactly, in lockstep with
+// the number of detection calls — not an assumption, a measured 1:1 relationship.
+//
+// The fix: while a clip is recording (see startClipRecording — canvas.captureStream is the only
+// way to bake the skeleton into a clip), the canvas still needs the full picture, pixel-mirrored,
+// exactly as this app has always recorded it. The rest of the time, <video> is what the owner
+// actually sees — playing at the camera's own native frame rate, entirely independent of how fast
+// pose detection is keeping up — and the canvas only ever holds the (transparent-background,
+// unmirrored-in-pixels) skeleton lines on top of it; the CSS .mirrored class (syncMirrorClasses)
+// flips both elements together so they stay pixel-registered with each other either way.
+function paintCanvas(landmarks) {
+  syncMirrorClasses();
+  if (activeRecording) {
+    withMirror(() => {
+      drawVideoFrame();
+      if (landmarks) drawSkeletonLines(landmarks);
+    });
+  } else {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (landmarks) drawSkeletonLines(landmarks);
   }
 }
 
@@ -2599,7 +2811,7 @@ function renderLoop() {
     const dueForIdleSample =
       attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
     if (!dueForIdleSample) {
-      withMirror(drawVideoFrame); // keep the on-screen view (and a clip, if one were somehow recording) alive even on a skipped frame
+      paintCanvas(null); // <video> keeps playing on its own; this only matters if a clip happens to be recording (see paintCanvas)
       syncDebugOverlay();
       return;
     }
@@ -2651,7 +2863,7 @@ function renderLoop() {
 
   if (!rawLandmarks) {
     updateCue(true, false); // "not seeing you" — set before endAttempt below, so a rejected/logged flash this same frame knows to hand back to "lost", not "resting", once it clears
-    withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
+    paintCanvas(null); // no skeleton to draw; <video> keeps the on-screen view alive on its own, and paintCanvas still bakes the picture in if a clip is recording
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
@@ -2679,7 +2891,7 @@ function renderLoop() {
     // coordinate system that doesn't itself change shape from frame to frame the way a moving
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
-    withMirror(() => drawSkeleton(landmarks));
+    paintCanvas(landmarks);
     updateBowArmReadout(landmarks, frameWidth, frameHeight);
     updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
     updateDrawElbowReadout(landmarks, frameWidth, frameHeight);
@@ -2729,6 +2941,11 @@ function updateHandButtonLabel() {
 function updateMirrorButtonLabel() {
   const mirrored = effectiveMirror(facingMode, mirrorToggled);
   btnMirror.textContent = mirrored ? "🪞 Mirrored" : "🪞 Not mirrored";
+  // Also updates the CSS mirror classes (see syncMirrorClasses) — every call site here changes
+  // effectiveMirror's inputs, and paintCanvas only re-syncs those once renderLoop is running, so
+  // without this the picture would show unmirrored for a moment right after startup or a camera
+  // switch, before the first frame paints.
+  syncMirrorClasses();
 }
 
 btnCamera.addEventListener("click", async () => {
@@ -2762,9 +2979,32 @@ btnLog.addEventListener("click", () => {
 // long log can't carry it out of reach) and from the tap-outside-to-close handler below.
 function closeShotLog() {
   shotLogEl.classList.add("hidden");
+  shotLogShareTextEl.classList.add("hidden"); // don't leave the manual-copy fallback showing next time the log opens
 }
 
 shotLogCloseBtn.addEventListener("click", closeShotLog);
+
+// Share: gathers the context that changes how the numbers should be read (camera resolution,
+// handedness, mirror state — all live DOM/module state, read here rather than inside
+// buildShareText so that function stays pure) and hands the rest to buildShareText/
+// shareSessionText. video.videoWidth/Height can briefly be 0 before the camera's ready; buildShareText
+// already renders that honestly as "?x?" rather than "0x0".
+shotLogShareBtn.addEventListener("click", () => {
+  const text = buildShareText(log, {
+    shotCount,
+    rejectedAttemptCount,
+    unsettledAttemptCount,
+    attentionIdlePeriods,
+    attentionLateWakeCount,
+    clipsUnavailableReason,
+    modelStatusLine,
+    rightHanded,
+    mirrored: effectiveMirror(facingMode, mirrorToggled),
+    cameraWidth: video.videoWidth || null,
+    cameraHeight: video.videoHeight || null,
+  });
+  shareSessionText(text);
+});
 
 // Convenience, not the fix itself (the close button above is): tapping anywhere outside the log
 // panel while it's open also dismisses it. Skips btn-log itself so this can never race that
@@ -3817,6 +4057,126 @@ function selfTest() {
     );
   }
 
+  // --- Share text: buildShareText is the one pure function behind the Share button (see its own
+  // comment) — entries + counters in, one string out, so it's checked directly here exactly like
+  // summarizeShots/narrateMeasure above, no DOM or navigator involved.
+  {
+    const shareEntries = [
+      {
+        shotNum: 3,
+        bowArmAngle: 172,
+        shoulderDrop: { bow: 46, draw: 44 },
+        elbowAlign: { signed: 2, deviation: 2, direction: "high" },
+        handSep: 0.81,
+        anchorOk: true, armOk: true, sepOk: true, stillOk: true,
+        reachedFullDraw: true,
+        clipUrl: "blob:fake-3",
+      },
+      // Deliberately the messiest of the three: an uncertain (below-MIN_VISIBILITY) bow-arm and
+      // draw-shoulder reading, a failed trigger condition, a short-of-full-draw draw, AND a
+      // failed clip — proves null-handling, trigger pass/fail, fullDraw, and clip failure all
+      // come through honestly on the same row rather than only being exercised in isolation.
+      {
+        shotNum: 2,
+        bowArmAngle: null,
+        shoulderDrop: { bow: 45, draw: null },
+        elbowAlign: null,
+        handSep: 0.62,
+        anchorOk: true, armOk: false, sepOk: true, stillOk: true,
+        reachedFullDraw: false,
+        clipFailReason: "no clip — recording came out empty",
+      },
+      {
+        shotNum: 1,
+        bowArmAngle: 170,
+        shoulderDrop: { bow: 44, draw: 45 },
+        elbowAlign: { signed: -1, deviation: 1, direction: "low" },
+        handSep: 0.79,
+        anchorOk: true, armOk: true, sepOk: true, stillOk: true,
+        reachedFullDraw: true,
+        clipUrl: "blob:fake-1",
+      },
+    ];
+    const shareCounters = {
+      shotCount: 3,
+      rejectedAttemptCount: 1,
+      unsettledAttemptCount: 0,
+      attentionIdlePeriods: 0,
+      attentionLateWakeCount: 0,
+      clipsUnavailableReason: null,
+      modelStatusLine: "Pose model: full — pose detection took about 12.3ms/frame, 47.1 fps actually rendered, measured at startup.",
+      rightHanded: true,
+      mirrored: false,
+      cameraWidth: 720,
+      cameraHeight: 1280,
+    };
+    const shareText = buildShareText(shareEntries, shareCounters);
+
+    console.assert(shareText.includes("Arrows this session: 3"), "share text must state the true session total, not just how many rows are included");
+    console.assert(shareText.includes("Movements ignored (not real draws): 1"), "share text must include rejectedAttemptCount even though a rejected movement never becomes its own row");
+    console.assert(shareText.includes("Camera 720x1280"), "share text header must carry the camera resolution");
+    console.assert(shareText.includes("right-handed") && shareText.includes("mirror off"), "share text header must carry handedness and mirror state");
+
+    // One labelled line per draw, in stable shot=N order, oldest first — chronological even
+    // though the input array (like the real log) was newest-first.
+    const drawLines = shareText.split("\n").filter((l) => l.startsWith("shot="));
+    console.assert(drawLines.length === 3, `share text must include exactly one line per logged draw, got ${drawLines.length}`);
+    console.assert(
+      drawLines[0].startsWith("shot=1") && drawLines[1].startsWith("shot=2") && drawLines[2].startsWith("shot=3"),
+      `draw lines must be chronological (oldest first) regardless of input order, got: ${drawLines.map((l) => l.slice(0, 8)).join(", ")}`
+    );
+
+    // Nulls/uncertain readings must be represented honestly, never as a fake 0 that would look
+    // like a real (if unusually low) measurement to whoever eventually tunes the thresholds.
+    console.assert(drawLines[1].includes("bowArm=uncertain"), "a null bow-arm reading must render as 'uncertain', not a fake number");
+    console.assert(drawLines[1].includes("shoulderDraw=uncertain"), "a null draw-shoulder reading must render as 'uncertain', not a fake number");
+    console.assert(!drawLines[1].includes("bowArm=0") && !drawLines[1].includes("shoulderDraw=0"), "a null reading must never render as a fake zero");
+
+    // Every trigger condition's pass/fail must come through, per shot — this is the whole point:
+    // the owner's only route to real hand-sep/trigger figures without remembering ?debug.
+    console.assert(drawLines[1].includes("arm=fail"), "a failed trigger condition must show as fail on its shot's line");
+    console.assert(drawLines[0].includes("arm=pass") && drawLines[0].includes("still=pass"), "passing trigger conditions must show as pass");
+    console.assert(drawLines[1].includes("handSep=0.620"), "hand separation must be included per shot, at real precision, for threshold retuning");
+
+    // Short-of-full-draw and clip status/failure reason must both be visible on the row.
+    console.assert(drawLines[1].includes("fullDraw=no"), "a draw that fell short of full draw must say so on its own line");
+    console.assert(drawLines[0].includes("fullDraw=yes") && drawLines[0].includes("recorded=yes"), "a full draw with a clip must say so on its own line");
+    console.assert(
+      drawLines[1].includes("recorded=no") && drawLines[1].includes('clipFailReason="no clip — recording came out empty"'),
+      "a failed clip must show recorded=no plus its stated reason on its own shot's line"
+    );
+    console.assert(shareText.includes('Shot 2: no clip — recording came out empty'), "a clip failure must also appear in the session-level Clip failures section");
+
+    // Consistency lines must be present and must reuse narrateMeasure's own wording, not a
+    // second, possibly-diverging implementation.
+    console.assert(shareText.includes("Consistency:"), "share text must include the consistency section");
+    const bowArmShareLine = narrateMeasure(shareEntries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+    console.assert(
+      bowArmShareLine && shareText.includes(bowArmShareLine.text),
+      "share text's consistency section must match narrateMeasure's own wording exactly, not a re-derived copy"
+    );
+
+    // The truncation notice: only 2 of these 3 entries "survive" as if the log had capped them —
+    // simulates a 30-arrow session sharing only its last few draws. Must say so explicitly rather
+    // than silently presenting the partial sample as the whole session.
+    const truncatedText = buildShareText(shareEntries.slice(0, 2), { ...shareCounters, shotCount: 30 });
+    console.assert(
+      truncatedText.includes("only the most recent 2 of 30 draws are included"),
+      "share text must explicitly say when fewer draws are included than actually happened"
+    );
+    const completeText = buildShareText(shareEntries, { ...shareCounters, shotCount: 3 });
+    console.assert(
+      !completeText.includes("only the most recent"),
+      "share text must NOT show a truncation notice when every draw that happened is included"
+    );
+
+    // Empty session: no shots yet, must say so plainly rather than rendering an empty or broken
+    // draws section.
+    const emptyShareText = buildShareText([], { ...shareCounters, shotCount: 0, rejectedAttemptCount: 0 });
+    console.assert(emptyShareText.includes("Arrows this session: 0"), "an empty session must still state the (zero) arrow count");
+    console.assert(emptyShareText.includes("(none)"), "an empty session's draws section must say plainly that there are none, not render blank");
+  }
+
   // --- Shot clips: MIME selection order, attaching a blob to the right shot number, discarding
   // one whose shot has fallen off the log, and revoking a clip when eviction removes its row.
   // These call the clip functions directly rather than through startClipRecording, which is
@@ -4529,6 +4889,28 @@ function selfTest() {
   console.assert(
     effectiveMirror("user", true) === false,
     "front camera, toggle on, should flip to unmirrored (away from its mirrored default)"
+  );
+
+  // --- canvasShouldMirrorViaCss: the #overlay canvas gets the CSS mirror flip only when the
+  // picture should look mirrored AND nothing is currently baking a pixel-level mirror into the
+  // canvas itself (see withMirror/paintCanvas) — stacking both would flip an already-mirrored
+  // recording's picture back to unmirrored on screen. Full truth table, since this is exactly the
+  // kind of two-boolean interaction a single missed case would silently get backwards.
+  console.assert(
+    canvasShouldMirrorViaCss(true, false) === true,
+    "mirrored + not recording: canvas should get the CSS flip"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(true, true) === false,
+    "mirrored + recording: canvas pixels are already mirrored (withMirror) — CSS flip must be withheld, or the picture flips back to unmirrored"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(false, false) === false,
+    "not mirrored + not recording: no CSS flip needed"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(false, true) === false,
+    "not mirrored + recording: no CSS flip either way"
   );
 
   // --- ROUTINE-START ATTENTION GATING: attentionIsClearlyCalm first, as a pure function, then

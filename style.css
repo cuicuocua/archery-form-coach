@@ -51,16 +51,35 @@ html, body {
   height: 100%;
 }
 
-/* Video fills its box. Never transformed by CSS any more — mirroring is done by flipping the
-   canvas's own pixels instead (see withMirror in app.js), so a recorded clip matches what was on
-   screen. This element is fully covered every frame by the opaque canvas painted on top of it
-   (same inset:0/100%x100% box, so there's no gap at any edge for it to show through). */
+/* Video fills its box and is now what the owner actually SEES live — see paintCanvas in app.js
+   for why. #overlay used to be an opaque canvas covering this every frame, which meant the
+   on-screen picture could only update as often as pose detection produced a new (blocking)
+   result — measured directly: with detection artificially delayed, the old on-screen repaint
+   rate tracked 1/delay in lockstep, which is why a slow phone or a hard-to-track frame showed up
+   as the whole picture stuttering, not just the skeleton lagging. Now the canvas stays
+   transparent except while a clip is recording, so <video> plays at the camera's own native rate
+   underneath it, independent of how fast pose detection is keeping up. object-fit is `contain`,
+   not `cover`: #camerabox (see below) is already sized in JS to this exact camera aspect ratio,
+   so in normal operation neither one crops anything — but `contain` fails safe (letterboxes)
+   instead of silently cropping the picture out of register with the skeleton drawn on top of it
+   if that sizing is ever wrong for a frame, which `cover` would not. */
 #video {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
+}
+
+/* Mirroring while NOT recording is a CSS transform on both #video and #overlay together (see
+   .mirrored below and syncMirrorClasses in app.js) — cheap, and correct here specifically because
+   both elements share the exact same box and are flipped by the exact same transform, so they
+   stay pixel-registered with each other. While a clip IS recording, #overlay's own pixels already
+   have the mirror baked in instead (see withMirror in app.js) and the .mirrored class is withheld
+   from it for that reason — a CSS flip on top of already-mirrored pixels would flip it back. */
+#video.mirrored,
+#overlay.mirrored {
+  transform: scaleX(-1);
 }
 
 #overlay {
@@ -277,12 +296,21 @@ html, body {
   display: none;
 }
 
-/* Always-reachable close control, same visual language as #clipplayer-close: big, high-contrast,
-   never part of the scrolling area beneath it. A generous tap target on purpose — the owner may
-   be checking this one-handed, wearing a tab or a release aid. */
-#shotlog-close {
+/* Always-reachable header row — Share plus Close, same visual language as #clipplayer-controls:
+   big, high-contrast, never part of the scrolling area beneath it. A generous tap target on
+   purpose — the owner may be checking this one-handed, wearing a tab or a release aid. Share
+   emits the whole session as plain text (see buildShareText/shareSessionText in app.js) — this is
+   his only route to the diagnostic numbers (hand separation, trigger pass/fail) that used to need
+   remembering ?debug before the session even started. */
+#shotlog-header {
   flex-shrink: 0;
+  display: flex;
+  gap: 10px;
   margin: 12px 12px 0;
+}
+
+#shotlog-header button {
+  flex: 1;
   padding: 16px 10px;
   border: none;
   border-radius: 14px;
@@ -292,8 +320,30 @@ html, body {
   font-weight: 700;
 }
 
-#shotlog-close:active {
+#shotlog-header button:active {
   background: rgba(255, 255, 255, 0.3);
+}
+
+/* Last-resort fallback when neither the share sheet nor the clipboard worked (see
+   shareSessionText in app.js) — a plain selectable block so the owner can still copy the session
+   text by hand. Hidden until that path is actually needed; pre-selected on show so a press-and-
+   hold "Copy" is the very next thing he can do, no hunting for where the text starts. */
+#shotlog-sharetext {
+  flex-shrink: 0;
+  margin: 8px 12px 0;
+  padding: 10px;
+  height: 120px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  resize: none;
+}
+
+#shotlog-sharetext.hidden {
+  display: none;
 }
 
 /* The actual scrolling content — everything renderShotLog() writes into. Owns the padding and
