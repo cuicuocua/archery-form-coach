@@ -194,6 +194,56 @@ Rules the PM follows:
   the log has working Watch buttons would be actively misleading. Either
   message latches once set and is never cleared or overwritten by the other.
 
+- **Shot log attempt gating: a draw attempt must plausibly BE a draw before it
+  gets logged.** Field report from the owner: "there are many more arrows than
+  I've actually shot." `DRAW_ATTEMPT_MIN_SEP` (0.3 torso-lengths, ~15cm) alone
+  was only ever meant to mark when an attempt starts/ends, not to decide
+  whether one deserved a row — but with nothing else gating it, nocking an
+  arrow, lowering the bow, adjusting a release aid, or the camera briefly
+  losing tracking (`endAttempt` also fires on pose loss) all crossed that
+  floor and got logged as phantom shots, dragging `summarizeShots`'s session
+  average around for every real shot compared against it. Two more gates,
+  checked once an attempt ends (by hands relaxing OR by tracking loss — same
+  check either way, so losing the archer can never manufacture a shot the
+  same movement ending normally wouldn't have earned): the attempt's peak
+  hand separation must clear `SHOT_MIN_PEAK_SEP_FRACTION` of
+  `FULL_DRAW_HAND_SEP_MIN`, and it must last at least `SHOT_MIN_DURATION_MS`
+  from start to end. A draw that fell short of literal full draw is still
+  logged and still worth seeing — that specific behaviour is deliberate and
+  unchanged, see the shot log bullet below — the new gates only throw out
+  things that were never plausibly a draw attempt at all. Every discarded
+  attempt increments `rejectedAttemptCount`, shown as a persistent "N
+  movements ignored" line in the log once it's above zero, for the same
+  reason as the clip-recording banner and pose-model line: the owner can't
+  watch this filtering happen, so if the app is quietly discarding movement
+  it has to say so later, not just get it right silently. `shotCount` only
+  increments for attempts that actually get logged, so the numbers the owner
+  reads match the arrows he shot.
+
+- **The shot log claims repeatability, never form quality.** The app has no
+  idea what good archery form looks like — every target range under
+  CALIBRATE WITH COACH is an explicitly labelled placeholder nobody has tuned
+  with a coach yet. So the log must never say anything that implies a
+  judgement it can't back up: no "your bow arm is too bent", no scores, no
+  pass/fail against an invented ideal. The one thing it CAN say honestly,
+  needing no calibration at all, is whether the owner did the same thing
+  twice — measured only against his own other shots that session, nothing
+  else. `narrateMeasure` in `app.js` turns each measurement's own numbers
+  into one plain-English line: whether it was steady, whether it drifted from
+  the early shots to the late ones, or whether one shot stood out (named by
+  number, so the owner knows which clip to go watch) — each judged against
+  how much the OTHER shots in the same session happened to scatter, never
+  against a fixed number of degrees or percent. Below three shots it says
+  plainly that there's no honest consistency story to tell yet, rather than
+  computing a spread from almost nothing; below five, whatever it does say
+  carries an "early days" qualifier. **Do not add a coaching verdict, a score,
+  or a fixed good/bad threshold to this wording** — if a future change wants
+  to judge the owner's form against a target, that target needs to come from
+  an actual coach into the CALIBRATE WITH COACH block first, not get invented
+  in the log's language. Raw degrees/percent are still shown, in small print
+  on each row, for whoever eventually tunes those placeholder constants
+  against a real session — they're just never the headline.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.

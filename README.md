@@ -66,12 +66,41 @@ figure it isn't sure of.
 
 ## The shot log
 
-Every draw is recorded, including ones where you never reached full draw at
-all. That's deliberate — a near-miss is exactly the case worth knowing about,
-and an empty log would teach you nothing.
+Only real draws get a row. The app watches for hand movement that's deep
+enough and lasts long enough to plausibly be a draw before it logs anything —
+nocking an arrow, lowering the bow, adjusting a release aid, or the camera
+briefly losing you mid-movement all get thrown away instead of logged as a
+phantom shot. If any movement gets thrown away, a line at the top of the log
+says how many: **"N movements ignored (too short, or never near full draw)."**
+A big number there next to a small arrow count is itself worth noticing.
 
-Each row gives the shot number and all three readouts from the moment you were
-most fully drawn.
+A draw that never quite reached full draw is still logged, and still worth
+seeing — that part hasn't changed — it's just marked **short of full draw**
+so you can tell it apart from one that went all the way.
+
+**What the log tells you, and what it deliberately doesn't.** The app has no
+way to know what good archery form looks like — every green/amber target
+range it uses is a placeholder nobody has tuned with a coach yet (see "The
+numbers are placeholders" below). So the log never judges your form. The one
+thing it can say with real confidence, needing no calibration at all, is
+whether you did the same thing twice — compared only against your own other
+shots that end, nothing else.
+
+At the top it says how many arrows it counted, then one line per measurement
+telling you plainly whether it was **steady**, whether it **drifted** over
+the course of the end (a shoulder creeping up as you tire is a classic one),
+or whether **one shot stood out**, named by number so you know exactly which
+clip to go watch. With fewer than three shots it says there isn't enough yet
+to call anything steady or drifting, rather than guessing from almost
+nothing. If a measurement's readings were all "uncertain" that session, it
+says nothing about it at all rather than reaching for a claim it can't back
+up.
+
+Each row underneath names the shot, says in plain English what — if anything
+— stood out about it, and gives you the Watch button. The raw degrees and
+percent are still there too, in small print under each shot, for whoever
+eventually tunes those placeholder target ranges against a real session; they
+just aren't the headline any more.
 
 The log holds the last ten draws and lasts until you reload the page. Reloading
 clears it. There's no history between sessions.
@@ -192,9 +221,11 @@ Pushing to `main` publishes to the live URL above via GitHub Pages, usually
 within a minute or two.
 
 **Self-check:** add `?selftest` to the URL and open the browser console. It runs
-assertions over the full-draw detection, the shot-log attempt boundaries, and
-the two form calculations. Silence means they passed. There is no test
-framework and no test files — this is the whole of it.
+assertions over the full-draw detection, the shot-log attempt boundaries and
+gating (including that noise gets thrown away and real draws don't), the
+plain-language consistency wording, and the two form calculations. Silence
+means they passed. There is no test framework and no test files — this is the
+whole of it.
 
 **Running it locally**, if you're changing something and don't want to publish
 first. Camera access needs HTTPS or localhost, so a plain file won't do:
