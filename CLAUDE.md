@@ -391,6 +391,27 @@ Rules the PM follows:
   floor constants above left untouched, since nothing survived to need them
   raised further.
 
+- **The frame-count settle gate above was necessary but not sufficient: a
+  crop box that exists is not the same as a crop box that has stopped
+  moving.** Found by piling a deliberate 3-second warm-up on top of the
+  already-fixed gate and seeing shot 1's bias more than halve anyway — proof
+  something was still converging past 30 frames. Root cause: `smoothCropBox`
+  eases the crop box toward its target every frame (`ROI_SMOOTHING`) rather
+  than snapping to it, and box size sets the measurement scale, so a
+  still-resizing box (e.g. right after the silhouette jumps from resting to
+  full draw) produces numbers on a moving scale even once the frame count is
+  satisfied. Fix: a new `CROP_BOX_STABLE_MAX_DELTA` constant (same
+  performance-knob family as `SETTLE_FRAMES_REQUIRED`, not calibration) and
+  `cropBoxIsStable()`, which requires the crop box's size AND position to
+  each change by less than that fraction between frames; `advanceSettling`
+  now requires both the frame count and (when ROI cropping is on) a stable
+  box on the current frame before a frame counts as eligible to log from.
+  Re-verified with the same 3-second-warm-up-on-top test after this fix:
+  adding the extra warm-up no longer moves shot 1's numbers meaningfully
+  (gaps stayed within noise, under half a degree/percent, both with and
+  without the extra warm-up) — confirming the settle gate alone was the gap,
+  not the frame count, which did not need raising.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.
