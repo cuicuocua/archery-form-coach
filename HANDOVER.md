@@ -180,6 +180,24 @@ Three uses, in order of value:
 3. **A framing check before he walks away** — "you are fully in frame" or "your
    legs are cut off" — at the one moment he can act on it.
 
+**Framing signature (decided 2026-08-23, in build)**: calibration also records
+an optional *framing signature* — apparent size in frame, position in frame, and
+a squareness proxy (side-on, the two shoulders project nearly on top of each
+other; that separation grows as the archer rotates toward the camera). Compared
+against the stored one each session so the app can say "you are set up
+differently from last time" at the one moment he can still fix it.
+
+Why it exists: the owner is considering tracking form **across** sessions. The
+blocker there is not storage, it is comparability — a metre further back, a
+higher phone, or 10° off perpendicular moves every number for reasons unrelated
+to his form. Without a controlled setup, a cross-session trend line narrates the
+tripod back to him with total confidence, which is the cry-wolf failure again in
+a more persuasive costume. Note also that within-session **spread** survives the
+trip across sessions far better than absolute values do, because it is his shots
+measured against each other and setup differences largely cancel — so any future
+tracking should lead with repeatability, not averages. Cross-session tracking is
+NOT built and may never be; the signature must be worth having on its own.
+
 **Decided**: store it, and re-measure each session to check against the stored
 value rather than trusting it blindly (see "Answered by the owner" below). This
 is the first thing the app persists across reloads — a deliberate exception to
