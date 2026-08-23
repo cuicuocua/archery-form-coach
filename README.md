@@ -128,11 +128,11 @@ The green/amber ranges are estimates, not coaching standards. They live in one
 labelled block at the top of `app.js` called **CALIBRATE WITH COACH**. Nothing
 else in the file needs touching to change them.
 
-Two other labelled blocks sit right next to it — **SMOOTHING** and **POSE
-MODEL** — but those are a different thing entirely: performance knobs, not
-form targets. No coach needed for those; change them and judge by watching
-the skeleton (live or in a recorded clip). See "Steadying the skeleton"
-below.
+Three other labelled blocks sit right next to it — **SMOOTHING**, **POSE
+MODEL**, and **REGION-OF-INTEREST CROPPING** — but those are a different
+thing entirely: performance knobs, not form targets. No coach needed for
+those; change them and judge by watching the skeleton (live or in a recorded
+clip). See "Steadying the skeleton" below.
 
 The shoulder-drop threshold in particular is a guess made at a desk from human
 proportions. To set it properly: in one session, shoot a few shots with your
@@ -146,20 +146,35 @@ clusters.
 
 The camera picks up real jitter, especially outdoors at five metres — you take
 up a small part of the frame, so the pose model's guess for a joint wobbles a
-little frame to frame even when you're holding dead still. The app smooths
-this out itself before it draws the skeleton, feeds a readout, or logs a shot,
-using a filter that eases off automatically the moment you actually move —
-so it can smooth hard while you're motionless at full draw (exactly when
-every number gets read) without dragging the skeleton behind you during the
-raise.
+little frame to frame even when you're holding dead still.
+
+The main fix for that: before the app hands each frame to the pose model, it
+crops in on roughly where you were standing last frame — a generously padded
+box around you, not a tight one — and zooms that up before the model ever
+looks at it. Same camera, same distance, but the model is now looking at a
+close-up of you instead of a wide shot with you as a small part of it, so its
+guess for each joint is working from far more detail. You never see this
+happen; the crop only ever feeds the pose model, never what's drawn on screen
+or saved in a clip — both of those always show the whole camera view. If you
+ever lose full-draw detection unexpectedly for a step or two, it's likely
+because you moved out of the cropped box and the app is re-finding you on the
+whole frame again — that recovers on its own within a frame or two, nothing
+to do about it.
+
+On top of that, the app also smooths the landmarks it gets back, using a
+filter that eases off automatically the moment you actually move — so it can
+smooth hard while you're motionless at full draw (exactly when every number
+gets read) without dragging the skeleton behind you during the raise.
 
 The app also tries the steadier of MediaPipe's two pose models by default, and
 quietly switches to the lighter one on its own if your phone can't keep it
 running fast enough — you'll never see this happen, but the shot log always
-shows a small line saying which one ended up running and roughly how many
-frames per second it managed. If you ever see this line say "lite
-(auto-switched)", it's telling you the full model was too much for that
-phone on that day; nothing to act on, just useful to know.
+shows a small line saying which one ended up running, about how many
+milliseconds each frame's pose detection took, and the real frame rate the
+app actually managed (drawing and everything else included, not just the pose
+model). If you ever see this line say "lite (auto-switched)", it's telling
+you the full model was too much for that phone on that day; nothing to act
+on, just useful to know.
 
 ---
 

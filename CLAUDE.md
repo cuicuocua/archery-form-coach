@@ -61,12 +61,16 @@ Rules the PM follows:
   color states for readouts, plus the shot log's clip button/no-clip note and
   the clip player's own styling.
 - `app.js` — all logic: MediaPipe setup (with the full→lite pose-model
-  fallback), camera start/switch, per-frame pose detection, One Euro landmark
-  smoothing, skeleton drawing (via MediaPipe's own `DrawingUtils`) burned into
-  the overlay canvas together with the raw camera frame — that combined
-  canvas is what per-shot clip recording actually captures — the two angle
-  calculations, the shot log, clip recording/playback, and the constants
-  blocks (calibration, smoothing, pose model) at the top of the file.
+  fallback), camera start/switch, region-of-interest cropping of the video
+  before each frame is handed to MediaPipe (a small offscreen canvas, never
+  shown or recorded — see "Region-of-interest cropping" below), per-frame
+  pose detection, One Euro landmark smoothing, skeleton drawing (via
+  MediaPipe's own `DrawingUtils`) burned into the overlay canvas together
+  with the raw camera frame — that combined canvas (always the full camera
+  view, never the crop) is what per-shot clip recording actually captures —
+  the two angle calculations, the shot log, clip recording/playback, and the
+  constants blocks (calibration, smoothing, pose model, ROI cropping) at the
+  top of the file.
 
 ## Key decisions
 
@@ -109,10 +113,11 @@ Rules the PM follows:
 - **Calibration constants are placeholders.** `BOW_ARM_ANGLE_MIN/MAX`,
   `DRAW_ELBOW_HEIGHT_MIN/MAX`, and `MIN_VISIBILITY` live in one clearly labeled
   block at the top of `app.js` — owner will tune these with a coach.
-  Two other labelled blocks near the same spot (`SMOOTH_*` and `MODEL_*`) hold
-  a completely different kind of constant — performance/feel knobs, not form
-  targets. Nothing in either block needs a coach: change them freely and judge
-  by eye (watch the skeleton, or a recorded clip afterwards).
+  Three other labelled blocks near the same spot (`SMOOTH_*`, `MODEL_*`, and
+  `ROI_*`) hold a completely different kind of constant — performance/feel
+  knobs, not form targets. Nothing in any of the three needs a coach: change
+  them freely and judge by eye (watch the skeleton, or a recorded clip
+  afterwards).
 
 - **Landmark smoothing: a One Euro filter, not a plain moving average.** Raw
   MediaPipe output is jittery outdoors — the archer occupies a small part of
@@ -149,7 +154,60 @@ Rules the PM follows:
   watch this decision happen (see "owner cannot touch or read the phone"
   above), so it is never shown live: instead, a small persistent line at the
   top of the shot log (same spot as the clip-recording banner) records which
-  model ended up running and roughly how many frames per second it managed.
+  model ended up running, the measured per-frame pose-detection cost in
+  milliseconds, and the real rendered frame rate over that same window (drawing
+  and smoothing included, not just inference) — reported as two separate
+  figures, deliberately, because a frame rate derived from inference time
+  alone ignores everything else a frame costs and can look many times faster
+  than the app actually ran; that was a real bug this replaced.
+
+- **Region-of-interest cropping — the real fix for distance-driven jitter, not
+  just smoothing it away.** At five metres the archer occupies a small part of
+  the camera frame, and MediaPipe itself resizes whatever image it's given
+  down to the model's small square input before it ever looks at it — so
+  without this, every joint guess is being made from a version of the archer
+  only a few dozen pixels tall, no matter how good the camera actually is. The
+  One Euro smoothing above treats the resulting jitter as noise to average
+  out after the fact; this treats the cause instead. Each frame, the app draws
+  just a square region around where the archer was last seen — expanded by a
+  generous padding margin, forced square, clamped to the video's bounds — into
+  a small offscreen canvas (`document.createElement("canvas")`, never added to
+  the page, never shown or recorded), scaled up to fill it, and hands
+  MediaPipe *that* instead of the whole video frame. Same camera, same
+  distance, far more pixels of archer reaching the model. The landmarks
+  MediaPipe returns are in that crop's own local coordinates, so they are
+  mapped back into full-frame normalised coordinates immediately, before
+  anything downstream (angle maths, torso-length scale reference, drawing, the
+  shot log) ever sees them — everything in this app assumes full-frame
+  coordinates, and getting that mapping wrong would silently corrupt every
+  number the owner is calibrating. The One Euro smoothing filter runs on
+  those mapped, full-frame coordinates, exactly as before this feature
+  existed.
+  Tunables live in one labelled `ROI_*` block: `ROI_CROPPING_ENABLED` is the
+  master on/off switch (set it `false` to go back to exactly the old
+  whole-frame behaviour, e.g. to rule the feature out if it ever misbehaves in
+  the field); `ROI_CANVAS_SIZE` is the offscreen canvas's pixel size;
+  `ROI_PADDING_FRACTION` controls how forgiving the crop is of a fast raise or
+  a step sideways versus how much it zooms in; `ROI_MIN_VISIBLE_LANDMARKS`
+  sets how many confidently-visible landmarks it takes to trust a crop box at
+  all; `ROI_SMOOTHING` is hysteresis on the box itself (an exponential ease,
+  not a hard "only move past X" threshold) so ordinary landmark noise doesn't
+  make the crop — and therefore the zoom level and framing MediaPipe sees —
+  flicker frame to frame.
+  **Recovery**: whenever a frame comes back with no landmarks, or too few
+  confidently-visible ones to trust a crop box, the app drops the crop
+  entirely and detects on the whole frame again starting next frame — it never
+  keeps cropping into a region that may no longer contain the archer. A crop
+  that could get stuck staring at an empty patch of grass, with no landmarks
+  ever coming back to trigger a whole-frame retry, would be exactly the kind
+  of hang the owner has no way to recover from mid-session (see "owner cannot
+  touch or read the phone" above) — this is why re-acquisition is unconditional
+  and immediate, not something that waits or times out.
+  Cropping is an inference-input concern only: the visible `#overlay` canvas,
+  and therefore every recorded clip, always shows the full camera frame with
+  the skeleton drawn over it — the crop is never drawn to anything the owner
+  sees.
+
 - **Freeze button: removed.** The prototype originally had a manual freeze
   button plus an auto-freeze that triggered at full draw and released itself
   after a few seconds. Both are gone — the owner confirmed in the field that

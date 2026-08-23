@@ -78,6 +78,24 @@ const MODEL_MEASURE_FRAMES = 20; // frames averaged together, right after warm-u
 const MODEL_SLOW_FRAME_MS = 60; // average per-frame inference time above this triggers the switch to lite (60ms ≈ 16fps, noticeably behind a live camera feed). RAISE this to let the app stay on the steadier "full" model on a slower phone; LOWER it to fall back to "lite" more readily.
 // ===========================================================================
 
+// ===== REGION-OF-INTEREST CROPPING — performance/accuracy knobs, not calibration; safe to
+// change without a coach. This is the real fix for outdoor jitter, not just smoothing it away
+// (see SMOOTHING above, which still runs on top of this). At five metres the archer is a small
+// part of the camera frame, and MediaPipe itself resizes whatever image it's given down to its
+// model's small square input before it ever looks at it — so without this, the model is making
+// every joint guess from a version of the archer only a few dozen pixels tall. Instead of handing
+// MediaPipe the whole video frame, the app remembers roughly where the archer was standing last
+// frame, crops a generous box around that, and hands MediaPipe an upscaled close-up of just that
+// box — same camera, same distance, far more pixels of archer reaching the model. See the "ROI
+// CROPPING" runtime block further down for how the box is computed, and CLAUDE.md for the full
+// write-up including the re-acquire-on-loss behaviour.
+const ROI_CROPPING_ENABLED = true; // master on/off switch. Set to false to go back to whole-frame detection exactly like before this feature existed — flip this first if cropping is ever suspected of causing trouble in the field, since it rules the whole feature out in one line
+const ROI_CANVAS_SIZE = 512; // pixel size (square) of the offscreen canvas the crop gets drawn into before MediaPipe sees it. BIGGER hands the model a more detailed close-up (steadier) but costs more GPU time per frame, same trade-off as the POSE MODEL block above; SMALLER is cheaper but starts to give back the pixels this whole feature exists to gain
+const ROI_PADDING_FRACTION = 0.6; // extra space added around last frame's body box, as a fraction of that box's own size, on every side. BIGGER makes the crop more forgiving of a fast raise or a step sideways (less likely to lose the archer out of the box) but zooms in less; SMALLER zooms in more but risks the box not containing him next frame
+const ROI_MIN_VISIBLE_LANDMARKS = 4; // fewer confidently-visible landmarks than this in a frame and the app treats the archer as "not really found" — it will not trust a crop box built from a couple of stray points, and re-acquires on the whole frame next frame instead (see "loss of tracking" below)
+const ROI_SMOOTHING = 0.35; // how much the crop box itself resists moving, frame to frame — 0 means it jumps straight to chase wherever the body was JUST seen (can flicker/re-zoom on ordinary landmark noise); closer to 1 means it barely moves at all (steadier crop, but slower to follow a real step sideways). This is the hysteresis that stops the box — and therefore the zoom level and framing handed to the model — chasing noise every single frame
+// ===========================================================================
+
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
@@ -286,6 +304,7 @@ let activePoseModel = "full"; // which model is actually loaded right now
 let modelDecisionMade = false; // true once the one-time full-vs-lite decision has run — after that, measurePoseModelPerf stops doing any work, so the model never hunts back and forth mid-session
 let modelWarmupSeen = 0; // frames seen since startup, counted toward MODEL_WARMUP_FRAMES then MODEL_MEASURE_FRAMES
 let modelMeasureTotalMs = 0; // summed inference time across the measurement window (after warm-up)
+let modelMeasureWindowStartMs = null; // wall-clock time (performance.now()) of the first frame counted toward the measurement window — lets measurePoseModelPerf report the REAL rendered frame rate over that window (drawing/smoothing/everything included), not just a number derived from inference time alone
 // Persistent shot-log line recording which model ended up running and the measured frame rate —
 // same "written once, shown on every render, never only live" treatment as clipsUnavailableReason
 // below, and for the same reason: the owner is on the shooting line when this gets decided, not
@@ -318,25 +337,37 @@ async function initPoseLandmarker() {
   activePoseModel = "full";
 }
 
-// Called once per frame from renderLoop with how long that frame's detectForVideo call took, in
-// milliseconds. No-ops once modelDecisionMade is true — see that variable's comment. Skips the
-// first MODEL_WARMUP_FRAMES entirely (cold-start frames are always slow and not representative),
-// then averages the next MODEL_MEASURE_FRAMES to make the one-time decision.
-function measurePoseModelPerf(inferenceMs) {
+// Called once per frame from renderLoop with how long that frame's detectForVideo call took (in
+// milliseconds) and the frame's own timestamp (performance.now(), from the top of renderLoop —
+// NOT re-read afterwards, so the measurement window's wall-clock length isn't inflated by this
+// function's own work). No-ops once modelDecisionMade is true — see that variable's comment.
+// Skips the first MODEL_WARMUP_FRAMES entirely (cold-start frames are always slow and not
+// representative), then averages the next MODEL_MEASURE_FRAMES to make the one-time decision.
+//
+// Reports two different numbers, not one, because they answer different questions and conflating
+// them was actively misleading: "avgMs" is purely how long pose detection itself took, the direct
+// cost of this feature; "renderedFps" is how many whole frames (detection + smoothing + drawing +
+// everything else in renderLoop) actually got through per second over the same window — the
+// number that reflects what the owner's phone actually delivered. A frame rate computed from
+// inference time alone (1000/avgMs) ignores every other cost in the frame and can look many times
+// faster than the app really ran, which is exactly the bug this replaced (see CLAUDE.md).
+function measurePoseModelPerf(inferenceMs, nowMs) {
   if (modelDecisionMade) return;
   modelWarmupSeen++;
   if (modelWarmupSeen <= MODEL_WARMUP_FRAMES) return;
+  if (modelMeasureWindowStartMs === null) modelMeasureWindowStartMs = nowMs; // first frame actually counted toward the window
   modelMeasureTotalMs += inferenceMs;
   const measured = modelWarmupSeen - MODEL_WARMUP_FRAMES;
   if (measured < MODEL_MEASURE_FRAMES) return;
 
   modelDecisionMade = true;
   const avgMs = modelMeasureTotalMs / measured;
-  const fps = 1000 / avgMs;
+  const windowElapsedMs = Math.max(nowMs - modelMeasureWindowStartMs, 1e-6); // guards a divide-by-zero if somehow every measured frame landed on the same timestamp
+  const renderedFps = (measured * 1000) / windowElapsedMs;
   if (avgMs > MODEL_SLOW_FRAME_MS && activePoseModel === "full") {
-    switchToLitePoseModel(fps);
+    switchToLitePoseModel(avgMs, renderedFps);
   } else {
-    setModelStatusLine(fps);
+    setModelStatusLine(avgMs, renderedFps);
   }
 }
 
@@ -346,7 +377,7 @@ function measurePoseModelPerf(inferenceMs) {
 // flaky fetch for the model file, most likely), the OLD "full" landmarker just keeps running —
 // slower than ideal, but still tracking, which is what matters (see CLAUDE.md: pose tracking
 // must never just stop).
-async function switchToLitePoseModel(measuredFps) {
+async function switchToLitePoseModel(avgMs, renderedFps) {
   try {
     const next = await createPoseLandmarker("lite");
     const old = poseLandmarker;
@@ -356,16 +387,139 @@ async function switchToLitePoseModel(measuredFps) {
   } catch (err) {
     console.error("archery-form-coach: falling back to lite pose model failed, staying on full", err);
   }
-  setModelStatusLine(measuredFps);
+  setModelStatusLine(avgMs, renderedFps);
 }
 
-function setModelStatusLine(measuredFps) {
+function setModelStatusLine(avgMs, renderedFps) {
   const label =
     activePoseModel === "full"
       ? "full"
       : "lite (auto-switched — full ran too slow on this phone)";
-  modelStatusLine = `Pose model: ${label} — about ${measuredFps.toFixed(1)} fps measured at startup.`;
+  modelStatusLine = `Pose model: ${label} — pose detection took about ${avgMs.toFixed(1)}ms/frame, ${renderedFps.toFixed(1)} fps actually rendered, measured at startup.`;
   renderShotLog();
+}
+// ===========================================================================
+
+// ===== ROI CROPPING — runtime state and pure geometry for the region-of-interest crop described
+// in the REGION-OF-INTEREST CROPPING constants above. The offscreen canvas below is never added
+// to the page (document.createElement, not appendChild) — it exists purely as an intermediate
+// image for MediaPipe to look at; it is NEVER what gets drawn to the visible #overlay canvas or
+// recorded into a shot's clip (see drawVideoFrame/drawSkeleton further down — those always draw
+// the full camera frame). Cropping is an inference-input concern only.
+const roiCanvas = document.createElement("canvas");
+roiCanvas.width = ROI_CANVAS_SIZE;
+roiCanvas.height = ROI_CANVAS_SIZE;
+const roiCtx = roiCanvas.getContext("2d");
+
+// The crop box to use for THIS frame's detection, in VIDEO PIXEL space (not normalised) as
+// {x, y, size} — always square, x/y is its top-left corner. null means "detect on the whole
+// frame this frame": the starting state, and also what losing the archer resets to (see
+// renderLoop). Kept in pixel space rather than normalised [0,1] coordinates specifically so the
+// squareness below is a square in actual camera pixels — a video frame usually isn't square
+// (e.g. 1280x720), so a box that was square in normalised x/y would actually be a rectangle on
+// screen, and scaling a rectangle into the square offscreen canvas would stretch the archer,
+// corrupting every angle this app measures.
+let currentCropBox = null;
+
+// The tight bounding box (in VIDEO PIXEL space) of every landmark confident enough to trust, or
+// null if fewer than ROI_MIN_VISIBLE_LANDMARKS qualify — in which case there's nothing
+// trustworthy to crop around, and the caller should fall back to whole-frame detection. Pure —
+// no DOM — so selfTest can exercise it directly on fixture landmarks.
+function boundingBoxOfLandmarks(landmarks, frameWidth, frameHeight) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let seen = 0;
+  for (const lm of landmarks) {
+    if (!lm || (lm.visibility ?? 0) < MIN_VISIBILITY) continue;
+    const px = lm.x * frameWidth;
+    const py = lm.y * frameHeight;
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
+    seen++;
+  }
+  if (seen < ROI_MIN_VISIBLE_LANDMARKS) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+// Pads a (minX,minY,maxX,maxY) box by ROI_PADDING_FRACTION, forces it to a square (so the crop
+// never distorts the body when it's scaled into the square offscreen canvas — a squashed archer
+// would corrupt every angle this app measures), and clamps it to fit inside the frame. Pure
+// geometry, no DOM — so selfTest can check the clamping and squareness directly with hand-picked
+// numbers, including a box that starts off-centre and not square.
+function squareAndClampCropBox(minX, minY, maxX, maxY, frameWidth, frameHeight, paddingFraction) {
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const paddedSize = Math.max(maxX - minX, maxY - minY) * (1 + 2 * paddingFraction);
+  // Never ask for a crop bigger than the frame itself — there'd be nothing left to zoom into.
+  const size = Math.max(1, Math.min(paddedSize, frameWidth, frameHeight));
+  let x = cx - size / 2;
+  let y = cy - size / 2;
+  // Slide the box back inside the frame rather than shrinking it further, so it keeps its full
+  // size (and stays square) right up to the frame's edge — exactly what happens when the archer
+  // is standing near the edge of the shot.
+  x = Math.min(Math.max(x, 0), frameWidth - size);
+  y = Math.min(Math.max(y, 0), frameHeight - size);
+  return { x, y, size };
+}
+
+// Eases the crop box toward a freshly-computed one instead of snapping straight to it — the
+// hysteresis described by ROI_SMOOTHING above, so ordinary landmark noise doesn't make the crop
+// (and therefore the zoom level and framing MediaPipe sees) flicker frame to frame. No previous
+// box (first acquisition, or just re-acquired after losing the archer) means nothing to ease
+// from, so the fresh box is used outright.
+function smoothCropBox(prevBox, freshBox, smoothing) {
+  if (!prevBox) return freshBox;
+  return {
+    x: prevBox.x + (1 - smoothing) * (freshBox.x - prevBox.x),
+    y: prevBox.y + (1 - smoothing) * (freshBox.y - prevBox.y),
+    size: prevBox.size + (1 - smoothing) * (freshBox.size - prevBox.size),
+  };
+}
+
+// The crop box to use NEXT frame, computed from THIS frame's (already full-frame-normalised —
+// see mapCropLandmarkToFullFrame) landmarks. Returns null — meaning "detect on the whole frame
+// next frame" — whenever there isn't a confident enough body to trust a box around, which is
+// exactly the re-acquire-on-loss behaviour: a crop that no longer contains the archer must never
+// get to persist, since detecting inside an empty box forever would be a hang the owner has no
+// way to recover from (see CLAUDE.md).
+function nextCropBox(landmarks, frameWidth, frameHeight, prevBox) {
+  const bbox = boundingBoxOfLandmarks(landmarks, frameWidth, frameHeight);
+  if (!bbox) return null;
+  const fresh = squareAndClampCropBox(
+    bbox.minX, bbox.minY, bbox.maxX, bbox.maxY, frameWidth, frameHeight, ROI_PADDING_FRACTION
+  );
+  return smoothCropBox(prevBox, fresh, ROI_SMOOTHING);
+}
+
+// Maps one landmark from crop-local normalised coordinates (0-1 across the ROI canvas, which is
+// what MediaPipe hands back when it was given the crop) into full-frame normalised coordinates
+// (0-1 across the actual camera frame — what EVERYTHING downstream of detection in this file,
+// the angle maths, the torso-length scale reference, the skeleton drawing, the shot log, assumes
+// it's working with). Getting this wrong would silently corrupt every number the owner is tuning,
+// so it stays a small, pure, directly-testable function rather than being inlined into
+// renderLoop. z is scaled by the same factor as x/y (crop size relative to frame width) so it
+// stays roughly proportionate to the coordinate system everything else already assumes, even
+// though nothing in this app currently reads z.
+function mapCropLandmarkToFullFrame(lm, cropBox, frameWidth, frameHeight) {
+  return {
+    ...lm,
+    x: (cropBox.x + lm.x * cropBox.size) / frameWidth,
+    y: (cropBox.y + lm.y * cropBox.size) / frameHeight,
+    z: (lm.z ?? 0) * (cropBox.size / frameWidth),
+  };
+}
+
+// The exact inverse of mapCropLandmarkToFullFrame: a full-frame normalised point back into
+// crop-local normalised coordinates. Not used by the live app (detection only ever needs the
+// forward direction) — kept purely so selfTest can prove the mapping round-trips cleanly, the
+// strongest guarantee that the forward map isn't quietly losing or shifting precision.
+function mapFullFrameToCropLocal(lm, cropBox, frameWidth, frameHeight) {
+  return {
+    ...lm,
+    x: (lm.x * frameWidth - cropBox.x) / cropBox.size,
+    y: (lm.y * frameHeight - cropBox.y) / cropBox.size,
+  };
 }
 // ===========================================================================
 
@@ -374,6 +528,10 @@ async function startCamera() {
   // mirrored front camera) must never blend into positions AFTER it — that would drag the
   // skeleton across the frame on the very first frames of the new camera. See LandmarkSmoother.
   landmarkSmoother.reset();
+  // Same reasoning for the ROI crop box: a box computed against the OLD camera's framing means
+  // nothing once the video source has changed underneath it, and could even be the wrong shape
+  // for the new frame's resolution. Detect on the whole frame again until a fresh box is found.
+  currentCropBox = null;
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
   }
@@ -1085,10 +1243,41 @@ function renderLoop() {
 
   if (!poseLandmarker || video.readyState < 2) return;
 
+  const frameWidth = video.videoWidth;
+  const frameHeight = video.videoHeight;
+
+  // Region-of-interest cropping: if a crop box survived from last frame (and the feature isn't
+  // switched off), draw just that box from the video into the small offscreen ROI canvas, scaled
+  // up to fill it, and hand MediaPipe THAT instead of the whole video frame — same camera, same
+  // distance, far more pixels of archer reaching the model. usedCropBox stays null (whole-frame
+  // detection, exactly like before this feature existed) whenever cropping is off, there's no
+  // box yet, or the video doesn't have real dimensions yet. See the ROI CROPPING constants and
+  // runtime block above for the full reasoning.
+  let usedCropBox = null;
+  let detectionSource = video;
+  if (ROI_CROPPING_ENABLED && currentCropBox && frameWidth && frameHeight) {
+    usedCropBox = currentCropBox;
+    roiCtx.drawImage(
+      video,
+      usedCropBox.x, usedCropBox.y, usedCropBox.size, usedCropBox.size,
+      0, 0, ROI_CANVAS_SIZE, ROI_CANVAS_SIZE
+    );
+    detectionSource = roiCanvas;
+  }
+
   const inferenceStart = performance.now();
-  const result = poseLandmarker.detectForVideo(video, now);
-  measurePoseModelPerf(performance.now() - inferenceStart);
-  const rawLandmarks = result.landmarks?.[0];
+  const result = poseLandmarker.detectForVideo(detectionSource, now);
+  measurePoseModelPerf(performance.now() - inferenceStart, now);
+  let rawLandmarks = result.landmarks?.[0];
+
+  // The model just saw a close-up crop, so its landmarks came back in CROP-LOCAL normalised
+  // coordinates (0-1 across the ROI canvas). Map them into full-frame normalised coordinates
+  // (0-1 across the actual camera frame) right here, before anything else in this file ever sees
+  // them — every readout, the shot log, and the skeleton drawing all assume full-frame
+  // coordinates, and getting this wrong would silently corrupt every number the owner is tuning.
+  if (rawLandmarks && usedCropBox) {
+    rawLandmarks = rawLandmarks.map((lm) => mapCropLandmarkToFullFrame(lm, usedCropBox, frameWidth, frameHeight));
+  }
 
   if (!rawLandmarks) {
     drawVideoFrame(); // keep the clip (and the on-screen view) showing the camera even without a skeleton
@@ -1101,12 +1290,22 @@ function renderLoop() {
     // stale. Reset so a fresh detection later starts clean rather than being dragged from
     // wherever the skeleton was last seen (see LandmarkSmoother).
     landmarkSmoother.reset();
+    // Re-acquire on loss: whether this frame was cropped or not, no landmarks means whatever crop
+    // box we had (if any) no longer contains the archer, or we never had one. Drop it so the very
+    // next frame detects on the WHOLE frame again rather than continuing to stare into a box that
+    // may no longer have anyone in it — a crop that can never find its way back would be exactly
+    // the kind of hang the owner has no way to recover from (see CLAUDE.md).
+    currentCropBox = null;
     endAttempt(); // pose lost mid-attempt counts as the attempt ending, same as hands relaxing
   } else {
     // Smoothed landmarks feed everything downstream — the skeleton drawing, all three readouts,
     // and the full-draw/shot-log sampling inside isAtFullDraw — so a shaky raw detection can't
     // show up in the numbers the owner reads later or the clip he watches back. Real elapsed time
     // (performance.now(), converted to seconds), not an assumed frame rate — see OneEuroFilter.
+    // This runs on the MAPPED, full-frame coordinates above, never on crop-local ones — the
+    // filter's whole job is smoothing real position over time, which only means something in a
+    // coordinate system that doesn't itself change shape from frame to frame the way a moving
+    // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
     drawSkeleton(landmarks);
     updateBowArmReadout(landmarks);
@@ -1117,6 +1316,16 @@ function renderLoop() {
     // the auto-freeze state machine, which read the true/false result; that machine is gone, but
     // the shot log still depends on this call happening every frame, so it stays.
     isAtFullDraw(landmarks, now);
+
+    // Pick the crop box for NEXT frame from what was actually seen this frame (full-frame
+    // coordinates, already mapped above if this frame itself was cropped). Recomputed from
+    // scratch — not carried over — every frame cropping is on, so a body that walks away from
+    // where it was is always followed; ROI_SMOOTHING (inside nextCropBox) is what stops that from
+    // meaning the box chases ordinary landmark noise. Left null when cropping is switched off, so
+    // the whole feature reduces to exactly the old whole-frame behaviour.
+    currentCropBox = ROI_CROPPING_ENABLED
+      ? nextCropBox(landmarks, frameWidth, frameHeight, usedCropBox)
+      : null;
   }
 
   syncDebugOverlay();
@@ -1832,6 +2041,131 @@ function selfTest() {
     console.assert(
       freshFrame[0].x === 0.9 && freshFrame[0].y === 0.1,
       "LandmarkSmoother.reset() should make the next frame come out completely unsmoothed"
+    );
+  }
+
+  // --- ROI cropping: pure geometry, no DOM/MediaPipe involved (same reasoning as the One Euro
+  // tests above), so these run straight against the functions with plain fixture numbers. This
+  // is the highest-risk part of the whole feature — get the crop-local <-> full-frame mapping
+  // wrong and every angle the owner is calibrating gets silently corrupted — so it gets checked
+  // directly here, not just eyeballed on a real camera.
+  {
+    // Mapping: a landmark at a KNOWN position inside a KNOWN crop box maps back to the correct
+    // full-frame coordinate. The crop box here is deliberately off-centre (not the middle of the
+    // frame) and not aligned to any nice fraction of it — a bug that only shows up for a crop
+    // that isn't centred/aligned would sail straight through a test that only ever used one.
+    const frameW1 = 1000, frameH1 = 800;
+    const cropBox1 = { x: 200, y: 100, size: 300 }; // spans x 200-500, y 100-400 — well off-centre in an 800-tall frame
+    const cropLm = { x: 0.25, y: 0.75, z: 0.1, visibility: 0.9 };
+    const mapped = mapCropLandmarkToFullFrame(cropLm, cropBox1, frameW1, frameH1);
+    // By hand: fullX = (200 + 0.25*300) / 1000 = 0.275; fullY = (100 + 0.75*300) / 800 = 0.40625
+    console.assert(
+      Math.abs(mapped.x - 0.275) < 1e-9 && Math.abs(mapped.y - 0.40625) < 1e-9,
+      `a landmark at a known crop-local position should map to the known full-frame position, got (${mapped.x}, ${mapped.y})`
+    );
+    console.assert(
+      Math.abs(mapped.z - 0.03) < 1e-9,
+      `z should scale by the crop's size-to-frame-width ratio (300/1000 = 0.3), got ${mapped.z}`
+    );
+    console.assert(
+      mapped.visibility === 0.9,
+      "mapping crop-local to full-frame must pass visibility through untouched, same as LandmarkSmoother does for x/y"
+    );
+
+    // Round-trip: a full-frame point, taken crop-local (mapFullFrameToCropLocal) and mapped back
+    // (mapCropLandmarkToFullFrame), must land back on the same point — the strongest available
+    // check that the forward map isn't quietly shifting or losing precision. Different box, still
+    // off-centre and not aligned to a round fraction of the frame, so this isn't just re-checking
+    // the fixture above under a different name.
+    const frameW2 = 1200, frameH2 = 900;
+    const cropBox2 = { x: 50, y: 400, size: 250 };
+    const fullPoint = { x: 0.63, y: 0.52, visibility: 1 };
+    const cropLocal = mapFullFrameToCropLocal(fullPoint, cropBox2, frameW2, frameH2);
+    const roundTripped = mapCropLandmarkToFullFrame(cropLocal, cropBox2, frameW2, frameH2);
+    console.assert(
+      Math.abs(roundTripped.x - fullPoint.x) < 1e-9 && Math.abs(roundTripped.y - fullPoint.y) < 1e-9,
+      `full-frame -> crop-local -> full-frame should round-trip to the same point, got (${roundTripped.x}, ${roundTripped.y}) from (${fullPoint.x}, ${fullPoint.y})`
+    );
+
+    // Clamping + squareness: a body bounding box near the LEFT edge of the frame, padded out,
+    // would want to extend past x=0 — it must instead slide back inside the frame (not shrink)
+    // and stay exactly square, the same way a real archer standing near the edge of the shot
+    // would be handled.
+    const edgeBox = squareAndClampCropBox(0, 200, 40, 280, 640, 480, ROI_PADDING_FRACTION);
+    console.assert(
+      edgeBox.x >= 0 && edgeBox.y >= 0 && edgeBox.x + edgeBox.size <= 640 && edgeBox.y + edgeBox.size <= 480,
+      `a crop box near the frame's edge must be clamped fully inside it, got x=${edgeBox.x} y=${edgeBox.y} size=${edgeBox.size} in a 640x480 frame`
+    );
+    console.assert(
+      edgeBox.x === 0,
+      `a box that would overhang the LEFT edge should slide flush against it (x=0), not shrink — got x=${edgeBox.x}`
+    );
+    // "Square" here just means one shared `size` drives both dimensions (see squareAndClampCropBox
+    // — there is no separate width/height to disagree), so the real thing worth checking is that
+    // clamping didn't accidentally shrink it into something degenerate.
+    console.assert(edgeBox.size > 0, "a clamped crop box must still have a positive size, not collapse to nothing");
+
+    // A body box bigger than the frame itself (padding pushed it past both dimensions) must be
+    // capped to fit inside the frame entirely — never asked to crop something larger than the
+    // source image.
+    const oversizeBox = squareAndClampCropBox(10, 10, 260, 110, 300, 300, ROI_PADDING_FRACTION);
+    console.assert(
+      oversizeBox.size <= 300 && oversizeBox.x === 0 && oversizeBox.y === 0,
+      `a box whose padded size exceeds the frame must be capped to fill the frame (x=0,y=0,size<=300), got x=${oversizeBox.x} y=${oversizeBox.y} size=${oversizeBox.size}`
+    );
+
+    // Loss of tracking resets to whole-frame detection: with too few confidently-visible
+    // landmarks, boundingBoxOfLandmarks (and therefore nextCropBox) must return null — the
+    // signal renderLoop uses to detect on the whole frame again next frame, rather than trust a
+    // box built from a couple of stray points or keep cropping into a region that may no longer
+    // have anyone in it.
+    const frameW3 = 640, frameH3 = 480;
+    const sparseLandmarks = [
+      { x: 0.5, y: 0.5, visibility: 0.9 },
+      { x: 0.5, y: 0.5, visibility: 0.9 },
+      { x: 0.5, y: 0.5, visibility: 0.1 }, // below MIN_VISIBILITY — must not count
+      { x: 0.5, y: 0.5, visibility: 0 },
+    ];
+    console.assert(
+      boundingBoxOfLandmarks(sparseLandmarks, frameW3, frameH3) === null,
+      "fewer than ROI_MIN_VISIBLE_LANDMARKS confidently-visible landmarks should yield no bounding box at all"
+    );
+    console.assert(
+      nextCropBox(sparseLandmarks, frameW3, frameH3, { x: 100, y: 100, size: 200 }) === null,
+      "losing confident tracking must return null (whole-frame detection next frame), even if a crop box was active going into this frame"
+    );
+
+    // Contrast case: enough confidently-visible landmarks spread across a real body pose DOES
+    // produce a usable box — confirms the null results above are really about confidence/count,
+    // not a bug that makes this always return null.
+    const confidentLandmarks = [
+      { x: 0.45, y: 0.30, visibility: 1 }, // head-ish
+      { x: 0.40, y: 0.45, visibility: 1 }, // shoulder
+      { x: 0.60, y: 0.45, visibility: 1 }, // other shoulder
+      { x: 0.35, y: 0.60, visibility: 1 }, // hip
+      { x: 0.65, y: 0.60, visibility: 1 }, // other hip
+    ];
+    const acquired = nextCropBox(confidentLandmarks, frameW3, frameH3, null);
+    console.assert(
+      acquired !== null && acquired.size > 0,
+      "enough confidently-visible landmarks should produce a real crop box for next frame, not null"
+    );
+
+    // Hysteresis: smoothCropBox should ease toward a fresh box rather than snap straight to it —
+    // the result must land strictly between the previous and fresh boxes (given a smoothing
+    // factor strictly between 0 and 1), and exactly on the fresh box when there's no previous one
+    // to ease from (first acquisition / just re-acquired).
+    const prevSmoothBox = { x: 0, y: 0, size: 100 };
+    const freshSmoothBox = { x: 100, y: 100, size: 200 };
+    const eased = smoothCropBox(prevSmoothBox, freshSmoothBox, ROI_SMOOTHING);
+    console.assert(
+      eased.x > prevSmoothBox.x && eased.x < freshSmoothBox.x && eased.size > prevSmoothBox.size && eased.size < freshSmoothBox.size,
+      "smoothing a crop box toward a fresh one should land strictly between the two, not jump straight to the fresh box"
+    );
+    const firstAcquisition = smoothCropBox(null, freshSmoothBox, ROI_SMOOTHING);
+    console.assert(
+      firstAcquisition.x === freshSmoothBox.x && firstAcquisition.size === freshSmoothBox.size,
+      "with no previous box to ease from, smoothCropBox should use the fresh box outright"
     );
   }
 
