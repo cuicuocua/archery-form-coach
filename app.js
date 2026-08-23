@@ -793,32 +793,39 @@ let attentionLateWakeCount = 0; // how many of those idle periods ended on a sam
 // is being reworked by a different engineer in parallel right now (the geometry-maths fix) — this
 // stays deliberately independent so the two changes land on different lines and merge cleanly.
 // Same "never guess" convention as the rest of the file: null if either wrist isn't confidently
-// visible, or there's no usable torso-length scale reference.
-function handSeparationForAttention(landmarks) {
+// visible, or there's no usable torso-length scale reference. frameWidth/frameHeight: same
+// physically-honest pixel-space conversion (see toPixelSpace) every other distance in this file
+// uses — required here for exactly the same reason, not optional polish.
+function handSeparationForAttention(landmarks, frameWidth, frameHeight) {
   const bowWrist = rightHanded ? L_WRIST : R_WRIST;
   const drawWrist = rightHanded ? R_WRIST : L_WRIST;
   if (!visible(landmarks, bowWrist) || !visible(landmarks, drawWrist)) return null;
-  const scale = attentionScale(landmarks);
+  const scale = attentionScale(landmarks, frameWidth, frameHeight);
   if (!scale) return null;
-  const a = landmarks[bowWrist];
-  const b = landmarks[drawWrist];
+  const a = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
+  const b = toPixelSpace(landmarks[drawWrist], frameWidth, frameHeight);
   return Math.hypot(a.x - b.x, a.y - b.y) / scale;
 }
 
 // Shared torso-length scale reference for this block — draw side preferred, bow side as
 // fallback, the same convention used everywhere else in this file (isAtFullDraw, shoulderDropOf).
-function attentionScale(landmarks) {
+function attentionScale(landmarks, frameWidth, frameHeight) {
   const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
   const drawHip = rightHanded ? R_HIP : L_HIP;
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowHip = rightHanded ? L_HIP : R_HIP;
-  return torsoLength(landmarks, drawShoulder, drawHip) ?? torsoLength(landmarks, bowShoulder, bowHip);
+  return (
+    torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ??
+    torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight)
+  );
 }
 
 // The midpoint between the two hips — a stable whole-body reference point that isn't a hand and
 // doesn't itself move as part of a normal draw, used to tell "standing settled" apart from
 // "walking/stepping" (see ATTENTION_REST_MOVE_MAX_PER_SEC). Null if either hip isn't confidently
-// visible — same "never guess" convention as the rest of the file.
+// visible — same "never guess" convention as the rest of the file. Returns NORMALISED coordinates
+// (same convention as lastDrawWrist in isAtFullDraw) — converted to pixel space at compare time,
+// using that frame's own dimensions, by whoever compares two of these against each other.
 function bodyReferencePoint(landmarks) {
   if (!visible(landmarks, L_HIP) || !visible(landmarks, R_HIP)) return null;
   return {
@@ -838,15 +845,20 @@ function bodyReferencePoint(landmarks) {
 // proof of calm", which is exactly the bar fail-toward-recording needs on both ends (see
 // updateAttentionState): allowing idle requires this to be true; staying idle requires it to
 // keep being true; anything else, on either end, defaults toward engaged.
-function attentionIsClearlyCalm(landmarks, prevRef, dtSec) {
+function attentionIsClearlyCalm(landmarks, prevRef, dtSec, frameWidth, frameHeight) {
   if (!landmarks) return true;
-  const handSep = handSeparationForAttention(landmarks);
+  const handSep = handSeparationForAttention(landmarks, frameWidth, frameHeight);
   if (handSep === null || handSep > ATTENTION_REST_HAND_SEP_MAX) return false;
   const ref = bodyReferencePoint(landmarks);
   if (ref && prevRef && dtSec > 0) {
-    const scale = attentionScale(landmarks);
+    const scale = attentionScale(landmarks, frameWidth, frameHeight);
     if (!scale) return false;
-    const speed = Math.hypot(ref.x - prevRef.x, ref.y - prevRef.y) / scale / dtSec;
+    // ref/prevRef are still normalised (see bodyReferencePoint) — converted to pixel space here,
+    // at compare time, using THIS frame's dimensions for both points, same convention isAtFullDraw
+    // uses for lastDrawWrist.
+    const refPx = toPixelSpace(ref, frameWidth, frameHeight);
+    const prevRefPx = toPixelSpace(prevRef, frameWidth, frameHeight);
+    const speed = Math.hypot(refPx.x - prevRefPx.x, refPx.y - prevRefPx.y) / scale / dtSec;
     if (speed > ATTENTION_REST_MOVE_MAX_PER_SEC) return false;
   }
   return true;
@@ -862,6 +874,9 @@ function attentionIsClearlyCalm(landmarks, prevRef, dtSec) {
 // threaded through explicitly (like `nowMs`/`frameEligible` already are elsewhere in this file)
 // so selfTest can prove the master-switch and warm-up-guard behaviour directly, without needing
 // a mutable module-level constant or having to actually run the pose-model warm-up first.
+// frameWidth/frameHeight are required (no default, same convention as isAtFullDraw) — every
+// distance this function's own calm check touches needs the physically-honest pixel-space
+// conversion (see toPixelSpace) every other measure in this file already gets.
 //
 // PIPELINE SETTLING, worked through as the brief asked: the moment this function decides to
 // re-engage (idle -> engaged), it resets landmarkSmoother, the settling counter, and the ROI crop
@@ -876,7 +891,7 @@ function attentionIsClearlyCalm(landmarks, prevRef, dtSec) {
 // there is nothing worth resetting FOR while idle (attempt is null by construction the entire
 // time — see the hard rule below — so nothing idle samples see ever reaches the shot log), and
 // resetting on the way in would just mean paying the same reset twice for one idle stretch.
-function updateAttentionState(nowMs, landmarks, gatingEnabled = ATTENTION_GATING_ENABLED, modelReady = modelDecisionMade) {
+function updateAttentionState(nowMs, landmarks, frameWidth, frameHeight, gatingEnabled = ATTENTION_GATING_ENABLED, modelReady = modelDecisionMade) {
   if (!gatingEnabled) {
     attentionEngaged = true;
     return;
@@ -894,7 +909,7 @@ function updateAttentionState(nowMs, landmarks, gatingEnabled = ATTENTION_GATING
   }
 
   const dtSec = attentionLastEvalMs === null ? 0 : (nowMs - attentionLastEvalMs) / 1000;
-  const calm = attentionIsClearlyCalm(landmarks, attentionPrevRef, dtSec);
+  const calm = attentionIsClearlyCalm(landmarks, attentionPrevRef, dtSec, frameWidth, frameHeight);
   attentionPrevRef = landmarks ? bodyReferencePoint(landmarks) : null;
   attentionLastEvalMs = nowMs;
 
@@ -942,7 +957,7 @@ function updateAttentionState(nowMs, landmarks, gatingEnabled = ATTENTION_GATING
     // from rejectedAttemptCount/unsettledAttemptCount on purpose — this is neither "that wasn't a
     // real draw" nor "the pipeline wasn't settled"; it's "the attention layer noticed a moment
     // later than an always-on pipeline would have."
-    const wokeHandSep = landmarks ? handSeparationForAttention(landmarks) : null;
+    const wokeHandSep = landmarks ? handSeparationForAttention(landmarks, frameWidth, frameHeight) : null;
     if (wokeHandSep !== null && wokeHandSep >= DRAW_ATTEMPT_MIN_SEP) attentionLateWakeCount++;
     // Re-engaging is exactly like every other recovery point in PIPELINE SETTLING (session
     // start, tracking lost, camera switched) — see this function's own top comment for why the
@@ -2497,7 +2512,7 @@ function renderLoop() {
   // and BEFORE the smoothing/settling below, not after: if this call is about to re-engage from
   // idle, it resets landmarkSmoother/settledFrames/currentCropBox synchronously, so everything
   // from here to the end of this same frame already runs against the fresh, reset state.
-  updateAttentionState(now, rawLandmarks);
+  updateAttentionState(now, rawLandmarks, frameWidth, frameHeight);
 
   if (!rawLandmarks) {
     withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
@@ -4236,6 +4251,16 @@ function selfTest() {
         `${label}: corrected anchor-distance ratio should match the real-world ground truth (${trueAnchorRatio.toFixed(6)}), got ${anchorRatio.toFixed(6)}`
       );
 
+      // ROUTINE-START ATTENTION GATING's own hand-separation signal shares this same wrist pair
+      // and the same aspect-ratio hazard (see handSeparationForAttention/attentionScale) — proven
+      // here directly against the same ground truth, in both orientations, rather than trusted to
+      // follow along just because it's built the same way.
+      const attnHandSep = handSeparationForAttention(lm, w, h);
+      console.assert(
+        attnHandSep !== null && Math.abs(attnHandSep - trueHandSepRatio) < TOL,
+        `${label}: handSeparationForAttention should match the real-world ground truth (${trueHandSepRatio.toFixed(6)}), got ${attnHandSep}`
+      );
+
       const { bow: bowDrop, draw: drawDrop } = shoulderDropSampleOf(lm, w, h);
       console.assert(
         Math.abs(bowDrop - trueBowDropPct) < TOL,
@@ -4336,34 +4361,34 @@ function selfTest() {
       16: { x: 0.42, y: 0.3 }, // draw wrist, right next to it — hands relaxed together
     });
     console.assert(
-      attentionIsClearlyCalm(null, null, 0) === true,
+      attentionIsClearlyCalm(null, null, 0, NOOP_W, NOOP_H) === true,
       "no landmarks at all (nobody in frame) should read as clearly calm — nothing to be shooting"
     );
     console.assert(
-      attentionIsClearlyCalm(restLandmarks, null, 0) === true,
+      attentionIsClearlyCalm(restLandmarks, null, 0, NOOP_W, NOOP_H) === true,
       "relaxed hands, with no previous reference point to judge stillness against yet, should read as clearly calm"
     );
 
     const drawnLandmarks = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
     console.assert(
-      attentionIsClearlyCalm(drawnLandmarks, null, 0) === false,
+      attentionIsClearlyCalm(drawnLandmarks, null, 0, NOOP_W, NOOP_H) === false,
       "hands far apart (a real draw) must never read as clearly calm"
     );
 
     const noWristLandmarks = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3, visibility: 0 }, 16: { x: 0.42, y: 0.3 } });
     console.assert(
-      attentionIsClearlyCalm(noWristLandmarks, null, 0) === false,
+      attentionIsClearlyCalm(noWristLandmarks, null, 0, NOOP_W, NOOP_H) === false,
       "an invisible wrist can't confirm the hands are relaxed — must not read as clearly calm"
     );
 
     const calmRef = bodyReferencePoint(restLandmarks);
     console.assert(
-      attentionIsClearlyCalm(restLandmarks, calmRef, 1) === true,
+      attentionIsClearlyCalm(restLandmarks, calmRef, 1, NOOP_W, NOOP_H) === true,
       "an unmoved body reference point over a full second should still read as clearly calm"
     );
     const farRef = { x: calmRef.x + 1, y: calmRef.y }; // ~3+ torso-lengths of drift in one second — unmistakably walking
     console.assert(
-      attentionIsClearlyCalm(restLandmarks, farRef, 1) === false,
+      attentionIsClearlyCalm(restLandmarks, farRef, 1, NOOP_W, NOOP_H) === false,
       "a body reference point that moved far in one second (walking) must not read as clearly calm, even with relaxed hands"
     );
 
@@ -4399,7 +4424,7 @@ function selfTest() {
     // warm-up guard (covered separately: production renderLoop always defaults modelReady to the
     // real modelDecisionMade flag). gatingEnabled still defaults to true and can be overridden
     // per call, same as updateAttentionState's own default.
-    const callAttention = (nowMs, lm, gatingEnabled = true) => updateAttentionState(nowMs, lm, gatingEnabled, true);
+    const callAttention = (nowMs, lm, gatingEnabled = true) => updateAttentionState(nowMs, lm, NOOP_W, NOOP_H, gatingEnabled, true);
 
     let t = 0;
     callAttention(t, calmLm);
@@ -4449,8 +4474,9 @@ function selfTest() {
     // of thing nocking, adjusting a release aid, or turning partway could look like. It must
     // still engage, never idle through it: "treated as shooting, not discarded."
     const ambiguousLm = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3 }, 16: { x: 0.48, y: 0.32 } });
-    const ambigScale = torsoLength(ambiguousLm, R_SHOULDER, R_HIP);
-    const ambigHandSep = Math.hypot(ambiguousLm[16].x - ambiguousLm[15].x, ambiguousLm[16].y - ambiguousLm[15].y) / ambigScale;
+    // Computed via the real production function (not a hand-rolled reimplementation) so this
+    // check can never drift out of sync with what attentionIsClearlyCalm itself actually measures.
+    const ambigHandSep = handSeparationForAttention(ambiguousLm, NOOP_W, NOOP_H);
     console.assert(
       ambigHandSep > ATTENTION_REST_HAND_SEP_MAX && ambigHandSep < DRAW_ATTEMPT_MIN_SEP,
       "the ambiguous fixture should sit strictly between 'clearly relaxed' and 'a real draw attempt', or this isn't testing the ambiguous case at all"
