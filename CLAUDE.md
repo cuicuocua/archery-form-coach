@@ -799,6 +799,30 @@ because a watchdog told him it was broken when it was not. A false alarm costs
 more than a missing one: it destroys trust in every other line the log shows.
 Any new warning needs a test proving it stays *silent* when nothing is wrong.
 
+**Distinguish "silent because fine" from "silent because it never ran."** These
+are opposite situations that look identical, and both have already cost real
+time here. The attention gating was dead for weeks — a `NaN` swallowed by a
+falsy guard, no error anywhere, and the battery savings it claimed were never
+happening. Calibration was written to say nothing when today's reading agreed
+with the stored one, which also meant it said nothing when it had never managed
+to measure the owner at all.
+
+Silence is the right default for **warnings about his shooting** — that is the
+cry-wolf rule above, and it stands. Silence is never acceptable as the signal
+for **a feature not working**. So:
+
+- Any feature that can quietly no-op must be able to report that it has not run,
+  in plain language, distinctly from reporting that it ran and was fine.
+- If the owner can act on it, tell him at the one moment he can (see the
+  can't-touch-the-phone rule) — neutrally and factually, not as an alarm.
+  "I have never managed to measure you, stand facing the camera for a couple of
+  seconds" is information, not a warning.
+- Put the fact in the shot log and the shared text too, so a session's data
+  answers "did this actually run?" without anyone having to guess afterwards.
+- Assert **both halves**: that it stays quiet when everything is fine, and that
+  it speaks up when it never ran. An assertion for only the first half is how
+  this class of bug survives.
+
 **No test hooks in `app.js`.** Verify from outside — hook browser prototypes,
 read the DOM, drive the real pipeline with a stub returning crop-relative
 coordinates (the app crops before inference). An earlier engineer's hooks were
