@@ -133,12 +133,30 @@ const ROI_SMOOTHING = 0.35; // how much the crop box itself resists moving, fram
 // is about 10 frames; this constant sits well above that for margin, since (see below) the cost
 // of waiting a little longer is nearly always zero.
 //
-// In practice this gate should almost never cost the owner a real arrow: he starts the app,
-// props the phone against something, and walks five metres to the shooting line before drawing
-// at all, so the pipeline has many seconds — far more than this threshold needs — to settle
-// before his first real shot. It only bites right after a tracking dropout mid-session, which is
-// exactly when a fresh, unsettled reading would otherwise have been the risky one to log.
+// A crop box merely EXISTING is not the same as it having finished moving. smoothCropBox eases
+// the box toward its target every frame (ROI_SMOOTHING above) rather than snapping to it, and
+// the box's own size sets the scale everything gets resolved at — a landmark read through a
+// still-shrinking-or-growing box is not on the same footing as one read through a settled box,
+// even once SETTLE_FRAMES_REQUIRED frames have passed since the last reset. This matters most
+// exactly at the moment a shot is worth logging: the box's fresh target jumps bigger the instant
+// the archer's arms reach full extension, right as the raise turns into the hold — precisely
+// when the highest-hand-separation frame (the one that gets scored) is likely to occur. Caught
+// in testing: adding a deliberate multi-second pause on top of the frame-count gate alone still
+// cut the residual bias on shoulder drop and elbow alignment by more than half, which a
+// sufficient frame count on its own should have made no difference to.
+//
+// CROP_BOX_STABLE_MAX_DELTA is derived from ROI_SMOOTHING the same way SETTLE_FRAMES_REQUIRED is
+// derived from SMOOTH_MIN_CUTOFF: each frame smoothCropBox closes (1 - ROI_SMOOTHING) = 65% of
+// the remaining gap to a static target, so the residual gap after n frames is ROI_SMOOTHING^n of
+// wherever it started. Even a full box-size jump (100% — roughly resting posture to a fully
+// extended full-draw silhouette, about the largest real jump this app will ever see) decays
+// below a 2% residual in n where 0.35^n <= 0.02, i.e. n >= 4 frames — fast, but real, and exactly
+// the handful of frames right at the raise-to-hold transition that a frame-count gate alone
+// cannot see. Below this fraction, frame-to-frame change is treated as the crop box's own
+// ordinary steady-state jitter (landmark noise still moves the fresh target a little every
+// frame, even standing still), not genuine settling in progress.
 const SETTLE_FRAMES_REQUIRED = 30; // consecutive good-tracking frames needed after a reset before a frame's numbers are trusted enough to log. RAISE for more margin (safer, but the gate takes longer to clear after every reset — still normally invisible, see above); LOWER only with real measured convergence data in hand, not a guess
+const CROP_BOX_STABLE_MAX_DELTA = 0.02; // the crop box's size AND position must each change by less than this fraction of its own size, frame to frame, to count as settled rather than still catching up — see the derivation above. RAISE if measurements still look inflated right after a raise-to-hold transition (rare box shapes may need more than 4 frames to fully decay); LOWER only with real measured box-jitter data in hand, not a guess — too low and ordinary steady-state box jitter (never truly zero) could block eligibility forever
 // ===========================================================================
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
@@ -593,26 +611,44 @@ function mapFullFrameToCropLocal(lm, cropBox, frameWidth, frameHeight) {
 }
 // ===========================================================================
 
-// ===== PIPELINE SETTLING — runtime state and the two small functions that implement the
-// PIPELINE SETTLING constant above. See SETTLE_FRAMES_REQUIRED's own comment for the full
-// reasoning; this is just the bookkeeping.
+// ===== PIPELINE SETTLING — runtime state and the functions that implement the PIPELINE
+// SETTLING constants above. See SETTLE_FRAMES_REQUIRED's and CROP_BOX_STABLE_MAX_DELTA's own
+// comments for the full reasoning; this is just the bookkeeping.
 let settledFrames = 0; // consecutive good-tracking frames seen since landmarkSmoother last reset
+let prevUsedCropBox = null; // the crop box actually used on the PREVIOUS good-tracking frame — compared against THIS frame's own box below to tell "settled" apart from "merely present"
+
+// Pure geometry: has the crop box stopped meaningfully moving/resizing between two consecutive
+// frames? No prior box to compare against (the very first frame after acquisition, or no box at
+// all) can never count as stable — there is nothing yet to prove it has stopped changing. Pure —
+// no DOM, no module state — so selfTest can drive it directly with fixture boxes.
+function cropBoxIsStable(box, prevBox) {
+  if (!box || !prevBox) return false;
+  const sizeDelta = Math.abs(box.size - prevBox.size) / prevBox.size;
+  const posDelta = Math.hypot(box.x - prevBox.x, box.y - prevBox.y) / prevBox.size;
+  return sizeDelta <= CROP_BOX_STABLE_MAX_DELTA && posDelta <= CROP_BOX_STABLE_MAX_DELTA;
+}
 
 // Called once per frame that has valid landmarks (never on pose loss — a lost frame has no
 // numbers to be trustworthy about, and ends whatever attempt was in progress anyway). Advances
 // the settling counter and reports whether THIS frame's own numbers are trustworthy enough to
-// log: takes cropBoxUsedThisFrame as a plain boolean rather than reading module state directly,
-// so selfTest can drive it deterministically without a real camera or crop box.
-function advanceSettling(cropBoxUsedThisFrame) {
+// log: takes the crop state as plain values rather than reading module state directly, so
+// selfTest can drive it deterministically without a real camera or crop box.
+function advanceSettling(cropBoxUsedThisFrame, cropBoxStableThisFrame) {
   settledFrames++;
-  return settledFrames >= SETTLE_FRAMES_REQUIRED && (!ROI_CROPPING_ENABLED || cropBoxUsedThisFrame);
+  return (
+    settledFrames >= SETTLE_FRAMES_REQUIRED &&
+    (!ROI_CROPPING_ENABLED || (cropBoxUsedThisFrame && cropBoxStableThisFrame))
+  );
 }
 
 // Re-arms the gate. Called from every place landmarkSmoother.reset() is called (pose lost,
 // camera switched) — same reset points, same reasoning: a frame right after either of those is
-// exactly as untrustworthy as one right after startup, and must be re-gated the same way.
+// exactly as untrustworthy as one right after startup, and must be re-gated the same way. Also
+// drops prevUsedCropBox — a box from before the reset must never be compared against a fresh one
+// after it, which would falsely read as "stable" when nothing has actually settled.
 function resetSettling() {
   settledFrames = 0;
+  prevUsedCropBox = null;
 }
 // ===========================================================================
 
@@ -1739,9 +1775,14 @@ function renderLoop() {
     //
     // frameEligible: is THIS frame's own reading settled enough to become a shot's logged sample
     // (see PIPELINE SETTLING above)? Computed here, not inside isAtFullDraw, because only
-    // renderLoop knows whether THIS frame actually used an established crop box — threaded
-    // through as an explicit argument (like nowMs already is) so selfTest can drive it too.
-    const frameEligible = advanceSettling(!!usedCropBox);
+    // renderLoop knows whether THIS frame actually used an established crop box, and whether
+    // that box has actually stopped moving — a box merely being present isn't the same as it
+    // having settled; see cropBoxIsStable. Compared against the PREVIOUS frame's box before that
+    // variable gets overwritten for next frame, then threaded through as an explicit argument
+    // (like nowMs already is) so selfTest can drive it too.
+    const cropBoxStableThisFrame = cropBoxIsStable(usedCropBox, prevUsedCropBox);
+    prevUsedCropBox = usedCropBox;
+    const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
     isAtFullDraw(landmarks, now, frameEligible);
 
     // Pick the crop box for NEXT frame from what was actually seen this frame (full-frame
@@ -1872,6 +1913,7 @@ function selfTest() {
   const savedRejectedAttemptCount = rejectedAttemptCount;
   const savedUnsettledAttemptCount = unsettledAttemptCount;
   const savedSettledFrames = settledFrames;
+  const savedPrevUsedCropBox = prevUsedCropBox;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   const mkLandmarks = (overrides) => {
@@ -2095,49 +2137,100 @@ function selfTest() {
     "log should stay newest-first even once it's capped"
   );
 
-  // --- PIPELINE SETTLING: advanceSettling/resetSettling, the pure bookkeeping behind
-  // SETTLE_FRAMES_REQUIRED — see that constant's own comment for the reasoning. Reset first so
-  // this doesn't inherit settledFrames from whatever earlier fixtures left behind.
+  // --- PIPELINE SETTLING: advanceSettling/resetSettling/cropBoxIsStable, the pure bookkeeping
+  // behind SETTLE_FRAMES_REQUIRED and CROP_BOX_STABLE_MAX_DELTA — see those constants' own
+  // comments for the reasoning. Reset first so this doesn't inherit settledFrames from whatever
+  // earlier fixtures left behind. Every advanceSettling call here passes `true` for the
+  // stability argument unless the test is specifically about stability, so frame-count behaviour
+  // stays isolated from box-stability behaviour.
   {
     resetSettling();
     // A frame before the threshold cannot become a logged sample: advanceSettling must read
     // false for every one of the first SETTLE_FRAMES_REQUIRED - 1 frames, cropping satisfied on
-    // every one of them (cropBoxUsedThisFrame: true), so it's the FRAME COUNT specifically being
-    // tested here, not the crop condition.
+    // every one of them (present AND stable), so it's the FRAME COUNT specifically being tested
+    // here, not either crop condition.
     let sawTrueEarly = false;
     for (let i = 0; i < SETTLE_FRAMES_REQUIRED - 1; i++) {
-      if (advanceSettling(true)) sawTrueEarly = true;
+      if (advanceSettling(true, true)) sawTrueEarly = true;
     }
     console.assert(!sawTrueEarly, "no frame before SETTLE_FRAMES_REQUIRED should ever read as settled");
     // One after (the SETTLE_FRAMES_REQUIRED-th good-tracking frame) can: this is the frame that
     // crosses the threshold.
     console.assert(
-      advanceSettling(true) === true,
+      advanceSettling(true, true) === true,
       "the SETTLE_FRAMES_REQUIRED-th consecutive good-tracking frame should read as settled"
     );
     // Once settled, later frames stay settled (the counter doesn't wrap or reset on its own).
-    console.assert(advanceSettling(true) === true, "settling should stay settled on the next frame too, not flicker back off");
+    console.assert(advanceSettling(true, true) === true, "settling should stay settled on the next frame too, not flicker back off");
 
-    // The crop requirement is independent of frame count: even with far more than
+    // The crop-PRESENT requirement is independent of frame count: even with far more than
     // SETTLE_FRAMES_REQUIRED good-tracking frames, a frame that never actually used an
     // established crop box must never read as settled while ROI_CROPPING_ENABLED is on.
     resetSettling();
     let sawTrueWithoutCrop = false;
     for (let i = 0; i < SETTLE_FRAMES_REQUIRED + 20; i++) {
-      if (advanceSettling(false)) sawTrueWithoutCrop = true;
+      if (advanceSettling(false, false)) sawTrueWithoutCrop = true;
     }
     console.assert(
       !ROI_CROPPING_ENABLED || !sawTrueWithoutCrop,
       "with cropping on, a frame that never used an established crop box must never read as settled, no matter how many frames have passed"
     );
 
+    // The crop-STABLE requirement is ALSO independent of frame count: a box that is present
+    // every frame but never stops moving/resizing must never read as settled either — a box
+    // merely existing is not the same as it having finished catching up (see
+    // CROP_BOX_STABLE_MAX_DELTA's own comment: the raise-to-hold transition is exactly the case
+    // this is for).
+    resetSettling();
+    let sawTrueUnstable = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED + 20; i++) {
+      if (advanceSettling(true, false)) sawTrueUnstable = true;
+    }
+    console.assert(
+      !ROI_CROPPING_ENABLED || !sawTrueUnstable,
+      "with cropping on, a crop box that never stabilises must never read as settled, no matter how many frames have passed"
+    );
+    // Once the box actually stabilises (with the frame count already satisfied from a prior
+    // unstable stretch), eligibility can be reached on the very next frame.
+    console.assert(
+      advanceSettling(true, true) === true,
+      "once the box stabilises, with the frame count already well past the threshold, the next frame should read as settled"
+    );
+
     // A reset mid-session re-arms the gate: get to settled, reset, and confirm the very next
     // frame goes back to reading unsettled — the counter doesn't remember where it was before.
     resetSettling();
-    for (let i = 0; i < SETTLE_FRAMES_REQUIRED; i++) advanceSettling(true);
-    console.assert(advanceSettling(true) === true, "setup: should be settled before the reset");
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED; i++) advanceSettling(true, true);
+    console.assert(advanceSettling(true, true) === true, "setup: should be settled before the reset");
     resetSettling();
-    console.assert(advanceSettling(true) === false, "a reset mid-session must re-arm the gate — the very next frame should read as unsettled again");
+    console.assert(advanceSettling(true, true) === false, "a reset mid-session must re-arm the gate — the very next frame should read as unsettled again");
+  }
+
+  // --- cropBoxIsStable: pure geometry, no dependency on advanceSettling's frame counting.
+  {
+    const prevBox = { x: 100, y: 100, size: 200 };
+    console.assert(cropBoxIsStable(prevBox, null) === false, "no prior box to compare against must never read as stable");
+    console.assert(cropBoxIsStable(null, prevBox) === false, "no current box must never read as stable");
+    console.assert(
+      cropBoxIsStable({ x: 100, y: 100, size: 200 }, prevBox) === true,
+      "an identical box (zero change) must read as stable"
+    );
+    console.assert(
+      cropBoxIsStable({ x: 100, y: 100, size: 202 }, prevBox) === true, // 2/200 = 1% size change — comfortably under CROP_BOX_STABLE_MAX_DELTA (2%)
+      "a small size change, well under the threshold, must still read as stable"
+    );
+    console.assert(
+      cropBoxIsStable({ x: 100, y: 100, size: 210 }, prevBox) === false, // 10/200 = 5% size change — over the threshold
+      "a size change over CROP_BOX_STABLE_MAX_DELTA must read as unstable"
+    );
+    console.assert(
+      cropBoxIsStable({ x: 102, y: 100, size: 200 }, prevBox) === true, // 2/200 = 1% position change
+      "a small position change, well under the threshold, must still read as stable"
+    );
+    console.assert(
+      cropBoxIsStable({ x: 110, y: 100, size: 200 }, prevBox) === false, // 10/200 = 5% position change
+      "a position change over CROP_BOX_STABLE_MAX_DELTA must read as unstable, even with size unchanged"
+    );
   }
 
   // --- PIPELINE SETTLING, integration: trackShotAttempt/endAttempt must never log a frame's own
@@ -2938,6 +3031,7 @@ function selfTest() {
   rejectedAttemptCount = savedRejectedAttemptCount;
   unsettledAttemptCount = savedUnsettledAttemptCount;
   settledFrames = savedSettledFrames;
+  prevUsedCropBox = savedPrevUsedCropBox;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
