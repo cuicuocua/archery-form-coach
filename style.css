@@ -58,6 +58,12 @@ html, body {
   border-radius: 999px;
   font-size: 14px;
   z-index: 5;
+  /* Normal startup text ("Starting camera…") is one short line, but the startup-watchdog
+     message (app.js, see STARTUP_WATCHDOG_MS) can run a bit longer — cap the width and centre
+     the text so it still reads cleanly on two lines from arm's length instead of stretching
+     edge-to-edge. */
+  max-width: min(90vw, 340px);
+  text-align: center;
 }
 
 #status.hidden {
@@ -236,6 +242,17 @@ html, body {
   font-size: 13px;
   line-height: 1.4;
   margin-bottom: 10px;
+}
+
+/* Small-print technical aside inside a shotlog-banner — how long startup was stuck, or the
+   browser's own error text (see recordStartupProblem in app.js). Always follows the plain-
+   English sentence above it, never replaces it — this is for whoever the owner relays the
+   message to, not the headline he reads himself. */
+#shotlog .shotlog-startup-detail {
+  display: block;
+  margin-top: 4px;
+  opacity: 0.8;
+  font-size: 11px;
 }
 
 /* Persistent line recording which pose model ended up running and the measured frame rate — set

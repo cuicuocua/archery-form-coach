@@ -467,6 +467,44 @@ Rules the PM follows:
   surviving the cap, so bounding memory this way costs precision, never
   introduces a new selection bias of the same shape as the one just fixed.
 
+- **Startup can never hang silently, and a startup failure gets recorded, not
+  just displayed.** Field report: the owner opened a build and it sat on
+  "Starting camera…" forever — camera picture visible, no skeleton, some
+  buttons dead. Root cause: `startCamera()` used to `await video.play()`
+  before doing anything else; on iOS Safari that promise can go unsettled (or
+  reject) even though the `<video>` (already `autoplay playsinline muted`) is
+  genuinely playing, which stalled `main()`'s whole `await` chain forever with
+  no exception for its `catch` to report. Fix has two parts. **(1)** `play()`
+  is still called (some browsers need it) but never awaited — a rejection is
+  swallowed, not treated as a real error — and `startCamera()` instead waits
+  for the video to report real `videoWidth`/`videoHeight` (`waitForVideoReady`,
+  bounded per attempt by `VIDEO_READY_TIMEOUT_MS`), re-arming in a loop rather
+  than giving up after one bounded attempt — giving up early would let
+  `main()` declare victory over a camera that never actually sent a picture,
+  with a 0×0 canvas and nothing to detect on. A standing `loadedmetadata`
+  listener (`sizeCanvasToVideo`) independently keeps the canvas sized to the
+  video, covering camera switches and any dimensions that show up late.
+  **(2)** A `STARTUP_WATCHDOG_MS` (15s) watchdog covers the deeper problem:
+  ANY step of startup stalling, not just this one — a promise that never
+  settles never throws, so `main()`'s `catch` alone can't be the only
+  safeguard. `startupStep` tracks which step is in flight (loading the pose
+  model / starting the camera / waiting for the picture / starting tracking)
+  so the watchdog's message names the actual stuck step ("the camera started
+  but never sent a picture") rather than a generic one. Per "owner cannot
+  touch or read the phone" above, the transient status-overlay message isn't
+  enough on its own — he may not walk over for minutes, and a small pill at
+  the top of the screen is easy to miss — so the same fact is also written as
+  a persistent banner at the top of the shot log (`recordStartupProblem`,
+  same treatment as the clip-recording banner and pose-model line), which
+  outranks every other banner there since nothing else in the log can be
+  trusted if tracking may never have properly started. If a watchdog-flagged
+  stall goes on to recover on its own before the owner ever looks,
+  `clearStartupProblem` removes the banner — a successful start must leave no
+  scary residue behind. A genuine terminal failure (e.g. camera permission
+  denied) is written once, with the browser's own error text kept in small
+  print under the plain-English sentence, and — unlike the watchdog case —
+  is never cleared, since `main()` has given up for the rest of the session.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.

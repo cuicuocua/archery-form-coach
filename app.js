@@ -175,6 +175,17 @@ const SETTLE_FRAMES_REQUIRED = 30; // consecutive good-tracking frames needed af
 const CROP_BOX_STABLE_MAX_DELTA = 0.02; // the crop box's size AND position must each change by less than this fraction of its own size, frame to frame, to count as settled rather than still catching up — see the derivation above. RAISE if measurements still look inflated right after a raise-to-hold transition (rare box shapes may need more than 4 frames to fully decay); LOWER only with real measured box-jitter data in hand, not a guess — too low and ordinary steady-state box jitter (never truly zero) could block eligibility forever
 // ===========================================================================
 
+// ===== STARTUP — timeouts, not calibration; safe to change without a coach. The owner cannot
+// read a console or tap anything mid-session (see CLAUDE.md's "one interaction" rule), so an app
+// that silently sits on "Starting camera…" forever is the worst failure mode there is for him —
+// he can't tell "still loading" from "dead". These two constants exist so startup can never hang
+// silently: VIDEO_READY_TIMEOUT_MS bounds one internal wait (see waitForVideoReady), and
+// STARTUP_WATCHDOG_MS bounds the whole of main() (see armStartupWatchdog) before the status text
+// is replaced with a plain-English line naming whatever step didn't finish.
+const VIDEO_READY_TIMEOUT_MS = 5000; // how long ONE wait attempt for the video's real width/height runs before re-arming rather than staying stuck on that one attempt forever (see the retry loop in startCamera) — bounds each attempt, not the overall wait; STARTUP_WATCHDOG_MS below is what bounds the overall wait and tells the owner if dimensions never show up at all
+const STARTUP_WATCHDOG_MS = 15000; // if main() hasn't reached the live tracking state within this long, replace the status text with a message naming the stuck step (see armStartupWatchdog/startupStuckMessage) instead of leaving the generic "Loading…"/"Starting…" text up with no explanation
+// ===========================================================================
+
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
@@ -218,6 +229,21 @@ let stream = null;
 let facingMode = "environment"; // rear camera first
 let rightHanded = true;
 let drawingUtils = null;
+
+// Which step of startup is currently in flight — read by the startup watchdog (see STARTUP
+// above) so its message can name the actual stuck step rather than a generic one. Only meaningful
+// while main() is still running; set at each transition in main()/startCamera() and never read
+// again once startup finishes.
+let startupStep = "loading the pose model";
+
+// Set (see recordStartupProblem, further down) when startup stalls past STARTUP_WATCHDOG_MS or
+// fails outright — the persistent, plain-English record of a startup failure that renderShotLog
+// puts at the very top of the shot log, above even the clip-recording banner: if this is set,
+// nothing else in the log can be trusted to mean much, since tracking may never have properly
+// started this session. Cleared automatically if a watchdog-triggered stall goes on to recover on
+// its own (see clearStartupProblem) — an eventual success must never leave this kind of residue
+// behind for the owner to find later.
+let startupProblem = null;
 
 // Manual mirror toggle (🪞 button) — set at setup time, before the owner walks off, same as the
 // handedness toggle. Deliberately NOT "mirrored: true/false" on its own: it means "flip away from
@@ -688,15 +714,77 @@ async function startCamera() {
     audio: false,
   });
   video.srcObject = stream;
-  await video.play();
+
+  // Call play() because some browsers need it, but never await it. The <video> element already
+  // carries autoplay/playsinline/muted (see index.html), so the picture showing up does not
+  // depend on this promise settling — and on iOS Safari it sometimes doesn't: field bug, this
+  // await used to hang here forever ("Starting camera…" stuck, picture visible, no skeleton, see
+  // CLAUDE.md/README). A rejection here isn't a real error either — swallow it rather than let it
+  // fall into main()'s catch block and report a false "Error:" for a camera that is actually fine.
+  video.play().catch(() => {});
+
+  startupStep = "waiting for the camera picture";
+  // Each single call is bounded (VIDEO_READY_TIMEOUT_MS) so this can never hang the way `await
+  // video.play()` used to — but a video that STILL has no real dimensions after one bounded wait
+  // must not be treated as ready either, or startCamera() would return "successfully" with a 0×0
+  // canvas and nothing to detect on, and main() below would hide the status text and declare
+  // victory over a camera that never actually sent a picture. So: keep re-waiting (each attempt
+  // still bounded) until real dimensions show up. This never spins hot — each iteration is just
+  // re-arming one "loadedmetadata" listener and a timer — and if dimensions genuinely never
+  // arrive, it keeps main() from ever reaching its success path, which is exactly what leaves
+  // STARTUP_WATCHDOG_MS (see main()) as the one honest backstop that tells the owner instead of
+  // the app quietly pretending to have started.
+  while (!(video.videoWidth > 0 && video.videoHeight > 0)) {
+    await waitForVideoReady();
+  }
 
   // No CSS mirroring here any more — see effectiveMirror/withMirror below for why. The <video>
   // element itself is left completely alone (never flipped, never classed); the canvas painted
   // on top of it is opaque every frame (see drawVideoFrame) and is what actually gets mirrored,
   // in its pixels, when that's called for.
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  sizeCanvasToVideo();
 }
+
+// Resolves once the video element has real pixel dimensions, OR VIDEO_READY_TIMEOUT_MS has passed
+// without them — whichever comes first. This is what replaced `await video.play()` as the thing
+// startCamera() actually waits on: real dimensions are what canvas sizing and detection need, and
+// — unlike play()'s promise — a single call here can never hang, so a slow-to-report camera can't
+// wedge this the way play() did. It does NOT by itself mean the video is ready: the caller
+// (startCamera(), above) loops on this until dimensions are real, so a timeout here just means
+// "check again" rather than "give up" — see that loop's own comment for why giving up here would
+// be the wrong call. sizeCanvasToVideo's standing listener (below) is a second, independent path
+// to the same outcome, for the camera-switch case and any other caller that isn't looping on this.
+function waitForVideoReady() {
+  if (video.videoWidth > 0 && video.videoHeight > 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener("loadedmetadata", onMeta);
+      clearTimeout(timer);
+      resolve();
+    };
+    const onMeta = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) finish();
+    };
+    video.addEventListener("loadedmetadata", onMeta);
+    const timer = setTimeout(finish, VIDEO_READY_TIMEOUT_MS);
+  });
+}
+
+// Keeps the overlay canvas sized to match the video frame. Called directly once startCamera()
+// has finished waiting above, AND wired as a standing listener (right below, attached once at
+// module scope) for the rare case dimensions arrive only after VIDEO_READY_TIMEOUT_MS gave up
+// waiting — without that second path a slow-to-report camera would leave the canvas at 0×0
+// forever, and nothing would ever draw even once tracking does start.
+function sizeCanvasToVideo() {
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+}
+video.addEventListener("loadedmetadata", sizeCanvasToVideo); // module-scope, attached once — covers first startup, every later camera switch, and late-arriving dimensions alike
 
 // Whether a given camera mirrors by default, before the owner's manual toggle is factored in.
 // Front camera ("user") defaults to mirrored, matching what people expect of a selfie view; rear
@@ -1684,6 +1772,10 @@ function renderShotRow(e, stats, outliers, words) {
 // narrateMeasure for why not. Raw degrees/percent are still there for whoever eventually tunes
 // the CALIBRATE WITH COACH constants, just demoted to small print on each row, not the headline.
 function renderShotLog() {
+  // A startup failure outranks every other banner below — if this is set, tracking may never
+  // have properly run this session at all, which makes even the clip-availability banner beside
+  // it secondary. See recordStartupProblem/clearStartupProblem for when this is set and cleared.
+  const startupBit = startupProblem ? `<div class="shotlog-banner">${startupProblem}</div>` : "";
   // A clip-recording failure has to still be visible whenever the owner walks over and looks —
   // not just at the moment it happened — so this goes at the very top, above everything else,
   // every single render, for as long as clipsUnavailableReason is set (which is forever, once
@@ -1710,7 +1802,7 @@ function renderShotLog() {
       : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${unsettledBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -1746,7 +1838,7 @@ function renderShotLog() {
   const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${unsettledBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -2019,23 +2111,109 @@ if (!CLIP_SUPPORTED) {
 }
 renderShotLog(); // shows the "no shots yet" placeholder (and the banner above, if set) before the first shot comes in
 
+// Plain-English description of whatever startupStep hasn't finished yet — the one place that
+// wording lives, shared by the transient status message and the persistent shot-log record below
+// so the two surfaces never describe the same stall two different ways. Deliberately says WHICH
+// thing didn't happen ("the camera started but never sent a picture") rather than a generic
+// "camera error" — that distinction is the whole point of tracking startupStep at all, see
+// CLAUDE.md's "one interaction" rule and its knock-on: whatever this says has to be enough on its
+// own for a non-coder to relay back, since he can't describe a stack trace he never saw.
+function startupStepProblem(step) {
+  switch (step) {
+    case "loading the pose model":
+      return "The pose tracker never finished loading";
+    case "starting the camera":
+      return "The camera never started";
+    case "waiting for the camera picture":
+      return "The camera started but never sent a picture";
+    case "starting tracking":
+      return "The camera was ready, but tracking never started";
+    default:
+      return "Startup never finished";
+  }
+}
+
+// The transient status-overlay line for whichever step the watchdog below caught still in
+// flight. Short and non-technical — the owner reads this from ~5 metres and has one option: come
+// over and restart the app (see CLAUDE.md's "one interaction" rule).
+function startupStuckMessage(step) {
+  return `${startupStepProblem(step)}. Close the app and reopen it.`;
+}
+
+// Writes (or updates) the persistent startup-problem banner at the top of the shot log — the
+// DURABLE record of a startup failure, alongside (never instead of) the transient status-overlay
+// message above. The status pill is easy to miss: the owner may not walk over for minutes, the
+// screen could have dimmed, and nothing about a small pill at the top says "look at me" the way
+// the shot log — the one place he's guaranteed to check when he's done shooting — already does
+// for a failed clip recording (clipsUnavailableReason) or the pose-model choice (modelStatusLine).
+// This gets the same treatment. `detail`, if given, is a technical aside (how long startup had
+// been stuck, or the browser's own error text) — kept in small print, after the plain-English
+// sentence, never standing in for it.
+function recordStartupProblem(headline, detail) {
+  startupProblem = detail ? `${headline}<div class="shotlog-startup-detail">${detail}</div>` : headline;
+  renderShotLog();
+}
+
+// Clears the startup-problem banner — used only when startup goes on to succeed AFTER the
+// watchdog already fired (the stuck step finished on its own before the owner ever got to the
+// phone). A successful start must leave no scary residue in the one place he's going to check
+// afterward; see recordStartupProblem above for why the shot log is that place.
+function clearStartupProblem() {
+  if (startupProblem === null) return;
+  startupProblem = null;
+  renderShotLog();
+}
+
+// Starts the startup watchdog: if main() hasn't finished (disarmed via the returned function)
+// within STARTUP_WATCHDOG_MS, the status text is replaced with a message naming whatever step was
+// still in flight (startupStep), AND the same fact is written to the persistent shot log (see
+// recordStartupProblem) so it is still there whenever the owner actually walks over. This is the
+// fix for the deeper failure, not just the video.play() hang above — ANY step that stalls (a
+// slow/broken model fetch, a camera permission prompt the owner never sees, a picture that never
+// arrives) leaves no exception for main()'s own catch block to report, since a promise that never
+// settles never throws. Returns a function that disarms the watchdog; call it as soon as startup
+// actually finishes (success OR error) so it can never fire after the fact and stomp on a status
+// the app has already resolved on its own.
+function armStartupWatchdog() {
+  const timer = setTimeout(() => {
+    statusEl.classList.remove("hidden");
+    statusEl.textContent = startupStuckMessage(startupStep);
+    recordStartupProblem(
+      `${startupStepProblem(startupStep)} — nothing was tracked this session.`,
+      `Startup hadn't finished after ${Math.round(STARTUP_WATCHDOG_MS / 1000)} seconds.`
+    );
+  }, STARTUP_WATCHDOG_MS);
+  return () => clearTimeout(timer);
+}
+
 async function main() {
+  const disarmWatchdog = armStartupWatchdog();
   try {
+    startupStep = "loading the pose model";
     statusEl.textContent = "Loading pose model…";
     await initPoseLandmarker();
     drawingUtils = new DrawingUtils(ctx);
 
+    startupStep = "starting the camera";
     statusEl.textContent = "Starting camera…";
-    await startCamera();
+    await startCamera(); // updates startupStep to "waiting for the camera picture" partway through, see startCamera
 
+    startupStep = "starting tracking";
+    disarmWatchdog();
+    clearStartupProblem(); // startup made it through after all — remove any watchdog banner left by a step that stalled earlier but then recovered on its own
     statusEl.classList.add("hidden");
     updateHandButtonLabel();
     updateMirrorButtonLabel();
     renderLoop();
   } catch (err) {
+    disarmWatchdog();
     statusEl.classList.remove("hidden");
     statusEl.textContent = `Error: ${err.message}`;
     console.error(err);
+    // Unlike the watchdog case above, main() gives up entirely here — there is no later success
+    // to clear this away, so it's written once and (like clipsUnavailableReason) stands for the
+    // rest of the session.
+    recordStartupProblem(`${startupStepProblem(startupStep)}.`, err.message);
   }
 }
 
