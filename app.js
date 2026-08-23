@@ -617,7 +617,7 @@ function setModelStatusLine(avgMs, renderedFps) {
 // in the REGION-OF-INTEREST CROPPING constants above. The offscreen canvas below is never added
 // to the page (document.createElement, not appendChild) — it exists purely as an intermediate
 // image for MediaPipe to look at; it is NEVER what gets drawn to the visible #overlay canvas or
-// recorded into a shot's clip (see drawVideoFrame/drawSkeleton further down — those always draw
+// recorded into a shot's clip (see paintCanvas/drawVideoFrame further down — those always draw
 // the full camera frame). Cropping is an inference-input concern only.
 const roiCanvas = document.createElement("canvas");
 roiCanvas.width = ROI_CANVAS_SIZE;
@@ -1018,10 +1018,9 @@ async function startCamera() {
     await waitForVideoReady();
   }
 
-  // No CSS mirroring here any more — see effectiveMirror/withMirror below for why. The <video>
-  // element itself is left completely alone (never flipped, never classed); the canvas painted
-  // on top of it is opaque every frame (see drawVideoFrame) and is what actually gets mirrored,
-  // in its pixels, when that's called for.
+  // Nothing to do for mirroring here — see effectiveMirror/withMirror/syncMirrorClasses for how
+  // it actually gets applied (a CSS class kept in sync every frame from paintCanvas), not
+  // anything startCamera itself needs to set up.
   sizeCanvasToVideo();
 }
 
@@ -2427,32 +2426,28 @@ function renderShotLog() {
   shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
-// Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
-// the canvas transparent so the <video> element underneath showed through on its own — visually
-// identical, but it meant the canvas itself had no picture in it, only skeleton lines. Now that
-// the canvas is what gets recorded (see startClipRecording — canvas.captureStream is the only
-// way to bake the skeleton into a clip), the canvas needs its own copy of the video frame every
-// time, landmarks or not, so a clip is never missing frames just because the pose was briefly
+// Draws the current camera frame into the overlay canvas, unmirrored. Only used while a clip is
+// actively recording (see paintCanvas below) — canvas.captureStream is the only way to bake the
+// picture into a clip, so the canvas needs its own copy of the video frame for exactly that
+// window, landmarks or not, so a clip is never missing frames just because the pose was briefly
 // lost. canvas.width/height are set to the video's native resolution in startCamera, so this
-// plain draw lines up exactly with no cropping or letterboxing needed. Always draws the RAW,
-// unmirrored video frame — see withMirror below for where the flip actually happens; this
-// function has no idea whether the current picture is mirrored or not, deliberately.
+// plain draw lines up exactly with no cropping or letterboxing needed. See withMirror below for
+// where the flip actually happens; this function has no idea whether the current picture is
+// mirrored or not, deliberately.
 //
 // This fully repaints canvas.width × canvas.height every call (clearRect then a drawImage that
-// covers the same rectangle), so the <video> element underneath — which sits at the same CSS
-// box (inset: 0, 100% × 100%) as this canvas — can never show through at an edge, even if the
-// two elements' internal pixel dimensions differ (they can: canvas.width/height are the video's
-// native capture resolution, while the CSS box both are stretched into is the on-screen viewport
-// size). "Stretched into a differently-sized box" is not "gaps at the edges" — both elements
-// always cover their entire box, just at different effective scales, so there is no seam for the
-// unflipped video to leak through.
+// covers the same rectangle) — the same box <video> sits in underneath (inset: 0, 100% × 100%),
+// so while this is drawing there is no seam at any edge for the unflipped video to leak through.
 function drawVideoFrame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 }
 
-function drawSkeleton(landmarks) {
-  drawVideoFrame();
+// The skeleton lines/dots only — no video frame. Pulled out on its own so paintCanvas can draw
+// it either on top of a freshly-composited video frame (recording) or straight onto a transparent
+// canvas (not recording, <video> shows through on its own) without duplicating the two
+// drawingUtils calls in both places.
+function drawSkeletonLines(landmarks) {
   drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
     color: "#00e5ff",
     lineWidth: 3,
@@ -2460,16 +2455,12 @@ function drawSkeleton(landmarks) {
   drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", radius: 4 });
 }
 
-// Runs one frame's worth of canvas drawing (video frame, and the skeleton on top of it when
-// there is one) inside a horizontal flip, when effectiveMirror says this frame should be
-// mirrored. This is now the ONLY place mirroring happens in the whole app — replacing the old
-// CSS `.mirrored` class on #video/#overlay, which only changed how the browser displayed those
-// elements and never touched a single pixel. That mattered because clips are recorded straight
-// off this canvas (canvas.captureStream, see startClipRecording): a CSS transform is invisible
-// to a pixel-capture stream, so the old approach meant a mirrored on-screen view recorded an
-// UNmirrored clip — the owner would watch back something that didn't match what he saw live.
-// Doing the flip here instead means the canvas's own pixels are mirrored, so whatever the owner
-// saw on screen is exactly what the recorder captured.
+// Runs one frame's worth of canvas drawing inside a horizontal flip, when effectiveMirror says
+// this frame should be mirrored. Only used while a clip is recording (see paintCanvas) — the rest
+// of the time mirroring is a CSS class instead (see syncMirrorClasses/style.css), because a CSS
+// transform is invisible to canvas.captureStream: a clip is recorded straight off this canvas's
+// own pixels, so whatever the owner sees mirrored on screen while recording has to be mirrored IN
+// THE CANVAS, not just in CSS, or the clip he watches back won't match what he saw live.
 //
 // The flip is pure presentation: it happens in ctx's transform, applied only to what gets drawn
 // AFTER it, and is undone (ctx.restore) before this function returns. It never touches a
@@ -2490,6 +2481,63 @@ function withMirror(drawFn) {
     drawFn();
   } finally {
     ctx.restore();
+  }
+}
+
+// Pure: should the #overlay canvas element carry the CSS .mirrored class (see style.css) this
+// frame? Only when the picture should appear mirrored AND nothing is currently baking a
+// pixel-level mirror into the canvas itself (see withMirror) — stacking both would flip an
+// already-mirrored recording's picture back to unmirrored on screen. Kept pure and tiny so
+// selfTest can check the full truth table directly, the same convention effectiveMirror uses.
+function canvasShouldMirrorViaCss(mirror, recording) {
+  return mirror && !recording;
+}
+
+// Keeps #video and #overlay's CSS mirror state in sync with effectiveMirror (facingMode/
+// mirrorToggled) and with whether a clip is currently recording (activeRecording) — see
+// canvasShouldMirrorViaCss. Called every frame from paintCanvas below rather than from every
+// place any of those three things can change: a missed call site there would show the wrong
+// picture with nothing to catch it, where a classList.toggle a frame late costs nothing visible.
+function syncMirrorClasses() {
+  const mirror = effectiveMirror(facingMode, mirrorToggled);
+  const recording = !!activeRecording;
+  video.classList.toggle("mirrored", mirror);
+  canvas.classList.toggle("mirrored", canvasShouldMirrorViaCss(mirror, recording));
+}
+
+// One frame's worth of drawing onto the overlay canvas — the single place renderLoop now goes to
+// put anything on screen. landmarks is this frame's smoothed landmarks, or null when there's
+// nothing to draw a skeleton from (pose lost, or an idle-throttled tick that skipped detection).
+//
+// FIELD BUG this replaced: the canvas used to be repainted with an opaque copy of the video frame
+// every single call, which is the only thing that made <video> (sitting underneath, same box)
+// invisible — so the picture the owner saw was a canvas repaint gated behind the ENTIRE rest of
+// this function's caller (renderLoop), including the synchronous, blocking pose-detection call.
+// The visible image could therefore never update faster than one inference pass per frame — at
+// the owner's own measured ~27.8ms/frame, that is the ~28.6fps his own shot log already reported,
+// and any slowdown in inference (a re-acquisition after losing the archer, a hot phone throttling
+// itself) showed up directly as the PICTURE stuttering, not just the skeleton lagging behind it.
+// Confirmed by measurement (see the PM's brief): with detection artificially delayed by a fixed
+// amount, the old code's on-screen repaint rate tracked 1/delay almost exactly, in lockstep with
+// the number of detection calls — not an assumption, a measured 1:1 relationship.
+//
+// The fix: while a clip is recording (see startClipRecording — canvas.captureStream is the only
+// way to bake the skeleton into a clip), the canvas still needs the full picture, pixel-mirrored,
+// exactly as this app has always recorded it. The rest of the time, <video> is what the owner
+// actually sees — playing at the camera's own native frame rate, entirely independent of how fast
+// pose detection is keeping up — and the canvas only ever holds the (transparent-background,
+// unmirrored-in-pixels) skeleton lines on top of it; the CSS .mirrored class (syncMirrorClasses)
+// flips both elements together so they stay pixel-registered with each other either way.
+function paintCanvas(landmarks) {
+  syncMirrorClasses();
+  if (activeRecording) {
+    withMirror(() => {
+      drawVideoFrame();
+      if (landmarks) drawSkeletonLines(landmarks);
+    });
+  } else {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (landmarks) drawSkeletonLines(landmarks);
   }
 }
 
@@ -2529,7 +2577,7 @@ function renderLoop() {
     const dueForIdleSample =
       attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
     if (!dueForIdleSample) {
-      withMirror(drawVideoFrame); // keep the on-screen view (and a clip, if one were somehow recording) alive even on a skipped frame
+      paintCanvas(null); // <video> keeps playing on its own; this only matters if a clip happens to be recording (see paintCanvas)
       syncDebugOverlay();
       return;
     }
@@ -2580,7 +2628,7 @@ function renderLoop() {
   updateAttentionState(now, rawLandmarks, frameWidth, frameHeight);
 
   if (!rawLandmarks) {
-    withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
+    paintCanvas(null); // no skeleton to draw; <video> keeps the on-screen view alive on its own, and paintCanvas still bakes the picture in if a clip is recording
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
@@ -2608,7 +2656,7 @@ function renderLoop() {
     // coordinate system that doesn't itself change shape from frame to frame the way a moving
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
-    withMirror(() => drawSkeleton(landmarks));
+    paintCanvas(landmarks);
     updateBowArmReadout(landmarks, frameWidth, frameHeight);
     updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
     updateDrawElbowReadout(landmarks, frameWidth, frameHeight);
@@ -2653,6 +2701,11 @@ function updateHandButtonLabel() {
 function updateMirrorButtonLabel() {
   const mirrored = effectiveMirror(facingMode, mirrorToggled);
   btnMirror.textContent = mirrored ? "🪞 Mirrored" : "🪞 Not mirrored";
+  // Also updates the CSS mirror classes (see syncMirrorClasses) — every call site here changes
+  // effectiveMirror's inputs, and paintCanvas only re-syncs those once renderLoop is running, so
+  // without this the picture would show unmirrored for a moment right after startup or a camera
+  // switch, before the first frame paints.
+  syncMirrorClasses();
 }
 
 btnCamera.addEventListener("click", async () => {
@@ -4446,6 +4499,28 @@ function selfTest() {
   console.assert(
     effectiveMirror("user", true) === false,
     "front camera, toggle on, should flip to unmirrored (away from its mirrored default)"
+  );
+
+  // --- canvasShouldMirrorViaCss: the #overlay canvas gets the CSS mirror flip only when the
+  // picture should look mirrored AND nothing is currently baking a pixel-level mirror into the
+  // canvas itself (see withMirror/paintCanvas) — stacking both would flip an already-mirrored
+  // recording's picture back to unmirrored on screen. Full truth table, since this is exactly the
+  // kind of two-boolean interaction a single missed case would silently get backwards.
+  console.assert(
+    canvasShouldMirrorViaCss(true, false) === true,
+    "mirrored + not recording: canvas should get the CSS flip"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(true, true) === false,
+    "mirrored + recording: canvas pixels are already mirrored (withMirror) — CSS flip must be withheld, or the picture flips back to unmirrored"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(false, false) === false,
+    "not mirrored + not recording: no CSS flip needed"
+  );
+  console.assert(
+    canvasShouldMirrorViaCss(false, true) === false,
+    "not mirrored + recording: no CSS flip either way"
   );
 
   // --- ROUTINE-START ATTENTION GATING: attentionIsClearlyCalm first, as a pure function, then
