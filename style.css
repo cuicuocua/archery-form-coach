@@ -51,16 +51,35 @@ html, body {
   height: 100%;
 }
 
-/* Video fills its box. Never transformed by CSS any more — mirroring is done by flipping the
-   canvas's own pixels instead (see withMirror in app.js), so a recorded clip matches what was on
-   screen. This element is fully covered every frame by the opaque canvas painted on top of it
-   (same inset:0/100%x100% box, so there's no gap at any edge for it to show through). */
+/* Video fills its box and is now what the owner actually SEES live — see paintCanvas in app.js
+   for why. #overlay used to be an opaque canvas covering this every frame, which meant the
+   on-screen picture could only update as often as pose detection produced a new (blocking)
+   result — measured directly: with detection artificially delayed, the old on-screen repaint
+   rate tracked 1/delay in lockstep, which is why a slow phone or a hard-to-track frame showed up
+   as the whole picture stuttering, not just the skeleton lagging. Now the canvas stays
+   transparent except while a clip is recording, so <video> plays at the camera's own native rate
+   underneath it, independent of how fast pose detection is keeping up. object-fit is `contain`,
+   not `cover`: #camerabox (see below) is already sized in JS to this exact camera aspect ratio,
+   so in normal operation neither one crops anything — but `contain` fails safe (letterboxes)
+   instead of silently cropping the picture out of register with the skeleton drawn on top of it
+   if that sizing is ever wrong for a frame, which `cover` would not. */
 #video {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
+}
+
+/* Mirroring while NOT recording is a CSS transform on both #video and #overlay together (see
+   .mirrored below and syncMirrorClasses in app.js) — cheap, and correct here specifically because
+   both elements share the exact same box and are flipped by the exact same transform, so they
+   stay pixel-registered with each other. While a clip IS recording, #overlay's own pixels already
+   have the mirror baked in instead (see withMirror in app.js) and the .mirrored class is withheld
+   from it for that reason — a CSS flip on top of already-mirrored pixels would flip it back. */
+#video.mirrored,
+#overlay.mirrored {
+  transform: scaleX(-1);
 }
 
 #overlay {
