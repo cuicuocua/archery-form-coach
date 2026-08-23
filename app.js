@@ -814,8 +814,28 @@ function effectiveMirror(facingMode, toggled) {
   return defaultMirrorFor(facingMode) !== toggled; // XOR: toggled flips whichever default applies
 }
 
+// MediaPipe hands back x and y normalised INDEPENDENTLY on each axis — x is a fraction of the
+// video frame's WIDTH, y a fraction of its HEIGHT. Those two fractions only mean the same
+// physical distance when the frame is square. An iPhone held upright records portrait video
+// (something like 720 wide by 1280 tall), so a step of 0.1 in x is a much shorter real-world
+// distance than a step of 0.1 in y — yet every distance and angle in this file was, until this
+// fix, computed with plain Math.hypot/atan-style vector maths directly on those raw x/y values,
+// silently stretching every measurement along whichever axis happens to be the frame's narrower
+// one. Multiplying x by the frame's pixel WIDTH and y by its pixel HEIGHT turns both axes back
+// into the same units (video pixels) before any geometry happens, so a physically straight arm
+// reads as straight and a real distance compares honestly to another real distance, regardless
+// of whether the phone is held upright or sideways. This is a GEOMETRY-ONLY conversion: nothing
+// that ends up on screen or in a recorded clip may use it (see mapCropLandmarkToFullFrame's own
+// comment) — drawing stays in MediaPipe's normalised space throughout, exactly as before.
+function toPixelSpace(lm, frameWidth, frameHeight) {
+  return { x: lm.x * frameWidth, y: lm.y * frameHeight, visibility: lm.visibility };
+}
+
 function angleAt(a, b, c) {
-  // angle at point b, between rays b->a and b->c, in degrees
+  // angle at point b, between rays b->a and b->c, in degrees. Pure vector maths — agnostic to
+  // whatever coordinate space a/b/c are already in, so callers are responsible for passing
+  // points already converted to a physically-honest space (see toPixelSpace above) when the
+  // frame isn't square. Never called directly on raw normalised landmarks for that reason.
   const v1 = { x: a.x - b.x, y: a.y - b.y };
   const v2 = { x: c.x - b.x, y: c.y - b.y };
   const dot = v1.x * v2.x + v1.y * v2.y;
@@ -848,16 +868,24 @@ function setValueState(valueEl, text, state) {
 
 // Bow-arm angle as a plain number (or null if we can't tell) — pulled out of the readout
 // function below so the shot log can record the exact same value without duplicating the math.
-function bowArmAngleOf(landmarks) {
+// frameWidth/frameHeight are the video's own pixel dimensions — required so the shoulder/elbow/
+// wrist points can be converted to a physically-honest space (see toPixelSpace) before angleAt
+// measures the angle between them; skipping this would report a distorted angle on any
+// non-square frame (i.e. basically every phone video).
+function bowArmAngleOf(landmarks, frameWidth, frameHeight) {
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowElbow = rightHanded ? L_ELBOW : R_ELBOW;
   const bowWrist = rightHanded ? L_WRIST : R_WRIST;
   if (![bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) return null;
-  return angleAt(landmarks[bowShoulder], landmarks[bowElbow], landmarks[bowWrist]);
+  return angleAt(
+    toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight),
+    toPixelSpace(landmarks[bowElbow], frameWidth, frameHeight),
+    toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight)
+  );
 }
 
-function updateBowArmReadout(landmarks) {
-  const angle = bowArmAngleOf(landmarks);
+function updateBowArmReadout(landmarks, frameWidth, frameHeight) {
+  const angle = bowArmAngleOf(landmarks, frameWidth, frameHeight);
   if (angle === null) {
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     return;
@@ -866,10 +894,15 @@ function updateBowArmReadout(landmarks) {
   setReadout(readoutBowArm, valueBowArm, `${Math.round(angle)}°`, ok ? "ok" : "warn");
 }
 
-function torsoLength(landmarks, shoulderIdx, hipIdx) {
+// The scale reference every ratio-based measure in this file divides by. Converted to pixel
+// space (see toPixelSpace) before the hypot — shoulder-to-hip is close to purely vertical in a
+// side-on view, but "close to" isn't "exactly", and this must be correct even for an archer who
+// isn't perfectly upright, so the conversion is never skipped just because it would often cancel
+// out anyway.
+function torsoLength(landmarks, shoulderIdx, hipIdx, frameWidth, frameHeight) {
   if (!visible(landmarks, shoulderIdx) || !visible(landmarks, hipIdx)) return null;
-  const s = landmarks[shoulderIdx];
-  const h = landmarks[hipIdx];
+  const s = toPixelSpace(landmarks[shoulderIdx], frameWidth, frameHeight);
+  const h = toPixelSpace(landmarks[hipIdx], frameWidth, frameHeight);
   return Math.hypot(s.x - h.x, s.y - h.y);
 }
 
@@ -879,7 +912,7 @@ function torsoLength(landmarks, shoulderIdx, hipIdx) {
 // Reported per shoulder (not averaged, see updateShoulderDropReadout below) because the
 // common compound fault is one shoulder — usually the bow shoulder, under load — creeping up
 // while the other stays fine; an average would hide exactly that.
-function shoulderDropOf(landmarks, shoulderIdx, sameEarIdx, otherEarIdx, ownHipIdx, otherShoulderIdx, otherHipIdx) {
+function shoulderDropOf(landmarks, shoulderIdx, sameEarIdx, otherEarIdx, ownHipIdx, otherShoulderIdx, otherHipIdx, frameWidth, frameHeight) {
   if (!visible(landmarks, shoulderIdx)) return null;
 
   // Side-on framing often means the far ear is occluded or low-confidence. Prefer the ear on
@@ -890,11 +923,16 @@ function shoulderDropOf(landmarks, shoulderIdx, sameEarIdx, otherEarIdx, ownHipI
 
   // Same "own side preferred, other side as fallback" torso-length convention used everywhere
   // else in this file.
-  const scale = torsoLength(landmarks, shoulderIdx, ownHipIdx) ?? torsoLength(landmarks, otherShoulderIdx, otherHipIdx);
+  const scale =
+    torsoLength(landmarks, shoulderIdx, ownHipIdx, frameWidth, frameHeight) ??
+    torsoLength(landmarks, otherShoulderIdx, otherHipIdx, frameWidth, frameHeight);
   if (!scale) return null;
 
-  const shoulder = landmarks[shoulderIdx];
-  const ear = landmarks[earIdx];
+  // Converted to pixel space (see toPixelSpace) before the subtraction, same as everywhere else
+  // — the ear-to-shoulder gap is close to purely vertical in a side-on view, but not exactly,
+  // and this needs to stay correct for an archer who's leaning or turned slightly too.
+  const shoulder = toPixelSpace(landmarks[shoulderIdx], frameWidth, frameHeight);
+  const ear = toPixelSpace(landmarks[earIdx], frameWidth, frameHeight);
   // Image y grows downward, so the ear normally sits above the shoulder (smaller y). That gap
   // shrinks as the shoulder shrugs up toward the ear, and grows as it drops away from it.
   return ((shoulder.y - ear.y) / scale) * 100;
@@ -902,7 +940,7 @@ function shoulderDropOf(landmarks, shoulderIdx, sameEarIdx, otherEarIdx, ownHipI
 
 // Both shoulders' drop in one call, so the readout and the shot log stay in sync using exactly
 // the same numbers.
-function shoulderDropSampleOf(landmarks) {
+function shoulderDropSampleOf(landmarks, frameWidth, frameHeight) {
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowHip = rightHanded ? L_HIP : R_HIP;
   const bowEar = rightHanded ? L_EAR : R_EAR;
@@ -911,13 +949,13 @@ function shoulderDropSampleOf(landmarks) {
   const drawEar = rightHanded ? R_EAR : L_EAR;
 
   return {
-    bow: shoulderDropOf(landmarks, bowShoulder, bowEar, drawEar, bowHip, drawShoulder, drawHip),
-    draw: shoulderDropOf(landmarks, drawShoulder, drawEar, bowEar, drawHip, bowShoulder, bowHip),
+    bow: shoulderDropOf(landmarks, bowShoulder, bowEar, drawEar, bowHip, drawShoulder, drawHip, frameWidth, frameHeight),
+    draw: shoulderDropOf(landmarks, drawShoulder, drawEar, bowEar, drawHip, bowShoulder, bowHip, frameWidth, frameHeight),
   };
 }
 
-function updateShoulderDropReadout(landmarks) {
-  const { bow, draw } = shoulderDropSampleOf(landmarks);
+function updateShoulderDropReadout(landmarks, frameWidth, frameHeight) {
+  const { bow, draw } = shoulderDropSampleOf(landmarks, frameWidth, frameHeight);
   for (const [pct, valueEl] of [[bow, valueShoulderBow], [draw, valueShoulderDraw]]) {
     if (pct === null) {
       setValueState(valueEl, "—", "uncertain");
@@ -939,16 +977,19 @@ function updateShoulderDropReadout(landmarks) {
 // This measures a real and important half of the goal, not the whole thing. Do not mistake it
 // for a complete check, and don't try to reconstruct the missing dimension from a single
 // side-on camera — it isn't there to reconstruct.
-function drawElbowAlignmentOf(landmarks) {
+function drawElbowAlignmentOf(landmarks, frameWidth, frameHeight) {
   const drawWrist = rightHanded ? R_WRIST : L_WRIST;
   const drawElbow = rightHanded ? R_ELBOW : L_ELBOW;
   const bowWrist = rightHanded ? L_WRIST : R_WRIST;
 
   if (![drawWrist, drawElbow, bowWrist].every((i) => visible(landmarks, i))) return null;
 
-  const wrist = landmarks[drawWrist];
-  const elbow = landmarks[drawElbow];
-  const bow = landmarks[bowWrist];
+  // Converted to pixel space up front (see toPixelSpace) — both the angle below AND the
+  // high/low line-interpolation further down mix x and y together, so both need every point in
+  // the same physically-honest units, not just the angle.
+  const wrist = toPixelSpace(landmarks[drawWrist], frameWidth, frameHeight);
+  const elbow = toPixelSpace(landmarks[drawElbow], frameWidth, frameHeight);
+  const bow = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
 
   const angle = angleAt(bow, wrist, elbow);
   if (angle === null) return null;
@@ -961,7 +1002,10 @@ function drawElbowAlignmentOf(landmarks) {
   // So: extend the bow-wrist -> draw-wrist line out to the elbow's x, and compare the elbow's
   // actual height to where that line would put it.
   const dx = wrist.x - bow.x;
-  if (Math.abs(dx) < 1e-6) return null; // near-vertical line: can't tell high from low this way
+  // near-vertical line: can't tell high from low this way. wrist/bow are pixel-space now (see
+  // above), not the [0,1] normalised fractions this epsilon was originally written against, so
+  // the threshold scales with frameWidth to mean the same tiny fraction-of-frame it always did.
+  if (Math.abs(dx) < 1e-6 * frameWidth) return null;
 
   const t = (elbow.x - bow.x) / dx;
   const expectedY = bow.y + t * (wrist.y - bow.y);
@@ -978,8 +1022,8 @@ function drawElbowAlignmentOf(landmarks) {
   return { deviation, direction, signed };
 }
 
-function updateDrawElbowReadout(landmarks) {
-  const result = drawElbowAlignmentOf(landmarks);
+function updateDrawElbowReadout(landmarks, frameWidth, frameHeight) {
+  const result = drawElbowAlignmentOf(landmarks, frameWidth, frameHeight);
   if (result === null) {
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
     return;
@@ -1003,7 +1047,10 @@ function updateDrawElbowReadout(landmarks) {
 // frameEligible: whether THIS frame's own reading is settled enough to become a shot's logged
 // sample (see PIPELINE SETTLING above) — required, not optional, so every caller has to make a
 // deliberate choice rather than accidentally defaulting to "trust everything".
-function isAtFullDraw(landmarks, nowMs, frameEligible) {
+// frameWidth/frameHeight: the video's own pixel dimensions, needed so every distance below can
+// be computed in a physically-honest space (see toPixelSpace) rather than raw normalised x/y,
+// which stretch distances along whichever axis the frame happens to be narrower on.
+function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) {
   const drawWrist = rightHanded ? R_WRIST : L_WRIST;
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowElbow = rightHanded ? L_ELBOW : R_ELBOW;
@@ -1018,36 +1065,47 @@ function isAtFullDraw(landmarks, nowMs, frameEligible) {
     return false;
   }
 
-  let anchor;
+  let anchorNorm;
   if (visible(landmarks, MOUTH_L) && visible(landmarks, MOUTH_R)) {
-    anchor = {
+    anchorNorm = {
       x: (landmarks[MOUTH_L].x + landmarks[MOUTH_R].x) / 2,
       y: (landmarks[MOUTH_L].y + landmarks[MOUTH_R].y) / 2,
     };
   } else if (visible(landmarks, NOSE)) {
-    anchor = landmarks[NOSE];
+    anchorNorm = landmarks[NOSE];
   } else {
     return false;
   }
+  // anchorNorm above is built by averaging two normalised points (still normalised, fine to mix
+  // before converting) or taken straight from a landmark; either way it's still in MediaPipe's
+  // normalised space at this point, so it gets the same toPixelSpace treatment as everything
+  // else below before any distance touches it.
+  const anchor = toPixelSpace(anchorNorm, frameWidth, frameHeight);
 
   const scale =
-    torsoLength(landmarks, drawShoulder, drawHip) ?? torsoLength(landmarks, bowShoulder, bowHip);
+    torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ??
+    torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight);
   if (!scale) return false;
 
-  const wrist = landmarks[drawWrist];
-  const bowWristPos = landmarks[bowWrist];
+  const wrist = toPixelSpace(landmarks[drawWrist], frameWidth, frameHeight);
+  const bowWristPos = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
   const anchorDist = Math.hypot(wrist.x - anchor.x, wrist.y - anchor.y) / scale;
   const handSep = Math.hypot(wrist.x - bowWristPos.x, wrist.y - bowWristPos.y) / scale;
 
-  const bowArmAngle = bowArmAngleOf(landmarks);
+  const bowArmAngle = bowArmAngleOf(landmarks, frameWidth, frameHeight);
   if (bowArmAngle === null) return false;
 
   // Stillness: compare to where the draw wrist was last frame. Speed (distance moved per
   // second), not raw distance, so it doesn't depend on how often this happens to get called.
-  // No previous frame yet means we can't know it's still, so treat that as "moving".
-  const prev = lastDrawWrist;
-  lastDrawWrist = { x: wrist.x, y: wrist.y, t: nowMs };
-  const dtSec = prev ? (nowMs - prev.t) / 1000 : 0;
+  // No previous frame yet means we can't know it's still, so treat that as "moving". lastDrawWrist
+  // is kept in the same normalised space landmarks always arrive in (matching every other piece
+  // of state this file carries frame-to-frame) and converted to pixel space at compare time,
+  // using THIS frame's dimensions for both points — correct as long as the frame size hasn't
+  // changed since the previous frame, true for every frame within one camera stream.
+  const prevNorm = lastDrawWrist;
+  lastDrawWrist = { x: landmarks[drawWrist].x, y: landmarks[drawWrist].y, t: nowMs };
+  const dtSec = prevNorm ? (nowMs - prevNorm.t) / 1000 : 0;
+  const prev = prevNorm ? toPixelSpace(prevNorm, frameWidth, frameHeight) : null;
   const speed =
     prev && dtSec > 0 ? Math.hypot(wrist.x - prev.x, wrist.y - prev.y) / scale / dtSec : Infinity;
 
@@ -1068,8 +1126,8 @@ function isAtFullDraw(landmarks, nowMs, frameEligible) {
     {
       handSep,
       bowArmAngle,
-      shoulderDrop: shoulderDropSampleOf(landmarks),
-      elbowAlign: drawElbowAlignmentOf(landmarks),
+      shoulderDrop: shoulderDropSampleOf(landmarks, frameWidth, frameHeight),
+      elbowAlign: drawElbowAlignmentOf(landmarks, frameWidth, frameHeight),
       anchorOk,
       armOk,
       sepOk,
@@ -2009,9 +2067,9 @@ function renderLoop() {
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
     withMirror(() => drawSkeleton(landmarks));
-    updateBowArmReadout(landmarks);
-    updateShoulderDropReadout(landmarks);
-    updateDrawElbowReadout(landmarks);
+    updateBowArmReadout(landmarks, frameWidth, frameHeight);
+    updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
+    updateDrawElbowReadout(landmarks, frameWidth, frameHeight);
     // Return value intentionally unused here — isAtFullDraw's real job on every frame is its
     // side effect, calling trackShotAttempt (below) to feed the shot log. It used to also drive
     // the auto-freeze state machine, which read the true/false result; that machine is gone, but
@@ -2027,7 +2085,7 @@ function renderLoop() {
     const cropBoxStableThisFrame = cropBoxIsStable(usedCropBox, prevUsedCropBox);
     prevUsedCropBox = usedCropBox;
     const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
-    isAtFullDraw(landmarks, now, frameEligible);
+    isAtFullDraw(landmarks, now, frameEligible, frameWidth, frameHeight);
 
     // Pick the crop box for NEXT frame from what was actually seen this frame (full-frame
     // coordinates, already mapped above if this frame itself was cropped). Recomputed from
@@ -2278,6 +2336,13 @@ function selfTest() {
   const savedPrevUsedCropBox = prevUsedCropBox;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
+  // Every fixture below except the dedicated ASPECT-RATIO CORRECTNESS section further down was
+  // written (and its expected numbers hand-checked) as plain [0,1] normalised coordinates, with
+  // no camera frame involved. Every geometry function now needs a frame width/height to convert
+  // into (see toPixelSpace) — passing 1x1 here is a literal no-op multiplication (every landmark
+  // times 1 is itself), so these fixtures keep measuring exactly what they always measured. It is
+  // NOT a claim that real phone video is 1x1 or square — quite the opposite, see below.
+  const NOOP_W = 1, NOOP_H = 1;
   const mkLandmarks = (overrides) => {
     const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 1 }));
     for (const i in overrides) lm[i] = { ...lm[i], ...overrides[i] };
@@ -2312,7 +2377,7 @@ function selfTest() {
     Math.abs(raiseArmAngle - 180) < 0.01,
     "raise fixture's bow arm must actually measure as ~180° (straight), or this isn't testing the raise at all"
   );
-  const raiseScale = torsoLength(raise, R_SHOULDER, R_HIP);
+  const raiseScale = torsoLength(raise, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
   const raiseAnchor = {
     x: (raise[MOUTH_L].x + raise[MOUTH_R].x) / 2,
     y: (raise[MOUTH_L].y + raise[MOUTH_R].y) / 2,
@@ -2329,9 +2394,9 @@ function selfTest() {
     raiseHandSep < FULL_DRAW_HAND_SEP_MIN,
     "raise fixture's hands should be too close together to pass hand separation — the one thing meant to reject it"
   );
-  console.assert(isAtFullDraw(raise, 0, true) === false, "raise (first frame) must not read as full draw");
+  console.assert(isAtFullDraw(raise, 0, true, NOOP_W, NOOP_H) === false, "raise (first frame) must not read as full draw");
   console.assert(
-    isAtFullDraw(raise, 500, true) === false,
+    isAtFullDraw(raise, 500, true, NOOP_W, NOOP_H) === false,
     "raise held steady for a second frame (passes stillness too, now) must still be rejected — by hand separation alone"
   );
 
@@ -2341,11 +2406,11 @@ function selfTest() {
   lastDrawWrist = null;
   const drawn = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
   console.assert(
-    isAtFullDraw(drawn, 0, true) === false,
+    isAtFullDraw(drawn, 0, true, NOOP_W, NOOP_H) === false,
     "first frame at full draw should read as still-moving (no prior position yet)"
   );
   console.assert(
-    isAtFullDraw(drawn, 500, true) === true,
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H) === true,
     "same position 500ms later (zero speed) should read as full draw"
   );
 
@@ -2354,9 +2419,9 @@ function selfTest() {
   // must be rejected by stillness alone, not because it never got close enough.
   lastDrawWrist = null;
   const midDraw1 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.4, y: 0.31 } });
-  isAtFullDraw(midDraw1, 0, true); // seeds lastDrawWrist; this call's own result isn't the point
+  isAtFullDraw(midDraw1, 0, true, NOOP_W, NOOP_H); // seeds lastDrawWrist; this call's own result isn't the point
   const midDraw2 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.5, y: 0.32 } });
-  const midScale = torsoLength(midDraw2, R_SHOULDER, R_HIP);
+  const midScale = torsoLength(midDraw2, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
   const midAnchor = {
     x: (midDraw2[MOUTH_L].x + midDraw2[MOUTH_R].x) / 2,
     y: (midDraw2[MOUTH_L].y + midDraw2[MOUTH_R].y) / 2,
@@ -2371,7 +2436,7 @@ function selfTest() {
     "mid-draw fixture's hands should already be far enough apart on their own"
   );
   console.assert(
-    isAtFullDraw(midDraw2, 50, true) === false,
+    isAtFullDraw(midDraw2, 50, true, NOOP_W, NOOP_H) === false,
     "wrist still travelling fast toward anchor (50ms, big jump) must not read as full draw yet — only stillness should be stopping it"
   );
 
@@ -2380,10 +2445,10 @@ function selfTest() {
   // right before it settles at anchor.
   lastDrawWrist = null;
   const driftSeed = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
-  isAtFullDraw(driftSeed, 500, true); // seeds lastDrawWrist at the same position/time as `drawn` above
+  isAtFullDraw(driftSeed, 500, true, NOOP_W, NOOP_H); // seeds lastDrawWrist at the same position/time as `drawn` above
   const drifted = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.6, y: 0.31 } });
   console.assert(
-    isAtFullDraw(drifted, 600, true) === false,
+    isAtFullDraw(drifted, 600, true, NOOP_W, NOOP_H) === false,
     "wrist jumping far in 100ms (fast) should not read as holding still"
   );
 
@@ -2716,7 +2781,7 @@ function selfTest() {
     7: { x: 0.3, y: 0.3 }, // L ear (same side) — gap 0.1, torso 0.3 -> 33.3%
     8: { x: 0.7, y: 0.35 }, // R ear (other side) — deliberately different; must NOT be used
   });
-  const drop1 = shoulderDropOf(dropLm1, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP);
+  const drop1 = shoulderDropOf(dropLm1, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
   console.assert(
     drop1 !== null && Math.abs(drop1 - 33.33) < 0.1,
     "shoulder drop should be the same-side ear-to-shoulder gap as a % of torso length"
@@ -2728,7 +2793,7 @@ function selfTest() {
     7: { x: 0, y: 0, visibility: 0 }, // same-side ear occluded
     8: { x: 0.7, y: 0.25 }, // other-side ear — gap 0.15, torso 0.3 -> 50%
   });
-  const drop2 = shoulderDropOf(dropLm2, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP);
+  const drop2 = shoulderDropOf(dropLm2, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
   console.assert(
     drop2 !== null && Math.abs(drop2 - 50) < 0.1,
     "shoulder drop should fall back to the other ear when the same-side one isn't visible"
@@ -2741,7 +2806,7 @@ function selfTest() {
     8: { x: 0, y: 0, visibility: 0 },
   });
   console.assert(
-    shoulderDropOf(dropLm3, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP) === null,
+    shoulderDropOf(dropLm3, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP, NOOP_W, NOOP_H) === null,
     "shoulder drop should be uncertain (null), not a guess, when both ears are occluded"
   );
 
@@ -2752,7 +2817,7 @@ function selfTest() {
     8: { x: 0.7, y: 0.3 },
   });
   console.assert(
-    shoulderDropOf(dropLm4, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP) === null,
+    shoulderDropOf(dropLm4, L_SHOULDER, L_EAR, R_EAR, L_HIP, R_SHOULDER, R_HIP, NOOP_W, NOOP_H) === null,
     "shoulder drop should be uncertain (null) when the shoulder itself isn't visible"
   );
 
@@ -2763,21 +2828,21 @@ function selfTest() {
   // implemented with one.
   rightHanded = true;
   const inLine = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.5 } });
-  const inLineResult = drawElbowAlignmentOf(inLine);
+  const inLineResult = drawElbowAlignmentOf(inLine, NOOP_W, NOOP_H);
   console.assert(
     inLineResult !== null && Math.abs(inLineResult.deviation) < 0.01,
     "elbow exactly on the extended bow-wrist -> draw-wrist line should read as ~0° deviation"
   );
 
   const highRH = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.4 } });
-  const highRHResult = drawElbowAlignmentOf(highRH);
+  const highRHResult = drawElbowAlignmentOf(highRH, NOOP_W, NOOP_H);
   console.assert(
     highRHResult !== null && highRHResult.direction === "high" && highRHResult.deviation > 5,
     "elbow physically higher than the extended line (smaller y) should report direction: high"
   );
 
   const lowRH = mkLandmarks({ 15: { x: 0.0, y: 0.5 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 1.0, y: 0.6 } });
-  const lowRHResult = drawElbowAlignmentOf(lowRH);
+  const lowRHResult = drawElbowAlignmentOf(lowRH, NOOP_W, NOOP_H);
   console.assert(
     lowRHResult !== null && lowRHResult.direction === "low" && lowRHResult.deviation > 5,
     "elbow physically lower than the extended line (bigger y) should report direction: low"
@@ -2792,7 +2857,7 @@ function selfTest() {
     15: { x: 0.5, y: 0.5 }, // draw wrist (L_WRIST)
     13: { x: 0.0, y: 0.4 }, // draw elbow (L_ELBOW) — still physically higher
   });
-  const highLHResult = drawElbowAlignmentOf(highLH);
+  const highLHResult = drawElbowAlignmentOf(highLH, NOOP_W, NOOP_H);
   console.assert(
     highLHResult !== null && highLHResult.direction === "high",
     "mirrored (left-handed) geometry: elbow still physically higher must still report high, not low"
@@ -2803,7 +2868,7 @@ function selfTest() {
     15: { x: 0.5, y: 0.5 },
     13: { x: 0.0, y: 0.6 }, // still physically lower
   });
-  const lowLHResult = drawElbowAlignmentOf(lowLH);
+  const lowLHResult = drawElbowAlignmentOf(lowLH, NOOP_W, NOOP_H);
   console.assert(
     lowLHResult !== null && lowLHResult.direction === "low",
     "mirrored (left-handed) geometry: elbow still physically lower must still report low, not high"
@@ -2812,7 +2877,7 @@ function selfTest() {
   rightHanded = true;
   const vertical = mkLandmarks({ 15: { x: 0.5, y: 0.2 }, 16: { x: 0.5, y: 0.5 }, 14: { x: 0.5, y: 0.8 } });
   console.assert(
-    drawElbowAlignmentOf(vertical) === null,
+    drawElbowAlignmentOf(vertical, NOOP_W, NOOP_H) === null,
     "a near-vertical bow-wrist -> draw-wrist line can't tell high from low, so this should be uncertain (null), not a guess"
   );
 
@@ -3434,6 +3499,178 @@ function selfTest() {
     console.assert(
       firstAcquisition.x === freshSmoothBox.x && firstAcquisition.size === freshSmoothBox.size,
       "with no previous box to ease from, smoothCropBox should use the fresh box outright"
+    );
+  }
+
+  // --- ASPECT-RATIO CORRECTNESS: the bug all the toPixelSpace conversions above exist to fix.
+  // MediaPipe normalises x by frame WIDTH and y by frame HEIGHT independently, so raw x/y are
+  // only the same physical units when the frame is square — and a phone's camera frame never is
+  // (e.g. roughly 720x1280 held upright). Left uncorrected, every distance and angle in this file
+  // is stretched along whichever axis the frame happens to be narrower on: a field shot log once
+  // showed hand separation reading 2.31-2.32 torso-lengths, ~3x a physically possible full draw,
+  // traced to exactly this. This section builds ONE synthetic archer directly in real-world-
+  // proportional units (no camera involved — this IS the ground truth, not a MediaPipe fixture),
+  // projects it into normalised landmarks the way a real camera+MediaPipe would for two very
+  // different frame shapes (a phone held upright, and the same phone on its side), and checks
+  // that every measure this file reports (a) matches the known-correct answer computed straight
+  // from those real-world units, in BOTH orientations, and (b) — the actual property that broke
+  // in the field — reads the SAME regardless of which way the phone was held.
+  {
+    // Real-world-proportional coordinates (one arbitrary consistent unit — only ratios and
+    // angles between these points are ever checked, never their absolute size). Convention
+    // matches the rest of this file: x grows toward the bow-arm/target side, y grows DOWNWARD
+    // (image convention), so a SMALLER y is physically HIGHER up.
+    const shoulder = { x: 0, y: 0 }; // bow shoulder and draw shoulder both land here — the same "shoulder line is nearly degenerate" simplification CLAUDE.md describes for a true side-on view
+    const hip = { x: 0, y: 0.5 }; // torso length 0.5 units, purely vertical — bow hip and draw hip both here too
+    const bowElbow = { x: 0.3, y: 0 }; // collinear with shoulder and bowWrist below: a genuinely straight bow arm, 180° by construction
+    const bowWrist = { x: 0.6, y: 0 };
+    const drawWrist = { x: 0.05, y: -0.18 }; // anchor near the face: close to the centreline, higher than the shoulder
+    const mouth = { x: 0.0, y: -0.2 }; // near, not on top of, drawWrist — a small but real (nonzero) anchor distance
+    const bowEar = { x: 0, y: -0.1 };
+    const drawEar = { x: 0, y: -0.15 };
+    // Deliberately NOT on the bow-wrist -> draw-wrist line: physically ABOVE it by a known
+    // amount, so both the deviation magnitude and the high/low direction are real, checkable
+    // facts about this fixture, not accidents of whatever numbers happened to be picked.
+    const drawElbow = { x: -0.225, y: -0.35 };
+
+    // Ground truth: plain vector maths on the real-world coordinates above, no camera or
+    // normalisation involved anywhere — this is what a perfect measurement would report, and
+    // exactly what the corrected functions below are held to, in both orientations.
+    const trueTorso = Math.hypot(shoulder.x - hip.x, shoulder.y - hip.y);
+    const trueBowArmAngle = angleAt(shoulder, bowElbow, bowWrist);
+    console.assert(Math.abs(trueBowArmAngle - 180) < 1e-9, "fixture sanity check: the bow arm was meant to be built perfectly straight");
+    const trueHandSepRatio = Math.hypot(bowWrist.x - drawWrist.x, bowWrist.y - drawWrist.y) / trueTorso;
+    const trueAnchorRatio = Math.hypot(drawWrist.x - mouth.x, drawWrist.y - mouth.y) / trueTorso;
+    const trueBowDropPct = ((shoulder.y - bowEar.y) / trueTorso) * 100;
+    const trueDrawDropPct = ((shoulder.y - drawEar.y) / trueTorso) * 100;
+    const trueElbowAngle = angleAt(bowWrist, drawWrist, drawElbow);
+    const trueElbowDeviation = 180 - trueElbowAngle;
+    const elbowDx = drawWrist.x - bowWrist.x;
+    const elbowT = (drawElbow.x - bowWrist.x) / elbowDx;
+    const elbowExpectedY = bowWrist.y + elbowT * (drawWrist.y - bowWrist.y);
+    const trueElbowDirection = drawElbow.y < elbowExpectedY ? "high" : drawElbow.y > elbowExpectedY ? "low" : "level";
+    console.assert(trueElbowDirection === "high", "fixture sanity check: the elbow was meant to be built physically higher than the extended line");
+
+    // Projects one real-world point into normalised [0,1] landmark coordinates for a given frame
+    // size, the way a real camera + MediaPipe would: the SAME physical scale (pixels per unit
+    // distance) on BOTH axes — exactly what a real lens does at a given distance from the subject
+    // — then normalised independently by the frame's own width and height. That last step, and
+    // only that last step, is what makes a non-square frame distort raw x/y differently — it's
+    // the entire bug toPixelSpace exists to undo, reproduced here on purpose so this test can
+    // catch a regression of it.
+    const ASPECT_PX_PER_UNIT = 400; // keeps every projected point comfortably inside [0,1] for both frame shapes below
+    function projectPhysical(p, frameWidth, frameHeight) {
+      return {
+        x: (frameWidth / 2 + p.x * ASPECT_PX_PER_UNIT) / frameWidth,
+        y: (frameHeight / 2 + p.y * ASPECT_PX_PER_UNIT) / frameHeight,
+        visibility: 1,
+      };
+    }
+    function buildAspectLandmarks(frameWidth, frameHeight) {
+      const lm = Array.from({ length: 25 }, () => ({ x: 0.5, y: 0.5, visibility: 0 }));
+      const put = (idx, p) => { lm[idx] = projectPhysical(p, frameWidth, frameHeight); };
+      put(L_SHOULDER, shoulder); put(R_SHOULDER, shoulder);
+      put(L_HIP, hip); put(R_HIP, hip);
+      put(L_ELBOW, bowElbow); put(R_ELBOW, drawElbow);
+      put(L_WRIST, bowWrist); put(R_WRIST, drawWrist);
+      put(MOUTH_L, mouth); put(MOUTH_R, mouth);
+      put(L_EAR, bowEar); put(R_EAR, drawEar);
+      return lm;
+    }
+
+    // A phone held upright (portrait: narrower than it is tall) and the same phone on its side
+    // (landscape) — the two shapes an iPhone's camera actually produces, at roughly the same
+    // pixel count either way. rightHanded is already true from earlier in selfTest.
+    const portrait = buildAspectLandmarks(720, 1280);
+    const landscape = buildAspectLandmarks(1280, 720);
+
+    const TOL = 1e-4; // far tighter than the 30-300%+ distortion this section exists to catch; comfortably loose for ordinary floating-point rounding
+
+    for (const [label, lm, w, h] of [["portrait", portrait, 720, 1280], ["landscape", landscape, 1280, 720]]) {
+      const bowArm = bowArmAngleOf(lm, w, h);
+      console.assert(
+        Math.abs(bowArm - 180) < TOL,
+        `${label}: a physically straight bow arm must still read as ~180° once corrected for aspect ratio, got ${bowArm}`
+      );
+
+      const scale = torsoLength(lm, R_SHOULDER, R_HIP, w, h);
+      const wristPx = toPixelSpace(lm[R_WRIST], w, h);
+      const bowWristPx = toPixelSpace(lm[L_WRIST], w, h);
+      const mouthPx = toPixelSpace(lm[MOUTH_L], w, h); // MOUTH_L === MOUTH_R here, either works
+      const handSepRatio = Math.hypot(wristPx.x - bowWristPx.x, wristPx.y - bowWristPx.y) / scale;
+      const anchorRatio = Math.hypot(wristPx.x - mouthPx.x, wristPx.y - mouthPx.y) / scale;
+      console.assert(
+        Math.abs(handSepRatio - trueHandSepRatio) < TOL,
+        `${label}: corrected hand-separation ratio should match the real-world ground truth (${trueHandSepRatio.toFixed(6)}), got ${handSepRatio.toFixed(6)}`
+      );
+      console.assert(
+        Math.abs(anchorRatio - trueAnchorRatio) < TOL,
+        `${label}: corrected anchor-distance ratio should match the real-world ground truth (${trueAnchorRatio.toFixed(6)}), got ${anchorRatio.toFixed(6)}`
+      );
+
+      const { bow: bowDrop, draw: drawDrop } = shoulderDropSampleOf(lm, w, h);
+      console.assert(
+        Math.abs(bowDrop - trueBowDropPct) < TOL,
+        `${label}: corrected bow-shoulder drop should match ground truth (${trueBowDropPct.toFixed(6)}%), got ${bowDrop}`
+      );
+      console.assert(
+        Math.abs(drawDrop - trueDrawDropPct) < TOL,
+        `${label}: corrected draw-shoulder drop should match ground truth (${trueDrawDropPct.toFixed(6)}%), got ${drawDrop}`
+      );
+
+      const elbow = drawElbowAlignmentOf(lm, w, h);
+      console.assert(
+        elbow !== null && Math.abs(elbow.deviation - trueElbowDeviation) < TOL,
+        `${label}: corrected elbow deviation should match ground truth (${trueElbowDeviation.toFixed(6)}°), got ${elbow && elbow.deviation}`
+      );
+      console.assert(
+        elbow !== null && elbow.direction === trueElbowDirection,
+        `${label}: corrected elbow direction should match ground truth (${trueElbowDirection}), got ${elbow && elbow.direction}`
+      );
+    }
+
+    // The actual property that broke in the field: the SAME real body, measured through a
+    // portrait frame and through a landscape frame, must read the SAME — not two different
+    // numbers depending on which way the phone happened to be held. (Each side already matched
+    // ground truth above; this restates the comparison directly between the two orientations so
+    // a future regression that broke both sides identically — e.g. a wrong-but-consistent
+    // conversion — still gets caught here even though it wouldn't be caught by comparing each
+    // side to ground truth alone... except ground truth is independent and correct, so in
+    // practice the loop above already proves this. Kept anyway as the single most direct
+    // statement of the property this whole fix is for.)
+    const portraitBowArm = bowArmAngleOf(portrait, 720, 1280);
+    const landscapeBowArm = bowArmAngleOf(landscape, 1280, 720);
+    console.assert(
+      Math.abs(portraitBowArm - landscapeBowArm) < TOL,
+      `bow-arm angle must be orientation-invariant: portrait ${portraitBowArm}, landscape ${landscapeBowArm}`
+    );
+
+    // Before/after, on this exact same body, in the portrait frame specifically (the shape that
+    // triggered the field bug): the UNCORRECTED formula — raw Math.hypot straight on normalised
+    // x/y, exactly what every measure in this file used to do — reproduced here only for this
+    // side-by-side comparison, since the corrected functions above no longer have a way to skip
+    // the conversion.
+    const buggyPortraitTorso = Math.hypot(
+      portrait[R_SHOULDER].x - portrait[R_HIP].x,
+      portrait[R_SHOULDER].y - portrait[R_HIP].y
+    );
+    const buggyPortraitHandSepRatio =
+      Math.hypot(portrait[R_WRIST].x - portrait[L_WRIST].x, portrait[R_WRIST].y - portrait[L_WRIST].y) / buggyPortraitTorso;
+    const correctedPortraitHandSepRatio =
+      Math.hypot(
+        toPixelSpace(portrait[R_WRIST], 720, 1280).x - toPixelSpace(portrait[L_WRIST], 720, 1280).x,
+        toPixelSpace(portrait[R_WRIST], 720, 1280).y - toPixelSpace(portrait[L_WRIST], 720, 1280).y
+      ) / torsoLength(portrait, R_SHOULDER, R_HIP, 720, 1280);
+    console.log(
+      `ASPECT-RATIO fix, same synthetic body, 720x1280 portrait frame: hand-separation ratio was ${buggyPortraitHandSepRatio.toFixed(3)} (uncorrected) -> ${correctedPortraitHandSepRatio.toFixed(3)} (corrected); real-world ground truth is ${trueHandSepRatio.toFixed(3)}.`
+    );
+    console.assert(
+      buggyPortraitHandSepRatio > correctedPortraitHandSepRatio * 1.3,
+      `the uncorrected ratio should be substantially inflated relative to the corrected one in a portrait frame — got uncorrected ${buggyPortraitHandSepRatio.toFixed(3)} vs corrected ${correctedPortraitHandSepRatio.toFixed(3)}`
+    );
+    console.assert(
+      Math.abs(correctedPortraitHandSepRatio - trueHandSepRatio) < TOL,
+      "corrected portrait hand-separation ratio should match ground truth"
     );
   }
 
