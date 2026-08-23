@@ -58,13 +58,16 @@ Everything below is live on `main` and deployed.
   scoring, and a fix for aspect-ratio distortion in all geometry
 - Startup watchdog that names the stuck step instead of hanging silently
 - Clip failures now explain themselves on the row
-- Routine-start attention gating (idles between arrows, fails toward recording)
+- Routine-start attention gating (idles between arrows, fails toward recording).
+  **Note: this was inert from the day it merged until 2026-08-23** — see the
+  merge-bug lesson below. Any earlier claim of battery savings was not measuring
+  what it thought it was.
 
 ---
 
 ## The plan
 
-### Stage 1 — Two bugs, ship first
+### Stage 1 — Two bugs, ship first — ✅ DONE 2026-08-23
 
 Independent of everything else. Small. The owner hits 1a every time he checks
 the log.
@@ -168,7 +171,7 @@ Stage 1 can run in parallel with anything. Stages 2–4 are best done in order;
 
 ## Also outstanding
 
-- **Remove the `?testhooks` block from `app.js`.** Test scaffolding shipped into
+- ~~**Remove the `?testhooks` block from `app.js`.**~~ ✅ Done 2026-08-23 — 29 lines, nothing depended on it. Test scaffolding shipped into
   the app by one engineer. Inert in normal use, but every other engineer
   verified from outside without it, and CLAUDE.md keeps this file minimal.
 - **Retune the detection thresholds.** `FULL_DRAW_HAND_SEP_MIN`,
@@ -206,12 +209,27 @@ Stage 1 can run in parallel with anything. Stages 2–4 are best done in order;
 ## Hard-won lessons — do not repeat these
 
 **The test environment does not resemble the device.** Everything here runs
-headless Chromium with a *landscape* fake camera and a stubbed MediaPipe module
-(the sandbox cannot reach `cdn.jsdelivr.net`). The owner shoots on a *portrait*
+headless Chromium on a desktop viewport. **Correction (2026-08-23): the claim
+that the sandbox cannot reach `cdn.jsdelivr.net` and stubs MediaPipe is wrong
+for the current environment** — three engineers independently loaded the real
+library (`Graph successfully started running`). What is actually unavailable is
+the *camera*: `getUserMedia` is denied outright, so anything past it must be
+driven with a stub or an injected stream. Check for yourself rather than
+inheriting either claim. The owner shoots on a *portrait*
 iPhone with the real library. Two serious bugs lived entirely in that gap: a
 startup hang on real Safari, and aspect-ratio distortion invisible to fixtures
 built in the same distorted space. **Test in portrait. State plainly which
 claims are proven and which are reasoned.**
+
+**A clean merge is not a correct merge.** The most expensive bug found so far
+was written by nobody: a merge combined two individually-correct branches into a
+call site passing three arguments to `torsoLength`, which the other branch had
+changed to need five. The result was `NaN`, which is falsy, so a guard clause
+swallowed it and the whole attention-gating feature silently switched itself off
+for weeks with no error anywhere. Git reported no conflict. **After any merge
+that touches `app.js`, re-run `?selftest` against the merged result and check
+the arity of every call to functions either branch changed.** Four separate
+worktrees were merged on 2026-08-23 and verified this way.
 
 **Verify which port your server actually bound.** Several servers run in this
 sandbox. One that fails to bind leaves you testing another directory's files —
