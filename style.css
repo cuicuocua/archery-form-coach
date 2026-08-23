@@ -297,6 +297,43 @@ body.debug-mode #readouts {
   display: none;
 }
 
+/* PROVISIONAL — HANDOVER.md Stage 4 calibration/framing status line (see app.js,
+   renderCalibrationStatus). Quiet only on the one state that's actually fine — agreement — with
+   the amber "worth flagging, not alarming" treatment reserved for the states that are genuinely
+   worth a look (a stored-vs-fresh disagreement, a legs-cut-off note, a framing-signature change).
+   Sits just under the readouts row; Stage 3's Setup screen is its real home. This element is a
+   sibling of #debug/#stage in normal (non-?debug) layout, not part of the ?debug panel below, so
+   it is untouched by the ?debug redesign — see app.js's own s-calibration row for how the SAME
+   underlying state additionally surfaces inside the ?debug panel now. */
+#calibration-status {
+  position: absolute;
+  top: calc(env(safe-area-inset-top, 12px) + 78px);
+  left: 8px;
+  right: 8px;
+  z-index: 5;
+  background: rgba(241, 196, 15, 0.16);
+  border: 1px solid rgba(241, 196, 15, 0.45);
+  color: var(--amber);
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+#calibration-status.hidden {
+  display: none;
+}
+
+/* "Calibration hasn't run yet this session" — plain information, not a warning (see
+   calibrationStatusText in app.js). Nothing is broken, so it must not look like it is: same dim,
+   unboxed treatment as .shotlog-modelinfo, not the amber box above. */
+#calibration-status.neutral {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.75);
+}
+
 .dbg-section {
   display: flex;
   flex-direction: column;
@@ -579,6 +616,16 @@ body.debug-mode #readouts {
    to look different from a full draw at a glance, since it's the only thing that does. Amber
    like a warn value, not a full alert — this isn't a problem, just a fact worth flagging. */
 #shotlog .shotlog-shortdraw {
+  color: var(--amber);
+  font-size: 13px;
+  opacity: 0.9;
+}
+
+/* Marks a shot whose hand-separation reading is physically impossible for the owner's own
+   calibrated body proportions (see handSepIsPlausible in app.js) — a data-quality flag about the
+   MEASUREMENT, never a judgement of his form. Same amber "worth flagging, not alarming" treatment
+   as shotlog-shortdraw above: "don't trust this number", not "something's wrong with your shot". */
+#shotlog .shotlog-implausible {
   color: var(--amber);
   font-size: 13px;
   opacity: 0.9;

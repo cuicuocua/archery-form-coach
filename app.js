@@ -249,6 +249,36 @@ const ATTENTION_REST_HAND_SEP_MAX = 0.2; // hand separation (torso-length fracti
 const ATTENTION_REST_MOVE_MAX_PER_SEC = 0.5; // how fast the body's reference point (hip midpoint, see bodyReferencePoint) may drift, in torso-lengths per second, and still count as "not walking/stepping". Ordinary standing sway is a small fraction of this; a real step or a walk toward/away from the line covers far more than a torso-length in a second. RAISE if ordinary standing sway is ever mistaken for movement (blocks idling, safe but wastes battery); LOWER if genuine walking is ever mistaken for standing still (also safe on its own — it only delays idling — but defeats the point of this feature if it happens often)
 // ===========================================================================
 
+// ===== CALIBRATION — owner's body-proportion reference (HANDOVER.md Stage 4). NOT a form target
+// like CALIBRATE WITH COACH above — nothing here judges his archery. This is a reference for what
+// HIS body's own proportions actually are, captured passively while he's standing calmly in frame
+// before he ever picks up the bow, so the app has something honest to check a measurement against.
+// It once reported his wrists 2.3 torso-lengths apart — physically impossible — and had no way to
+// know that was nonsense; this is what lets it know.
+//
+// Runs with NO button and no explicit trigger, per the owner's own decision — it should cost him
+// nothing to remember. It reuses the ATTENTION GATING calm detector above (attentionEngaged /
+// attentionIsClearlyCalm) as its "is he standing there, readable" signal rather than building a
+// second one: see sampleForCalibration further down for exactly which flags it reads.
+const CALIBRATION_MIN_SAMPLES = 15; // how many good (all-needed-landmarks-visible) frames one calm stretch needs before a calibration is trusted — see medianCalibrationOf. At a typical idle sampling rate this is a couple of seconds of ordinary standing-still, nothing he'd notice
+const MIN_SHOULDER_TO_TORSO = 0.2; // a shoulder-width reading below this fraction of torso length is treated as "the camera's basically side-on right now, this number is unreliable" rather than a genuine narrow-shouldered reading — see CLAUDE.md's own note that the shoulder line goes nearly degenerate in a side-on view. Below this floor, calibration produces NO reading for that frame rather than a garbage-small ratio nobody could ever match again
+const CALIBRATION_PLAUSIBILITY_SLACK = 1.15; // extra margin (15%) on top of the exact physical reach bound in handSepIsPlausible below, to absorb ordinary calibration/measurement noise without crying wolf — not a fudge on the physics, just room for the fact that neither calibration nor a shot's own reading is perfectly noise-free (though both are already medians over many frames, not single noisy ones)
+const CALIBRATION_AGREEMENT_TOLERANCE = 0.15; // relative difference (15%) between a stored ratio and a freshly re-measured one before it counts as a real disagreement worth telling him about, rather than ordinary measurement noise. A desk estimate, like SHOULDER_DROP_MIN_PCT above — not yet tuned against a real two-session comparison
+const CALIBRATION_STORAGE_KEY = "archery-calibration-v1"; // localStorage key — deliberately its own small, independent use of storage (see HANDOVER.md), not shared with whatever the shot-log persistence work elsewhere uses
+
+// FRAMING SIGNATURE — an OPTIONAL add-on to the calibration above, for a session-tracking feature
+// the owner is considering but hasn't committed to building. It answers a different question from
+// the body-proportion ratios above: not "is this reading physically possible for him", but "was
+// he set up the same way relative to the camera as last time" — stand a metre further back, or
+// tilt the phone, and every measurement shifts for reasons that have nothing to do with his form.
+// Nothing anywhere in this app depends on this existing: if it can't be computed (or there's no
+// stored one to compare against yet), calibration/detection/logging/clips carry on exactly as if
+// this feature didn't exist — see framingChangeMessage's own null-safety.
+const FRAMING_SIZE_TOLERANCE = 0.2; // relative — apparent size (torso length as a fraction of frame height) allowed to differ by this much, session to session, before it's worth a word. A desk estimate, like CALIBRATION_AGREEMENT_TOLERANCE above — loose enough that standing a step closer or further doesn't cry wolf
+const FRAMING_POSITION_TOLERANCE = 0.12; // absolute — fraction of the frame's own width/height the body's reference point (hip midpoint) may drift before "you're standing in a different part of the frame" is worth saying. Ordinary "didn't plant his feet in the exact same spot" variation is well under this
+const FRAMING_SQUARENESS_TOLERANCE = 0.15; // absolute, in torso-lengths — how much the shoulder/hip horizontal-separation proxy (see framingSignatureOf) may differ before "how square to the camera he is" counts as having actually changed, not just ordinary stance noise
+// ===========================================================================
+
 // ===== STARTUP — timeouts, not calibration; safe to change without a coach. The owner cannot
 // read a console or tap anything mid-session (see CLAUDE.md's "one interaction" rule), so an app
 // that silently sits on "Starting camera…" forever is the worst failure mode there is for him —
@@ -294,6 +324,7 @@ const L_WRIST = 15, R_WRIST = 16;
 const L_HIP = 23, R_HIP = 24;
 const NOSE = 0, MOUTH_L = 9, MOUTH_R = 10;
 const L_EAR = 7, R_EAR = 8;
+const L_ANKLE = 27, R_ANKLE = 28; // only used by the calibration framing check (bothAnklesVisible) — "are you fully in frame, or cut off at the legs"
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("overlay");
@@ -321,6 +352,12 @@ if (DEBUG) {
   document.body.classList.add("debug-mode"); // see the ?debug LAYOUT block in style.css — the only thing that turns the two-column grid on
   buildDebugPanel(); // built once, here, before any frame renders — see its own comment for why
 }
+// PROVISIONAL — Stage 4 calibration/framing status line (see HANDOVER.md and the CALIBRATION
+// block further down). Belongs on Stage 3's future Setup screen; lives here, minimally, until
+// that's built. Independent of the ?debug panel above (which gets its own calibration row — see
+// buildDebugPanel/syncDebugOverlay's s-calibration entries) — this element is the normal-UI line,
+// shown in every build, not just ?debug.
+const calibrationStatusEl = document.getElementById("calibration-status");
 const btnLog = document.getElementById("btn-log");
 const shotLogEl = document.getElementById("shotlog");
 // renderShotLog() writes into this inner scrolling element, never into shotLogEl itself — the
@@ -931,6 +968,27 @@ let attentionPrevRef = null; // bodyReferencePoint() from the last actual sample
 // other running total in this file.
 let attentionIdlePeriods = 0; // how many times this session the app allowed itself to idle between shots
 let attentionLateWakeCount = 0; // how many of those idle periods ended on a sample where hand separation was ALREADY past DRAW_ATTEMPT_MIN_SEP — meaning the real start of that movement happened sometime during the idle gap just slept through, not on the exact frame that noticed it. See its own comment at the increment site below for what this does and doesn't mean
+
+// ===== CALIBRATION — runtime state. Fed passively by sampleForCalibration (called from
+// renderLoop whenever landmarks come back), which reuses attentionEngaged above as its "is he
+// standing there, readable" signal rather than building a second detector — see that function's
+// own comment. One verdict per session, same "set once, then quiet" convention as
+// modelStatusLine/clipsUnavailableReason elsewhere in this file.
+let calibrationSamples = []; // proportions collected during the CURRENT unbroken calm stretch — cleared the instant he moves (attentionEngaged goes true), so a calibration is never built from samples spanning "calm, then walked around, then calm again"
+let calibrationCalmSinceMs = null; // wall-clock start of the current calm stretch — mirrors attentionCalmSinceMs's own bookkeeping, used only to give the framing check below a real held stretch to judge rather than one lucky frame
+let calibrationDone = false; // this session's one calibration verdict has already been reached — stop sampling/comparing for the rest of the session
+let calibrationStatusLine = null; // plain-English disagreement note — set ONLY when today's fresh reading disagrees with what's stored; stays null (nothing shown, nothing said) on agreement, per the owner's explicit "silent unless it disagrees" decision
+let framingStatusLine = null; // plain-English framing note ("legs may be outside the frame") — set only if the ankles stay missing across a real held calm stretch; stays null when he's fully in frame
+// The calibration this SESSION is actually using for the shot-log nonsense check below
+// (handSepIsPlausible). Starts from whatever was REMEMBERED (loadStoredCalibration) rather than
+// null — "remember it" (the owner's own words) means the app should keep working from last
+// session's numbers from the very first frame, not go dark for the whole session waiting on a
+// fresh re-check that (see the PM's review) may never actually complete if he never happens to
+// face the camera. Replaced with the fresh reading the moment one lands (see
+// finishPassiveCalibration) — "recheck it every time" — whether that reading agrees or not.
+let activeCalibration = loadStoredCalibration();
+let framingSamples = []; // FRAMING SIGNATURE (optional add-on, see the constants block above) — collected alongside calibrationSamples during the same calm stretch, cleared/reset the same way
+let framingChangeStatusLine = null; // plain-English note that THIS SESSION's framing looks different from the stored one — set only on a real difference; stays null (nothing shown) when it matches, or when there's nothing to compare against yet
 
 // Two wrists' separation, scaled by torso length — the same "how far apart are the hands" signal
 // isAtFullDraw uses internally (see FULL_DRAW_HAND_SEP_MIN/DRAW_ATTEMPT_MIN_SEP above), but kept
@@ -1553,6 +1611,306 @@ function updateDrawElbowReadout(landmarks, frameWidth, frameHeight) {
   setReadout(readoutElbow, valueElbow, text, ok ? "ok" : "warn");
 }
 
+// ===== CALIBRATION — measurement. Unlike every other measure in this file, this doesn't care
+// which arm is "bow" or "draw" — it's a fact about the archer's own body, not his stance — so it
+// just prefers whichever side's landmarks happen to be clearer, same "own side, other side as
+// fallback" convention used everywhere else (torsoLength, shoulderDropOf).
+
+// Arm length (shoulder to wrist, via the elbow) for one side, or null if any of the three joints
+// on that side isn't confidently visible. Sum of the two segments, not the straight shoulder-to-
+// wrist distance — he's just standing there during calibration, not holding a T-pose, and a
+// slightly bent elbow must not read as a shorter arm than he actually has.
+function armLengthOf(landmarks, shoulderIdx, elbowIdx, wristIdx, frameWidth, frameHeight) {
+  if (![shoulderIdx, elbowIdx, wristIdx].every((i) => visible(landmarks, i))) return null;
+  const s = toPixelSpace(landmarks[shoulderIdx], frameWidth, frameHeight);
+  const e = toPixelSpace(landmarks[elbowIdx], frameWidth, frameHeight);
+  const w = toPixelSpace(landmarks[wristIdx], frameWidth, frameHeight);
+  return Math.hypot(s.x - e.x, s.y - e.y) + Math.hypot(e.x - w.x, e.y - w.y);
+}
+
+// Both ankles visible — the calibration framing check ("fully in frame" vs. "cut off at the
+// legs"). BOTH, not either: side-on, one ankle can legitimately hide behind the other, but
+// calibration happens standing roughly toward the phone before he's walked to the line, so seeing
+// neither ankle is the honest sign his feet are outside the frame, not just self-occluded.
+function bothAnklesVisible(landmarks) {
+  return visible(landmarks, L_ANKLE) && visible(landmarks, R_ANKLE);
+}
+
+// One frame's calibration proportions, or null if this frame can't support a trustworthy reading
+// — a missing/low-confidence landmark, a torso estimate to divide by, or a near side-on shoulder
+// projection (see MIN_SHOULDER_TO_TORSO). Ratios only, never an absolute size — he stands at a
+// different distance from the phone every time; ratios are the only thing that survives that
+// (dividing by frameWidth/frameHeight via toPixelSpace, then again by torso length, cancels out
+// both his distance from the camera AND the frame's own resolution). Averages both sides' arm
+// length when both are visible, for a steadier number; either measure alone still counts.
+function bodyProportionsOf(landmarks, frameWidth, frameHeight) {
+  const torso =
+    torsoLength(landmarks, L_SHOULDER, L_HIP, frameWidth, frameHeight) ??
+    torsoLength(landmarks, R_SHOULDER, R_HIP, frameWidth, frameHeight);
+  if (!torso) return null;
+
+  const arms = [
+    armLengthOf(landmarks, L_SHOULDER, L_ELBOW, L_WRIST, frameWidth, frameHeight),
+    armLengthOf(landmarks, R_SHOULDER, R_ELBOW, R_WRIST, frameWidth, frameHeight),
+  ].filter((v) => v != null);
+  if (arms.length === 0) return null;
+  const armLength = arms.reduce((a, b) => a + b, 0) / arms.length;
+
+  if (!visible(landmarks, L_SHOULDER) || !visible(landmarks, R_SHOULDER)) return null;
+  const ls = toPixelSpace(landmarks[L_SHOULDER], frameWidth, frameHeight);
+  const rs = toPixelSpace(landmarks[R_SHOULDER], frameWidth, frameHeight);
+  const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+  // Near side-on, both shoulders project close together in x — see CLAUDE.md's own note on this
+  // — and the resulting tiny "width" is a projection artefact, not a real measurement. Below
+  // MIN_SHOULDER_TO_TORSO this frame contributes NO calibration at all, rather than a garbage
+  // ratio nobody could ever match again.
+  if (shoulderWidth / torso < MIN_SHOULDER_TO_TORSO) return null;
+
+  const earIdx = visible(landmarks, L_EAR) ? L_EAR : visible(landmarks, R_EAR) ? R_EAR : null;
+  if (earIdx === null || !visible(landmarks, NOSE)) return null;
+  const nose = toPixelSpace(landmarks[NOSE], frameWidth, frameHeight);
+  const ear = toPixelSpace(landmarks[earIdx], frameWidth, frameHeight);
+  const headSize = Math.hypot(nose.x - ear.x, nose.y - ear.y); // nose-to-ear: stays readable from a side-on view, unlike ear-to-ear (see the shoulder-width note above — the same degeneracy would apply)
+
+  return {
+    armToTorso: armLength / torso,
+    shoulderToTorso: shoulderWidth / torso,
+    headToTorso: headSize / torso,
+  };
+}
+
+// Turns a calm stretch's per-frame proportions into ONE calibration — each ratio medianed
+// independently, reusing the exact same median() function and reasoning a shot's own numbers
+// already use (see medianSampleOf above): a calibration built from a single lucky/unlucky frame
+// is exactly the kind of noise this whole feature exists to avoid trusting. Returns null if there
+// weren't enough good frames yet (see CALIBRATION_MIN_SAMPLES) — the caller (sampleForCalibration)
+// just keeps collecting rather than treating this as a final failure.
+function medianCalibrationOf(samples) {
+  if (samples.length < CALIBRATION_MIN_SAMPLES) return null;
+  return {
+    armToTorso: median(samples.map((s) => s.armToTorso)),
+    shoulderToTorso: median(samples.map((s) => s.shoulderToTorso)),
+    headToTorso: median(samples.map((s) => s.headToTorso)),
+  };
+}
+
+// ===== FRAMING SIGNATURE — measurement (optional add-on, see its own constants-block comment
+// above). Same pure, no-DOM discipline as bodyProportionsOf above, and shares its torso-length
+// scale reference, but answers a different question: not "what are his body's proportions" but
+// "how was he set up relative to the camera" — apparent size, roughly where in the frame he sits,
+// and how square-on he was. Returns null (no signature at all, never a guessed one) if the
+// landmarks it needs aren't confidently visible.
+function framingSignatureOf(landmarks, frameWidth, frameHeight) {
+  const torso =
+    torsoLength(landmarks, L_SHOULDER, L_HIP, frameWidth, frameHeight) ??
+    torsoLength(landmarks, R_SHOULDER, R_HIP, frameWidth, frameHeight);
+  if (!torso || !frameHeight) return null;
+
+  // Hip midpoint, already normalised [0,1] fractions of the frame — MediaPipe's own coordinate
+  // convention, no conversion needed — reused as-is from the ATTENTION GATING block above rather
+  // than inventing a second "roughly where he's standing" reference point.
+  const ref = bodyReferencePoint(landmarks);
+  if (!ref) return null;
+  if (!visible(landmarks, L_SHOULDER) || !visible(landmarks, R_SHOULDER)) return null;
+
+  const ls = toPixelSpace(landmarks[L_SHOULDER], frameWidth, frameHeight);
+  const rs = toPixelSpace(landmarks[R_SHOULDER], frameWidth, frameHeight);
+  const lh = toPixelSpace(landmarks[L_HIP], frameWidth, frameHeight);
+  const rh = toPixelSpace(landmarks[R_HIP], frameWidth, frameHeight);
+
+  return {
+    // How big he is in frame — DELIBERATELY not a torso-length ratio like the body-proportion
+    // measures above; this one is SUPPOSED to change with how far he stands from the camera, not
+    // cancel it out. That's the "am I standing where I stood last time" signal.
+    apparentSize: torso / frameHeight,
+    // Roughly where in the frame he's standing — a moved or re-aimed phone shows up here.
+    frameX: ref.x,
+    frameY: ref.y,
+    // How square-on to the camera he is: viewed properly side-on, the two shoulders (and the two
+    // hips) project almost on top of each other, so their HORIZONTAL-ONLY separation (not the
+    // full 2D distance shoulderToTorso above uses) is small; turning toward the camera grows it.
+    // Normalised by torso length so it doesn't also mean "how big he is in frame" — the variable
+    // most likely to corrupt the elbow/shoulder-drop geometry if it changes between sessions.
+    shoulderSquareness: Math.abs(ls.x - rs.x) / torso,
+    hipSquareness: Math.abs(lh.x - rh.x) / torso,
+  };
+}
+
+// Same median-of-a-calm-stretch treatment as medianCalibrationOf above, same reasoning, same
+// minimum sample bar — kept as its own function (not folded into medianCalibrationOf) because this
+// is optional and independent: a session where this never reaches enough good frames must not stop
+// the real calibration above from completing.
+function medianFramingOf(samples) {
+  if (samples.length < CALIBRATION_MIN_SAMPLES) return null;
+  return {
+    apparentSize: median(samples.map((s) => s.apparentSize)),
+    frameX: median(samples.map((s) => s.frameX)),
+    frameY: median(samples.map((s) => s.frameY)),
+    shoulderSquareness: median(samples.map((s) => s.shoulderSquareness)),
+    hipSquareness: median(samples.map((s) => s.hipSquareness)),
+  };
+}
+
+// Plain-English DESCRIPTION of what changed, never a DIAGNOSIS of why — "you look smaller in frame
+// than last time" is something this measurement actually supports; "the camera is lower" isn't (a
+// vertical-position change could be camera height, camera tilt, or where he stood, and this can't
+// tell those apart). A confident wrong explanation is worse than a vague right one. Returns null
+// (say nothing) the moment nothing crosses its tolerance — same "never cry wolf" standard as
+// describeFraming/calibrationVerdict above.
+function describeFramingChange(stored, fresh) {
+  const notes = [];
+  if (Math.abs(fresh.apparentSize - stored.apparentSize) / stored.apparentSize > FRAMING_SIZE_TOLERANCE) {
+    notes.push(fresh.apparentSize > stored.apparentSize ? "you look bigger in frame than last time" : "you look smaller in frame than last time");
+  }
+  if (Math.hypot(fresh.frameX - stored.frameX, fresh.frameY - stored.frameY) > FRAMING_POSITION_TOLERANCE) {
+    notes.push("you're standing in a different part of the frame than last time");
+  }
+  const squarenessDelta = Math.max(
+    Math.abs(fresh.shoulderSquareness - stored.shoulderSquareness),
+    Math.abs(fresh.hipSquareness - stored.hipSquareness)
+  );
+  if (squarenessDelta > FRAMING_SQUARENESS_TOLERANCE) {
+    notes.push("you're angled differently toward the camera than last time");
+  }
+  if (notes.length === 0) return null;
+  return `Framing looks different from your last calibration: ${notes.join("; ")} — form numbers may not compare well session to session until this matches.`;
+}
+
+// The null-safe entry point finishPassiveCalibration actually calls — every "optional, nothing
+// depends on it" guarantee lives here in one place: no stored signature yet, or this session's own
+// reading never got enough good frames, and this says nothing at all, silently, forever (until a
+// calibration exists on both ends to compare).
+function framingChangeMessage(storedFraming, freshFraming) {
+  if (!storedFraming || !freshFraming) return null;
+  return describeFramingChange(storedFraming, freshFraming);
+}
+// ===========================================================================
+
+// Use #1 (HANDOVER.md's own order of value): can a reading like this ever actually happen for
+// THIS archer's body? PROVEN, not just plausible — for any two wrist positions, each at most
+// armToTorso torso-lengths from its OWN shoulder, and the two shoulders at most shoulderToTorso
+// torso-lengths apart, the triangle inequality puts a hard ceiling on how far apart the wrists can
+// ever be: armToTorso + shoulderToTorso + armToTorso — reached only in the limiting (never actually
+// drawn) case of both arms pointing straight away from each other in a dead line through both
+// shoulders. CALIBRATION_PLAUSIBILITY_SLACK adds a little room on top for calibration/measurement
+// noise — both of which are already medians over many frames, not single noisy ones — not because
+// the physics has any give in it. Returns null (no verdict, never a false "fine") when there's
+// nothing to check against — no calibration yet, or this shot's own hand-sep reading was itself
+// uncertain.
+function maxPlausibleHandSep(calibration) {
+  return CALIBRATION_PLAUSIBILITY_SLACK * (2 * calibration.armToTorso + calibration.shoulderToTorso);
+}
+
+function handSepIsPlausible(handSep, calibration) {
+  if (handSep == null || calibration == null) return null;
+  return handSep <= maxPlausibleHandSep(calibration);
+}
+
+// Use #2: is the calibration on file still describing the archer standing there right now?
+// Per-ratio relative comparison — deliberately NOT resolved automatically either way (see
+// HANDOVER.md and the owner's own words: "remember it but recheck it everytime against remembered
+// data"). Pure: two calibration objects in, which (if any) ratios disagree beyond
+// CALIBRATION_AGREEMENT_TOLERANCE out — calibrationVerdict below decides what to actually do
+// about it.
+function compareCalibrations(stored, fresh, tolerance = CALIBRATION_AGREEMENT_TOLERANCE) {
+  const names = ["armToTorso", "shoulderToTorso", "headToTorso"];
+  const mismatches = names.filter((name) => Math.abs(stored[name] - fresh[name]) / stored[name] > tolerance);
+  return { agrees: mismatches.length === 0, mismatches };
+}
+
+const CALIBRATION_LABELS = { armToTorso: "arm length", shoulderToTorso: "shoulder width", headToTorso: "head size" };
+
+// Plain-English disagreement note — what the owner actually reads, live on screen and later in the
+// shot log. Pure: a comparison + the two calibration objects in, one sentence out, same "no DOM, no
+// module state" convention as narrateMeasure/buildShareText above, so selfTest can check the
+// wording directly. Only ever called when comparison.agrees is false (see calibrationVerdict) —
+// agreement says NOTHING, per the owner's explicit "silent unless it disagrees" decision.
+function describeCalibrationResult(comparison, stored, fresh) {
+  const names = comparison.mismatches.map((n) => CALIBRATION_LABELS[n]).join(", ");
+  return `Today's ${names} measurement${comparison.mismatches.length === 1 ? "" : "s"} don't match your saved calibration — using today's numbers for this session, but not overwriting what's saved. Recalibrate on purpose (or check you're standing the way you usually do) if this keeps happening.`;
+}
+
+// The actual decision, pulled out as its own pure function so "does this stay silent" is directly
+// testable without touching localStorage or any module state (see finishPassiveCalibration, the
+// only caller). No stored calibration yet: nothing to disagree with, save it, say nothing. Agrees:
+// save the refreshed reading, say nothing — the whole point of running unprompted is that
+// there is nothing new for him to remember. Disagrees: do NOT overwrite what's on file, and say so.
+function calibrationVerdict(stored, fresh) {
+  if (!stored) return { save: true, message: null };
+  const comparison = compareCalibrations(stored, fresh);
+  if (comparison.agrees) return { save: true, message: null };
+  return { save: false, message: describeCalibrationResult(comparison, stored, fresh) };
+}
+
+// Told to the owner directly, live and in the shot log, when calibration hasn't managed to
+// confirm anything this session — see calibrationStatusText below for why this exists as its own
+// state rather than staying silent like agreement does.
+const CALIBRATION_NOT_YET_MESSAGE =
+  "Calibration hasn't run yet this session — stand where you shoot and face the camera for a couple of seconds when you get the chance.";
+
+// THREE states, not two — the gap this fixes (PM review, 2026-08-23): agreement and "never
+// managed to measure you" both used to render as the same thing, silence, and those are not the
+// same situation. He shoots side-on, and a side-on shoulder line is genuinely too degenerate to
+// calibrate from (see MIN_SHOULDER_TO_TORSO/bodyProportionsOf — that floor is protecting against
+// real garbage, not being weakened to force a reading through) — so if his routine never happens
+// to include a moment facing the camera, `calibrationDone` can stay false all session, and before
+// this fix that looked identical, forever, to everything being fine. `calibrationDone` false is
+// the ONLY thing distinguishing this from the other two states, deliberately: it's a fact about
+// THIS SESSION, not about whether a calibration exists at all (see calibrationShareLine below for
+// that half of the picture, which this function doesn't need). Neutral tone on purpose — nothing
+// is broken, there's just something worth doing when he gets the chance; renderCalibrationStatus
+// is what keeps this from LOOKING like the amber "worth flagging" warnings elsewhere in this file.
+function calibrationStatusText(calibrationDone, disagreementMessage) {
+  if (!calibrationDone) return { text: CALIBRATION_NOT_YET_MESSAGE, tone: "neutral" };
+  if (disagreementMessage) return { text: disagreementMessage, tone: "warn" };
+  return null; // agrees — silent, per the owner's own "silent unless it disagrees" decision
+}
+
+// What the PM actually needs from a shared session (see the same review): not just today's
+// verdict, but whether a calibration exists AT ALL and when it was last confirmed — without that,
+// "no calibration line in the share text" is indistinguishable from "calibration has never once
+// run", exactly the ambiguity calibrationStatusText above exists to remove for the owner. Pure:
+// the stored record (or null) + today's outcome in, one line out — no Date-object comparisons in
+// selfTest, since `stored.takenAt` is a plain epoch-ms number formatted here, not compared.
+function calibrationShareLine(stored, calibrationDone, disagreementMessage) {
+  const lastLine = stored?.takenAt ? `last confirmed ${new Date(stored.takenAt).toLocaleString()}` : "never calibrated";
+  const todayLine = !calibrationDone ? "not yet confirmed this session" : disagreementMessage ? "disagreed with what was stored" : "agreed with what was stored";
+  return `Calibration: ${lastLine} — today: ${todayLine}`;
+}
+
+// Use #3: a plain framing note, only when there's actually something to say — same "never cry
+// wolf" standard as everything else here. legsVisible: whether bothAnklesVisible held true across
+// the whole calm stretch checked so far (see sampleForCalibration) — nothing to say when it did.
+function describeFraming(legsVisible) {
+  return legsVisible
+    ? null
+    : "Your legs may be outside the frame — stand back so your whole body, head to feet, fits before you shoot.";
+}
+
+// ===== CALIBRATION — storage. Deliberately separate from any other persistence in this file (see
+// HANDOVER.md) — its own small, independent use of localStorage under its own key, not a shared
+// abstraction with whatever the shot-log persistence work elsewhere ends up using. try/catch
+// because localStorage can throw (private browsing, storage disabled) and calibration failing to
+// persist must never take the rest of the app down with it.
+function loadStoredCalibration() {
+  try {
+    const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCalibration(calibration) {
+  try {
+    localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(calibration));
+  } catch {
+    // storage unavailable — calibration just won't survive a reload this session; nothing else
+    // depends on it, so this fails silently rather than raising an alarm about it
+  }
+}
+// ===========================================================================
+
 // The full-draw signal. Four things all have to be true at once:
 //  - the draw-hand wrist has arrived near the face (mouth corners, falling back to the nose)
 //  - the bow arm is substantially extended
@@ -1951,7 +2309,14 @@ function endAttempt(nowMs) {
   // Each of the four real measures (plus the diagnostic handSep/flags) is the MEDIAN of its own
   // eligible frames, computed independently — see medianSampleOf's own comment for the full
   // reasoning and what this replaced.
-  const shotNum = logShot({ ...medianSampleOf(a.eligibleFrames), startMs: a.startMs, reachedFullDraw: a.reachedFullDraw });
+  const medianSample = medianSampleOf(a.eligibleFrames);
+  // CALIBRATION nonsense-check (HANDOVER.md's most valuable use of the three): is this hand-sep
+  // reading even physically possible for this archer, as calibrated? `=== false` specifically,
+  // not just falsy — handSepIsPlausible returns null (no verdict) whenever there's no calibration
+  // yet or the reading itself was uncertain, and null must never render as a flag (see
+  // handSepIsPlausible's own comment and the "never cry wolf" rule in HANDOVER.md).
+  const implausible = handSepIsPlausible(medianSample.handSep, activeCalibration) === false;
+  const shotNum = logShot({ ...medianSample, startMs: a.startMs, reachedFullDraw: a.reachedFullDraw, implausible });
   if (DEBUG) debugEvents.shotLogged = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
@@ -2754,6 +3119,13 @@ function renderShotRow(e, stats, outliers, words) {
   // only thing separating "he drew short of full draw" from "he drew all the way".
   const shortMark = e.reachedFullDraw === false ? ` <span class="shotlog-shortdraw">· short of full draw</span>` : "";
 
+  // CALIBRATION nonsense-check (see handSepIsPlausible/endAttempt) — a data-quality flag about
+  // the MEASUREMENT, never a judgement of his form. Only ever set true; never set for a shot
+  // logged before any calibration existed this session (see endAttempt's own `=== false` check).
+  const implausibleMark = e.implausible
+    ? ` <span class="shotlog-implausible">⚠ hands measured farther apart than your calibrated reach allows — check calibration or framing</span>`
+    : "";
+
   // A big, obvious watch button when this shot has a clip; otherwise a "no clip" note — never
   // nothing, so a missing clip never reads as a missing shot. When something specific is known
   // about WHY (see explainClipFailure — a recorder error, an empty recording, one that arrived
@@ -2769,7 +3141,7 @@ function renderShotRow(e, stats, outliers, words) {
     ? `<button type="button" class="shotlog-play" data-shot="${e.shotNum}">▶ Watch</button>`
     : `<span class="shotlog-noclip">${e.clipLostOnRestore ? "clip lost — the app restarted" : e.clipFailReason || "no clip"}</span>`;
 
-  return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum} — ${highlightText}${shortMark}${rawHtml}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
+  return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum} — ${highlightText}${shortMark}${implausibleMark}${rawHtml}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
 }
 
 // Plain-language shot log — this is what the owner actually reads, standing at the phone after
@@ -2800,6 +3172,15 @@ function renderShotLog() {
   // measurePoseModelPerf/setModelStatusLine), and shown on every render after that. Sits right
   // under the clip banner, same reasoning: the owner can't be watching when this gets decided.
   const modelBit = modelStatusLine ? `<div class="shotlog-modelinfo">${modelStatusLine}</div>` : "";
+  // CALIBRATION (HANDOVER.md Stage 4) — same "recorded and still there later" rule as everything
+  // else here: renderCalibrationStatus already shows this live, but the owner (or, more likely
+  // here, the PM reading a shared log) may only ever check this, so whatever it had to say — a
+  // stored-vs-fresh disagreement, calibration never having confirmed itself this session, a
+  // legs-cut-off framing note, or a framing-signature change — needs to still be readable after
+  // the fact too. Only ever silent on the one state that's actually fine: agreement.
+  const calibrationLine = calibrationStatusText(calibrationDone, calibrationStatusLine);
+  const calibrationParts = [calibrationLine?.text, framingStatusLine, framingChangeStatusLine].filter(Boolean);
+  const calibrationBit = calibrationParts.length ? `<div class="shotlog-modelinfo">${calibrationParts.join(" ")}</div>` : "";
   // How many draw attempts got thrown out as noise this session (see endAttempt) — shown
   // whenever there's at least one, right alongside the two lines above, for the same reason:
   // this is diagnostic information the owner can only ever read after the fact. A big number
@@ -2833,7 +3214,7 @@ function renderShotLog() {
       : "";
 
   if (log.length === 0) {
-    shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${calibrationBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -2887,7 +3268,7 @@ function renderShotLog() {
   const stats = summarizeShots(fullDrawLog);
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${calibrationBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // ===== SHARE — the owner's only route to a full session's numbers. He can't remember to add
@@ -2918,6 +3299,12 @@ function buildShareText(entries, counters) {
     cameraWidth,
     cameraHeight,
     sessionWasRestored,
+    // Defaulted (not required) so every existing caller/fixture that doesn't know about
+    // calibration yet keeps working unchanged — see calibrationShareLine's own comment for why
+    // the PM needs this line at all.
+    storedCalibration = null,
+    calibrationDone = false,
+    calibrationStatusLine: calibrationDisagreement = null,
   } = counters;
 
   const lines = [];
@@ -2934,6 +3321,11 @@ function buildShareText(entries, counters) {
   // fixes in this app have already been sensitive to exactly these settings (see CLAUDE.md).
   lines.push(`Camera ${cameraWidth ?? "?"}x${cameraHeight ?? "?"} · ${rightHanded ? "right-handed" : "left-handed"} · mirror ${mirrored ? "on" : "off"}`);
   if (modelStatusLine) lines.push(modelStatusLine);
+  // Whether calibration exists at all, when it was last confirmed, and what today's check found —
+  // see calibrationShareLine's own comment. Always present (never gated on a truthy check like
+  // the other optional lines above/below) for exactly the reason the PM's review raised: its
+  // absence must never be mistaken for "calibration is fine."
+  lines.push(calibrationShareLine(storedCalibration, calibrationDone, calibrationDisagreement));
 
   lines.push("");
   // "Arrows" means confirmed full draw, same distinction as the on-screen count line — see
@@ -3357,6 +3749,7 @@ function buildDebugPanel() {
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">Movements ignored</span><span class="dbg-val" data-x="s-ignored">0</span></div>
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">Unsettled attempts</span><span class="dbg-val" data-x="s-unsettled">0</span></div>
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">Attention idle periods</span><span class="dbg-val" data-x="s-idle">0</span></div>
+      <div class="dbg-row dbg-row-2col"><span class="dbg-name">Calibration</span><span class="dbg-val" data-x="s-calibration">—</span></div>
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">Pose</span><span class="dbg-val" data-x="s-pose">—</span></div>
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">Torso scale</span><span class="dbg-val" data-x="s-scale">—</span></div>
       <div class="dbg-row dbg-row-2col"><span class="dbg-name">ROI cropping</span><span class="dbg-val" data-x="s-roi">—</span></div>
@@ -3488,12 +3881,128 @@ function syncDebugOverlay(nowMs, landmarks, frameWidth, frameHeight) {
   r["s-ignored"].textContent = String(rejectedAttemptCount);
   r["s-unsettled"].textContent = String(unsettledAttemptCount);
   r["s-idle"].textContent = String(attentionIdlePeriods);
+  // CALIBRATION (HANDOVER.md Stage 4) — the debug panel's own view of the same state
+  // renderCalibrationStatus/renderShotLog already surface elsewhere (see #calibration-status and
+  // the shot log's calibrationBit), reusing calibrationStatusText rather than re-deriving the
+  // wording a second time. Unlike those two, this panel is a diagnostic instrument that never
+  // goes quiet on purpose (see buildDebugPanel's own comment) — so the one state they render as
+  // silence (calibrationDone && no disagreement) gets an explicit "agrees with stored calibration"
+  // line here instead, matching the never-blank convention the rest of this panel already follows.
+  const calibText = calibrationStatusText(calibrationDone, calibrationStatusLine);
+  const calibParts = [calibText?.text, framingStatusLine, framingChangeStatusLine].filter(Boolean);
+  r["s-calibration"].textContent = calibParts.length ? calibParts.join(" ") : "agrees with stored calibration";
+  r["s-calibration"].className = `dbg-val ${
+    calibText?.tone === "warn" || framingStatusLine || framingChangeStatusLine ? "warn" : calibText?.tone === "neutral" ? "uncertain" : "ok"
+  }`;
   r["s-pose"].textContent = lastPoseSeen ? "seen" : "not seen";
   r["s-roi"].textContent = !ROI_CROPPING_ENABLED ? "disabled" : currentCropBox ? "active" : "no box yet";
   r["s-model"].textContent = modelStatusLine ?? "measuring…";
   r["s-inference"].textContent = lastInferenceMs == null ? "—" : `${lastInferenceMs.toFixed(1)}ms`;
   r["s-fps"].textContent = debugInstantFps == null ? "—" : debugInstantFps.toFixed(1);
 }
+
+// ===== CALIBRATION — passive capture, wired into renderLoop below. No button, no explicit
+// trigger — the owner's own decision (see HANDOVER.md Stage 4). "Is he standing there, readable"
+// reuses signals the pipeline already computes, rather than a new detector:
+//   - attentionEngaged === false — the ATTENTION GATING calm detector (attentionIsClearlyCalm)
+//     has already decided hands are relaxed AND the body isn't moving, continuously, for at least
+//     ATTENTION_IDLE_AFTER_MS. That IS "a stable pose" in this app's own existing terms.
+//   - MIN_VISIBILITY, via bodyProportionsOf/visible() — every ratio below is null unless the
+//     landmarks it needs are confidently visible.
+//   - bothAnklesVisible — "body fully in frame", for the framing note specifically.
+// Called every frame landmarks come back (renderLoop), so while idle this runs at the throttled
+// idle-sample rate — plenty to gather CALIBRATION_MIN_SAMPLES good frames in a couple of seconds
+// of ordinary standing-still. While an attempt is open, updateAttentionState's own hard rule forces
+// attentionEngaged true, so this always resets rather than sampling — a real shot's landmarks can
+// never contaminate a calibration.
+function sampleForCalibration(landmarks, frameWidth, frameHeight, nowMs) {
+  if (calibrationDone) return; // this session's one verdict is already in
+
+  if (attentionEngaged) {
+    // Moving, or not yet held calm long enough (see ATTENTION GATING above) — whatever was being
+    // built up during a PREVIOUS calm stretch doesn't carry over into this one; a calibration
+    // built from samples either side of him walking around isn't a reading of one steady pose.
+    calibrationSamples = [];
+    framingSamples = [];
+    calibrationCalmSinceMs = null;
+    return;
+  }
+  if (calibrationCalmSinceMs === null) calibrationCalmSinceMs = nowMs;
+
+  const sample = bodyProportionsOf(landmarks, frameWidth, frameHeight);
+  if (sample) calibrationSamples.push(sample);
+
+  // FRAMING SIGNATURE (optional add-on) — collected alongside, from the same frames, but never
+  // gates anything: if this never fills up, calibration above still completes on its own schedule.
+  const framingSample = framingSignatureOf(landmarks, frameWidth, frameHeight);
+  if (framingSample) framingSamples.push(framingSample);
+
+  // Framing note: only after a real held stretch of calm (not one blip — see
+  // attentionIsClearlyCalm's own "positive proof" standard, which this borrows) and only once,
+  // ever, per session. Independent of whether calibration itself succeeds — the ratios above
+  // never need the ankles at all, so a cut-off framing problem still gets its own word even on a
+  // session where calibration completes fine.
+  if (
+    !framingStatusLine &&
+    nowMs - calibrationCalmSinceMs >= ATTENTION_IDLE_AFTER_MS &&
+    !bothAnklesVisible(landmarks)
+  ) {
+    framingStatusLine = describeFraming(false);
+    renderCalibrationStatus();
+  }
+
+  if (calibrationSamples.length >= CALIBRATION_MIN_SAMPLES) finishPassiveCalibration();
+}
+
+function finishPassiveCalibration() {
+  const fresh = medianCalibrationOf(calibrationSamples);
+  const freshFraming = medianFramingOf(framingSamples); // optional — may be null; see medianFramingOf's own comment
+  calibrationSamples = [];
+  framingSamples = [];
+  if (!fresh) return; // not enough GOOD frames even after CALIBRATION_MIN_SAMPLES pushes (e.g. persistently near side-on) — keep trying on the next calm stretch, calibrationDone stays false
+
+  calibrationDone = true;
+  activeCalibration = fresh; // this session's nonsense-check always uses today's fresh reading — see handSepIsPlausible and the owner's own "recheck it every time" decision
+  const stored = loadStoredCalibration();
+  const verdict = calibrationVerdict(stored, fresh);
+  // One record, one write — the framing signature (optional) rides along with the same
+  // proportions it was measured alongside, never a second storage mechanism (see HANDOVER.md).
+  // takenAt records when the CURRENTLY-TRUSTED calibration was last confirmed — read back by
+  // calibrationShareLine so the PM can tell from shared text whether calibration ever ran at all,
+  // not just guess from its absence (see the PM's own review of this gap).
+  if (verdict.save) saveCalibration({ ...fresh, framing: freshFraming, takenAt: Date.now() });
+  if (verdict.message) calibrationStatusLine = verdict.message; // disagreement only — see calibrationVerdict; agreement (or first-ever calibration) says nothing, on purpose
+
+  // FRAMING SIGNATURE comparison — entirely independent of the verdict above (see
+  // framingChangeMessage's own null-safety): compares against whatever was stored BEFORE this
+  // write, regardless of whether the proportions above agreed or not.
+  const framingMessage = framingChangeMessage(stored?.framing ?? null, freshFraming);
+  if (framingMessage) framingChangeStatusLine = framingMessage;
+
+  renderCalibrationStatus();
+}
+
+// Thin DOM wrapper — PROVISIONAL presentation (see HANDOVER.md Stage 3/4): a plain status line
+// that sets itself, same shape as modelStatusLine/clipsUnavailableReason, shown live (so the
+// framing note is actionable before he walks off) and folded into the shot log below (so it's
+// still there afterwards too — see CLAUDE.md's "recorded and still there later" rule). Stage 3's
+// Setup screen is its real home; move it there rather than duplicating it when that lands.
+function renderCalibrationStatus() {
+  const calibrationState = calibrationStatusText(calibrationDone, calibrationStatusLine);
+  const parts = [calibrationState?.text, framingStatusLine, framingChangeStatusLine].filter(Boolean);
+  if (parts.length === 0) {
+    calibrationStatusEl.classList.add("hidden");
+    return;
+  }
+  calibrationStatusEl.textContent = parts.join(" ");
+  // Neutral ("hasn't run yet") is information, not a warning (see calibrationStatusText's own
+  // comment) — it must never look like something is broken, because nothing is. Only apply the
+  // quiet styling when nothing ELSE on the line is an actual warning (the legs-cut-off or
+  // framing-changed notes, which are).
+  calibrationStatusEl.classList.toggle("neutral", calibrationState?.tone === "neutral" && !framingStatusLine && !framingChangeStatusLine);
+  calibrationStatusEl.classList.remove("hidden");
+}
+// ===========================================================================
 
 function renderLoop() {
   requestAnimationFrame(renderLoop);
@@ -3623,6 +4132,7 @@ function renderLoop() {
     updateBowArmReadout(landmarks, frameWidth, frameHeight);
     updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
     updateDrawElbowReadout(landmarks, frameWidth, frameHeight);
+    sampleForCalibration(landmarks, frameWidth, frameHeight, now);
     // Return value intentionally unused here — isAtFullDraw's real job on every frame is its
     // side effect, calling trackShotAttempt (below) to feed the shot log. It used to also drive
     // the auto-freeze state machine, which read the true/false result; that machine is gone, but
@@ -3734,6 +4244,9 @@ shotLogShareBtn.addEventListener("click", () => {
     cameraWidth: video.videoWidth || null,
     cameraHeight: video.videoHeight || null,
     sessionWasRestored,
+    storedCalibration: loadStoredCalibration(), // read fresh, not activeCalibration — reflects what's actually on file right now, whether or not this session's own check has landed
+    calibrationDone,
+    calibrationStatusLine,
   });
   shareSessionText(text);
 });
@@ -3915,6 +4428,10 @@ function armStartupWatchdog() {
 }
 
 async function main() {
+  // Shown from the very first moment, not just once a frame has run through sampleForCalibration —
+  // "not yet confirmed" is the honest state from startup, and silence before then would be exactly
+  // the ambiguity the PM's review flagged (see calibrationStatusText's own comment).
+  renderCalibrationStatus();
   setStartupStep("loading the pose model");
   const disarmWatchdog = armStartupWatchdog();
   try {
@@ -5147,6 +5664,12 @@ function selfTest() {
     const emptyShareText = buildShareText([], { ...shareCounters, shotCount: 0, fullDrawShotCount: 0, rejectedAttemptCount: 0 });
     console.assert(emptyShareText.includes("Arrows this session: 0"), "an empty session must still state the (zero) arrow count");
     console.assert(emptyShareText.includes("(none)"), "an empty session's draws section must say plainly that there are none, not render blank");
+
+    // shareCounters above (an existing fixture, predating calibration) omits every calibration
+    // field on purpose — buildShareText must still include a calibration line via its own
+    // defaults, never throw, and never claim more than "never calibrated" for a caller that never
+    // supplied anything.
+    console.assert(shareText.includes("Calibration:") && shareText.includes("never calibrated"), "buildShareText must include a calibration line even when the caller supplies no calibration fields at all, defaulting honestly to 'never calibrated'");
   }
 
   // --- Shot clips: MIME selection order, attaching a blob to the right shot number, discarding
@@ -6069,6 +6592,240 @@ function selfTest() {
     attentionEngaged = false;
     callAttention(t4 + 100, calmLm, false);
     console.assert(attentionEngaged === true, "gatingEnabled=false must force engaged, even starting from idle");
+  }
+
+  // --- CALIBRATION (HANDOVER.md Stage 4): body-proportion measurement, the physical-plausibility
+  // check it enables, the stored-vs-fresh comparison, and the optional framing-signature add-on.
+  // All pure functions — no module state touched, so nothing here needs saving/restoring.
+  {
+    const near = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
+
+    // A simple standing body, arms hanging at the sides, facing roughly toward the camera (NOT
+    // side-on — calibration happens before he's turned to shoot). Round numbers on purpose:
+    // torso 0.3, each arm's two segments 0.15+0.15=0.3 (armToTorso 1.0), shoulder width 0.3
+    // (shoulderToTorso 1.0), nose-to-ear 0.06 (headToTorso 0.2).
+    const standingBody = mkLandmarks({
+      0: { x: 0.5, y: 0.1 }, // nose
+      7: { x: 0.44, y: 0.1 }, // left ear
+      11: { x: 0.35, y: 0.3 }, // left shoulder
+      12: { x: 0.65, y: 0.3 }, // right shoulder
+      13: { x: 0.35, y: 0.45 }, // left elbow
+      14: { x: 0.65, y: 0.45 }, // right elbow
+      15: { x: 0.35, y: 0.6 }, // left wrist
+      16: { x: 0.65, y: 0.6 }, // right wrist
+      23: { x: 0.35, y: 0.6 }, // left hip
+      24: { x: 0.65, y: 0.6 }, // right hip
+      27: { x: 0.35, y: 0.9 }, // left ankle
+      28: { x: 0.65, y: 0.9 }, // right ankle
+    });
+
+    const proportions = bodyProportionsOf(standingBody, NOOP_W, NOOP_H);
+    console.assert(proportions !== null, "a fully-visible standing body should produce a calibration reading");
+    console.assert(near(proportions.armToTorso, 1.0), `armToTorso should read 1.0 for this fixture, got ${proportions?.armToTorso}`);
+    console.assert(near(proportions.shoulderToTorso, 1.0), `shoulderToTorso should read 1.0 for this fixture, got ${proportions?.shoulderToTorso}`);
+    console.assert(near(proportions.headToTorso, 0.2), `headToTorso should read 0.2 for this fixture, got ${proportions?.headToTorso}`);
+
+    // --- Scale invariance: THE property this whole feature rests on (see bodyProportionsOf's own
+    // comment). Same body, standing twice as far from the camera — every landmark scaled by 0.5
+    // toward the frame centre, exactly like walking backward — must produce the SAME ratios, not
+    // smaller ones.
+    const scaleToward = (pt, c, k) => ({ x: c.x + k * (pt.x - c.x), y: c.y + k * (pt.y - c.y) });
+    const center = { x: 0.5, y: 0.5 };
+    const farOverrides = {};
+    for (const i of [0, 7, 11, 12, 13, 14, 15, 16, 23, 24, 27, 28]) farOverrides[i] = scaleToward(standingBody[i], center, 0.5);
+    const standingBodyFar = mkLandmarks(farOverrides);
+    const proportionsFar = bodyProportionsOf(standingBodyFar, NOOP_W, NOOP_H);
+    console.assert(proportionsFar !== null, "the same body, standing closer/farther, should still produce a calibration reading");
+    console.assert(
+      near(proportions.armToTorso, proportionsFar.armToTorso) &&
+        near(proportions.shoulderToTorso, proportionsFar.shoulderToTorso) &&
+        near(proportions.headToTorso, proportionsFar.headToTorso),
+      "body proportions must be scale-invariant — the same body at a different apparent size must read the same ratios (the property the whole calibration feature rests on)"
+    );
+
+    // --- Missing/low-confidence landmarks must produce NO calibration, never a bad one.
+    const noWrists = mkLandmarks({
+      ...standingBody,
+      15: { ...standingBody[15], visibility: 0 },
+      16: { ...standingBody[16], visibility: 0 },
+    });
+    console.assert(bodyProportionsOf(noWrists, NOOP_W, NOOP_H) === null, "invisible wrists on both sides (no arm can be measured) must produce no calibration at all");
+
+    const sideOnShoulders = mkLandmarks({ ...standingBody, 11: { x: 0.5, y: 0.3 }, 12: { x: 0.5, y: 0.3 } });
+    console.assert(
+      bodyProportionsOf(sideOnShoulders, NOOP_W, NOOP_H) === null,
+      "shoulders projecting on top of each other (side-on) must produce no calibration — a near-zero shoulder width is a projection artefact, not a real reading (see MIN_SHOULDER_TO_TORSO)"
+    );
+
+    // --- medianCalibrationOf: too few good frames must produce no calibration at all.
+    console.assert(
+      medianCalibrationOf([proportions, proportions, proportions]) === null,
+      "fewer than CALIBRATION_MIN_SAMPLES good frames must produce no calibration, however consistent they are"
+    );
+    const enoughSamples = Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => proportions);
+    const calibrationFromMedian = medianCalibrationOf(enoughSamples);
+    console.assert(
+      calibrationFromMedian &&
+        near(calibrationFromMedian.armToTorso, 1.0) &&
+        near(calibrationFromMedian.shoulderToTorso, 1.0) &&
+        near(calibrationFromMedian.headToTorso, 0.2),
+      "enough identical good frames should produce exactly their own values as the calibration"
+    );
+
+    // --- handSepIsPlausible: the triangle-inequality reach bound. maxPlausibleHandSep here is
+    // 1.15 x (2x1.0 + 1.0) = 3.45.
+    console.assert(handSepIsPlausible(1.0, calibrationFromMedian) === true, "a typical full-draw hand-separation reading (~1 torso-length) must not be flagged");
+    console.assert(handSepIsPlausible(4.0, calibrationFromMedian) === false, "a hand-separation reading beyond what this archer's own calibrated reach could ever produce must be flagged");
+    console.assert(handSepIsPlausible(null, calibrationFromMedian) === null, "no hand-sep reading this shot (uncertain) must give no verdict, never a false 'fine'");
+    console.assert(handSepIsPlausible(1.0, null) === null, "no calibration yet must give no verdict, never a false 'fine' or a false alarm");
+    // The field bug this whole feature exists for, reproduced with REPRESENTATIVE (not the
+    // owner's own measured) adult body-proportion ratios — arms noticeably longer than the torso,
+    // shoulders somewhat narrower than it, both plausible for a real adult build. This proves the
+    // mechanism catches an implausible reading under realistic numbers; whether it would have
+    // caught the OWNER's actual historical 2.3 reading depends on his real measured proportions,
+    // which this fixture does not claim to reproduce.
+    const representativeAdult = { armToTorso: 0.7, shoulderToTorso: 0.35, headToTorso: 0.2 };
+    console.assert(
+      handSepIsPlausible(2.3, representativeAdult) === false,
+      "under representative adult body-proportion ratios, a 2.3-torso-length hand separation (the app's own historical impossible reading) should be flagged"
+    );
+
+    // --- compareCalibrations / calibrationVerdict: agreement must stay SILENT — not just "not
+    // flagged as different" but literally no message at all — across several slightly-varying
+    // re-measurements. This matters more now than a one-off trigger would: with no button behind
+    // it, this comparison runs every single time the app calibrates, so the bar for saying
+    // anything has to hold up under ordinary repeated use, not just a single lucky test case.
+    for (const jitter of [0, 0.03, -0.05, 0.08, -0.1]) {
+      const fresh = {
+        armToTorso: calibrationFromMedian.armToTorso * (1 + jitter),
+        shoulderToTorso: calibrationFromMedian.shoulderToTorso * (1 - jitter),
+        headToTorso: calibrationFromMedian.headToTorso * (1 + jitter / 2),
+      };
+      const verdict = calibrationVerdict(calibrationFromMedian, fresh);
+      console.assert(
+        verdict.save === true && verdict.message === null,
+        `agreeing calibrations (jitter ${jitter}) must stay completely silent — no message at all, not even a mild one`
+      );
+    }
+    const firstEverVerdict = calibrationVerdict(null, calibrationFromMedian);
+    console.assert(
+      firstEverVerdict.save === true && firstEverVerdict.message === null,
+      "the very first calibration ever (nothing stored yet) must save silently — nothing to disagree with"
+    );
+
+    // --- A real disagreement must be surfaced, named correctly, and must NOT overwrite storage.
+    const armChanged = {
+      armToTorso: calibrationFromMedian.armToTorso * 1.6,
+      shoulderToTorso: calibrationFromMedian.shoulderToTorso,
+      headToTorso: calibrationFromMedian.headToTorso,
+    };
+    const disagreeVerdict = calibrationVerdict(calibrationFromMedian, armChanged);
+    console.assert(disagreeVerdict.save === false, "a real disagreement must not overwrite what's stored");
+    console.assert(
+      typeof disagreeVerdict.message === "string" && disagreeVerdict.message.includes("arm length"),
+      "a disagreement in arm-to-torso specifically should name 'arm length' in the message"
+    );
+    console.assert(
+      !disagreeVerdict.message.includes("shoulder width") && !disagreeVerdict.message.includes("head size"),
+      "a disagreement in only ONE ratio must not also name the ratios that actually agreed"
+    );
+
+    // --- calibrationStatusText: THREE states, not two (PM review, 2026-08-23) — agreement stays
+    // silent, a session with no successful calibration gets its own neutral line, and a
+    // disagreement keeps the existing wording. Each must be independently distinguishable: a
+    // "not yet" session must never look like an agreeing one (both used to render as nothing at
+    // all), and neither may be confused with an actual disagreement.
+    const neverState = calibrationStatusText(false, null);
+    console.assert(
+      neverState !== null && neverState.tone === "neutral" && typeof neverState.text === "string" && neverState.text.length > 0,
+      "calibrationDone === false must produce its own neutral, non-null line — silence here is exactly the ambiguity being fixed"
+    );
+    const agreedState = calibrationStatusText(true, null);
+    console.assert(agreedState === null, "calibrationDone === true with no disagreement message must stay completely silent — agreement is the one state allowed to say nothing");
+    const disagreedState = calibrationStatusText(true, disagreeVerdict.message);
+    console.assert(
+      disagreedState !== null && disagreedState.tone === "warn" && disagreedState.text === disagreeVerdict.message,
+      "calibrationDone === true with a disagreement message must surface that exact message, tagged as a real warning, not the neutral 'not yet' wording"
+    );
+    // The three states must actually be distinguishable from one another, not just individually
+    // non-crashing — this is the literal bug being fixed (agreement and "never measured" both
+    // rendered as nothing).
+    console.assert(neverState?.text !== disagreedState?.text, "the 'not yet calibrated' line and a real disagreement must never read as the same sentence");
+
+    // --- calibrationShareLine: the PM's window into whether calibration ran at all, when, and
+    // what today found. Must distinguish "never calibrated, ever" from "calibrated before, not
+    // reconfirmed today" from "reconfirmed and agreed" from "reconfirmed and disagreed" — four
+    // combinations of the same two facts (does a stored record exist, did today's check land).
+    const neverCalibratedLine = calibrationShareLine(null, false, null);
+    console.assert(neverCalibratedLine.includes("never calibrated") && neverCalibratedLine.includes("not yet confirmed"), "no stored record and no fresh one this session must say plainly that calibration has never run");
+
+    const staleLine = calibrationShareLine({ ...calibrationFromMedian, takenAt: Date.now() - 86400000 }, false, null);
+    console.assert(
+      staleLine.includes("last confirmed") && !staleLine.includes("never calibrated") && staleLine.includes("not yet confirmed"),
+      "a stored record from a past session, not yet reconfirmed today, must say when it was last confirmed AND that today hasn't checked in yet — not silently imply today already agreed"
+    );
+
+    const agreedLine = calibrationShareLine({ ...calibrationFromMedian, takenAt: Date.now() }, true, null);
+    console.assert(agreedLine.includes("last confirmed") && agreedLine.includes("agreed with what was stored"), "a session where today's check agreed must say so explicitly, not just stay quiet the way the live status line does — the PM needs this even when the owner doesn't");
+
+    const disagreedLine = calibrationShareLine(calibrationFromMedian, true, disagreeVerdict.message);
+    console.assert(disagreedLine.includes("disagreed with what was stored"), "a session where today's check disagreed must say so explicitly in the shared text");
+
+    // --- Framing (legs-cut-off) note: silent when fully in frame, plain when not.
+    console.assert(describeFraming(true) === null, "fully in frame must say nothing at all");
+    console.assert(typeof describeFraming(false) === "string" && describeFraming(false).length > 0, "legs missing from frame for a real stretch must say something plain");
+
+    // --- FRAMING SIGNATURE (optional add-on): the squareness proxy responds to rotation toward
+    // the camera, and stays put under pure scaling (a distance change, not a rotation).
+    const framing = framingSignatureOf(standingBody, NOOP_W, NOOP_H);
+    const framingFar = framingSignatureOf(standingBodyFar, NOOP_W, NOOP_H);
+    console.assert(framing !== null && framingFar !== null, "a fully-visible standing body should produce a framing signature");
+    console.assert(
+      near(framing.shoulderSquareness, framingFar.shoulderSquareness) && near(framing.hipSquareness, framingFar.hipSquareness),
+      "the squareness proxy must stay put when the body is only scaled (a distance change), not rotated"
+    );
+
+    const fullySideOn = mkLandmarks({
+      ...standingBody,
+      11: { x: 0.5, y: 0.3 },
+      12: { x: 0.5, y: 0.3 },
+      23: { x: 0.5, y: 0.6 },
+      24: { x: 0.5, y: 0.6 },
+    });
+    const moreFrontal = mkLandmarks({ ...standingBody, 11: { x: 0.2, y: 0.3 }, 12: { x: 0.8, y: 0.3 } });
+    const framingSideOn = framingSignatureOf(fullySideOn, NOOP_W, NOOP_H);
+    const framingFrontal = framingSignatureOf(moreFrontal, NOOP_W, NOOP_H);
+    console.assert(framingSideOn !== null && near(framingSideOn.shoulderSquareness, 0), "shoulders projecting on top of each other (dead side-on) should read ~0 squareness");
+    console.assert(
+      framingSideOn.shoulderSquareness < framing.shoulderSquareness && framing.shoulderSquareness < framingFrontal.shoulderSquareness,
+      "the squareness proxy must actually respond to rotation toward the camera — side-on < standingBody's own angle < more frontal"
+    );
+
+    // --- describeFramingChange: silent across ordinary, slightly-varying setups; speaks up on a
+    // real difference, describing WHAT changed without diagnosing WHY.
+    for (const jitter of [0, 0.05, -0.08, 0.1]) {
+      const freshFraming = {
+        apparentSize: framing.apparentSize * (1 + jitter * 0.5),
+        frameX: framing.frameX + jitter * 0.02,
+        frameY: framing.frameY - jitter * 0.02,
+        shoulderSquareness: framing.shoulderSquareness + jitter * 0.05,
+        hipSquareness: framing.hipSquareness + jitter * 0.05,
+      };
+      console.assert(
+        describeFramingChange(framing, freshFraming) === null,
+        `ordinary session-to-session framing variation (jitter ${jitter}) must stay silent`
+      );
+    }
+    const closerFraming = { ...framing, apparentSize: framing.apparentSize * 1.6 };
+    const closerMsg = describeFramingChange(framing, closerFraming);
+    console.assert(
+      typeof closerMsg === "string" && closerMsg.includes("bigger in frame"),
+      "standing noticeably closer should say he looks bigger in frame, not diagnose a cause"
+    );
+    console.assert(!closerMsg.toLowerCase().includes("camera"), "the framing-change message must describe what changed, never diagnose a cause like the camera moving");
+
+    console.assert(framingChangeMessage(null, framing) === null, "no stored framing signature yet must say nothing — optional, never a false claim");
+    console.assert(framingChangeMessage(framing, null) === null, "no fresh framing signature this session must say nothing — optional, never a false claim");
   }
 
   // --- SHOOTING CUES (HANDOVER.md Stage 2): updateCue must not let the very next frame cut a
