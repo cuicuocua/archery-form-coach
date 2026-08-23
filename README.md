@@ -102,10 +102,15 @@ shot; either way it never hides the shot itself.
 and reloading the page loses them along with everything else. Watch them
 before you reload.
 
-If your browser can't record video at all, an amber line appears at the top
-of the log saying so, and it stays there for the rest of the session — not
-just a message that flashes by while you're not looking. Everything else
-(the readouts, the shot log, the numbers) keeps working regardless.
+If clip recording runs into trouble, an amber line appears at the top of the
+log saying so, and it stays there for the rest of the session — not just a
+message that flashes by while you're not looking. It says one of two things,
+depending on what actually went wrong: if your browser can't record video at
+all, it says that plainly, and no row will ever have a clip; if recording
+generally works but one shot's clip failed, it says a shot or two might be
+missing a clip rather than claiming nothing works, since later shots can
+still succeed. Either way, everything else (the readouts, the shot log, the
+numbers) keeps working regardless.
 
 ---
 

@@ -500,13 +500,17 @@ function markClipsUnavailable(reason) {
 function startClipRecording() {
   if (selfTestInProgress || !CLIP_SUPPORTED) return; // banner already went up at startup; nothing more to do per attempt
   finalizeRecording(activeRecording);
+  // Named clipStream, deliberately not `stream` — that name is already the module-level camera
+  // MediaStream (see startCamera), and shadowing it here would be a trap for whoever next reads
+  // a `stream.getTracks()...` call elsewhere in the file and assumes it means this one.
+  let clipStream = null;
   try {
     const mimeType = pickMimeType();
     const options = { videoBitsPerSecond: CLIP_BITRATE };
     if (mimeType) options.mimeType = mimeType;
-    const stream = canvas.captureStream(CLIP_FRAME_RATE);
-    const recorder = new MediaRecorder(stream, options);
-    const rec = { recorder, chunks: [], shotNum: null, finished: false, capTimer: null, tailTimer: null };
+    clipStream = canvas.captureStream(CLIP_FRAME_RATE);
+    const recorder = new MediaRecorder(clipStream, options);
+    const rec = { recorder, clipStream, chunks: [], shotNum: null, finished: false, capTimer: null, tailTimer: null };
     recorder.ondataavailable = (ev) => {
       try {
         if (ev.data && ev.data.size > 0) rec.chunks.push(ev.data);
@@ -515,16 +519,39 @@ function startClipRecording() {
       }
     };
     recorder.onerror = (ev) => console.error("archery-form-coach: clip recorder error", ev?.error ?? ev);
-    recorder.onstop = () => finishClipRecording(rec);
+    // Stopping the recorder does NOT stop canvas.captureStream's tracks — they keep pulling
+    // frames off the canvas at CLIP_FRAME_RATE forever unless something stops them explicitly,
+    // which without this would mean one live, still-pulling capture track per shot for the rest
+    // of the session (found in review: 3 shots -> 3 leaked live tracks, unbounded over an end).
+    // Stopped here, in onstop, deliberately AFTER ondataavailable/onstop have already handed the
+    // recorder its final data (see finishClipRecording) rather than the instant .stop() is
+    // called — so cleaning up the source can never cost the recording its last frame.
+    recorder.onstop = () => {
+      stopClipStreamTracks(rec.clipStream);
+      finishClipRecording(rec);
+    };
     recorder.start();
     // Absolute ceiling from the moment recording starts, independent of whether/when the attempt
     // ever ends — this is what stops a stuck full-draw detection from recording forever.
     rec.capTimer = setTimeout(() => finalizeRecording(rec), CLIP_MAX_MS);
     activeRecording = rec;
   } catch (err) {
+    stopClipStreamTracks(clipStream); // the capture stream may already exist even though start() (or the recorder itself) failed -- don't leak it
     activeRecording = null;
-    markClipsUnavailable("Clip recording isn't working in this browser — everything else still works, just no shot videos.");
+    markClipsUnavailable("Some shots couldn't be recorded — at least one clip failed this session.");
     console.error("archery-form-coach: clip recording failed to start", err);
+  }
+}
+
+// Stops every track on a canvas capture stream, so it stops pulling frames off the canvas once
+// its recording is done with it. Safe to call more than once on the same stream (or with null/
+// undefined) — MediaStreamTrack.stop() on an already-stopped track is a harmless no-op, which
+// matters here because more than one code path below can end up calling this for the same rec.
+function stopClipStreamTracks(clipStream) {
+  try {
+    clipStream?.getTracks().forEach((t) => t.stop());
+  } catch (err) {
+    console.error("archery-form-coach: failed to stop clip capture tracks", err);
   }
 }
 
@@ -549,9 +576,16 @@ function finalizeRecording(rec) {
   clearTimeout(rec.capTimer);
   clearTimeout(rec.tailTimer);
   try {
-    if (rec.recorder.state !== "inactive") rec.recorder.stop();
+    if (rec.recorder.state !== "inactive") {
+      rec.recorder.stop(); // capture tracks get stopped from the onstop handler above, once the data is safely out
+    } else {
+      // Already inactive without us calling stop() here — onstop won't fire again on our
+      // account, so nothing else is going to stop the capture tracks; do it ourselves.
+      stopClipStreamTracks(rec.clipStream);
+    }
   } catch (err) {
     console.error("archery-form-coach: failed to stop clip recording", err);
+    stopClipStreamTracks(rec.clipStream); // stop() itself failed, so onstop may never fire -- don't leak the tracks over that
   }
   if (activeRecording === rec) activeRecording = null;
 }

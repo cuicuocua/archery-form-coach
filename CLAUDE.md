@@ -132,10 +132,22 @@ Rules the PM follows:
   numbers, with a plain "no clip" note in place of the watch button. Clips are
   capped at 20 seconds each as a safety valve, live in memory only exactly
   like the shot log, and get `URL.revokeObjectURL`'d the moment their row
-  falls off the end of `SHOT_LOG_MAX`. If recording doesn't work at all in
-  the browser, or throws on start, a persistent line goes up at the top of the
-  shot log saying so — never just a console message, for the same "the owner
-  finds out later, not in the moment" reason as everything else here.
+  falls off the end of `SHOT_LOG_MAX`. Every `canvas.captureStream` track this
+  creates is explicitly stopped (in the recorder's `onstop`, once the blob's
+  data is safely out) once its clip is done — `MediaRecorder.stop()` does not
+  stop the capture tracks feeding it, and leaving those running would mean one
+  live, still-pulling track left behind per shot for the rest of the session.
+  If recording doesn't work at all in the browser, or throws on start, a
+  persistent line goes up at the top of the shot log saying so — never just a
+  console message, for the same "the owner finds out later, not in the
+  moment" reason as everything else here. The wording is deliberately
+  different depending on which happened: never-supported-at-all (checked once
+  at startup) says plainly that clips don't work here; a `MediaRecorder` that
+  threw partway through a session says only that at least one shot's clip
+  failed, since later attempts still retry and can succeed — the two are not
+  the same claim, and telling the owner "recording doesn't work" while half
+  the log has working Watch buttons would be actively misleading. Either
+  message latches once set and is never cleared or overwritten by the other.
 
 ## Not built / explicitly out of scope for this prototype
 
