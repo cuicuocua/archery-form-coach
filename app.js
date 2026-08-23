@@ -1168,6 +1168,48 @@ const OUTLIER_SCATTER_FACTOR = 2.5; // a shot's own gap from the average must be
 const DRIFT_GAP_FACTOR = 1.5; // the gap between the first-half and second-half averages must be more than this many times the whole session's typical gap from average before it counts as drift rather than ordinary shot-to-shot wobble
 // ===========================================================================
 
+// ===== MEASUREMENT PRECISION FLOORS — a second, ABSOLUTE bar under the relative one above.
+// Different kind of number entirely: OUTLIER_SCATTER_FACTOR/DRIFT_GAP_FACTOR ask "is this gap
+// big compared to how this session scattered?", which has a blind spot — a very tight, repeatable
+// session has very little scatter to compare against, so a gap of a fraction of a degree can look
+// "statistically" huge next to it. Caught in the field: a synthetic body held completely still
+// (only ±0.004 of normalised-coordinate jitter, representative of the noise still left after the
+// One Euro filter — see SMOOTH_* above) produced a 1-2 point wobble in shoulder-drop that the
+// relative test alone called "drifted". Nothing drifted; the pipeline just can't measure a joint
+// more precisely than this, and the tighter the archer shoots, the more confidently it would have
+// narrated that noise back at him — the same phantom-shot failure one level up, an untrue claim
+// stated with unearned confidence. So every claim narrateMeasure can make (outlier AND drift) must
+// now clear BOTH bars: big relative to this session's own scatter, AND bigger than the app's own
+// measurement floor below. Below the floor, the honest answer is "steady", because as far as this
+// app can actually tell, it was.
+//
+// NOT a form target — nothing here implies any judgement of the owner's archery, so it doesn't
+// belong in CALIBRATE WITH COACH and doesn't need a coach to set it. It's a statement about how
+// precisely THIS PIPELINE can measure a joint from a phone camera at five metres — same family as
+// SMOOTH_* above: a characteristic of the measurement pipeline, not of the archer. Four separate
+// constants, one per measure, because they're in different units (degrees vs. percentage points)
+// and shouldn't be compared as if they were the same number wearing different labels.
+//
+// Where these numbers come from: each measure's own geometry, run through roughly ±0.004 of
+// normalised-coordinate jitter per landmark (the residual noise level the field case above was
+// built from, and the rough order of magnitude One Euro is tuned to leave behind on a joint that
+// isn't actually moving). Shoulder drop is a vertical gap between two independently-jittered
+// points (shoulder, ear) divided by torso length (~0.3 in a typical side-on frame, the same
+// figure used throughout this file's own test fixtures): two jittered points can disagree by up
+// to ~2x0.004, so (0.008 / 0.3) x 100 ~= 2.7 percentage points of possible noise on its own —
+// rounded up for margin. The two angle measures move a joint sideways off a limb segment roughly
+// 0.15 units long (again, this file's own fixture scale); a jitter of 0.004 perpendicular to that
+// segment shifts the angle by roughly atan(0.004 / 0.15) ~= 1.5-2 degrees, and two joints can each
+// contribute — rounded up for the same reason. RAISE any of these to make the app more reluctant
+// to call anything a trend or a standout shot (more noise gets called "steady"); LOWER them to
+// make it more talkative — and more likely to chase noise, which is exactly the failure this
+// block exists to prevent, so lower with real recorded jitter in hand, not a guess.
+const BOW_ARM_CONSISTENCY_FLOOR_DEG = 2; // degrees — a bow-arm angle claim (outlier or drift) must clear this on top of the relative test
+const ELBOW_CONSISTENCY_FLOOR_DEG = 2; // degrees — same reasoning as bow arm above; both are angles measured off similarly-sized limb segments
+const SHOULDER_BOW_CONSISTENCY_FLOOR_PCT = 3; // percentage points — bow-side shoulder drop
+const SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT = 3; // percentage points — draw-side shoulder drop; same value as bow-side today (same measurement, same units, same noise budget) but named and set separately in case a real session ever shows the two sides need different floors
+// ===========================================================================
+
 // Turns one measure's own numbers, across the shots in the log, into ONE plain-English headline
 // sentence — or null if there's nothing honest to say. Priority order, checked in this order:
 //   1. One shot sits clearly apart from the rest of them — name it, and say which way.
@@ -1185,10 +1227,18 @@ const DRIFT_GAP_FACTOR = 1.5; // the gap between the first-half and second-half 
 // for shoulder drop, higher = sat lower (see shoulderDropOf's own comment: bigger % = further
 // from the ear = more dropped). sign is +1 for a reading above the session average, -1 for below.
 //
-// Pure: entries (any order) + a value-getter + a label + a word function in, one result out —
-// { text, outlierShotNum, outlierWord } (outlierShotNum/outlierWord are null unless case 1 above
-// fired) or null. No DOM, no module state, so selfTest can drive it with plain fixture arrays.
-function narrateMeasure(entries, getValue, label, wordFor) {
+// `floor`: this measure's own MEASUREMENT PRECISION FLOOR (see the block above) — an absolute
+// number, in this measure's own units, that a claim must ALSO clear on top of the relative
+// (OUTLIER_SCATTER_FACTOR / DRIFT_GAP_FACTOR) test. Required, not optional: the relative test
+// alone has no way to tell "genuinely different" apart from "this session happened to be very
+// tight, so ordinary noise looks huge by comparison" — see that block's comment for the field
+// case this caught.
+//
+// Pure: entries (any order) + a value-getter + a label + a word function + a floor in, one
+// result out — { text, outlierShotNum, outlierWord } (outlierShotNum/outlierWord are null unless
+// case 1 above fired) or null. No DOM, no module state, so selfTest can drive it with plain
+// fixture arrays.
+function narrateMeasure(entries, getValue, label, wordFor, floor) {
   const points = entries
     .map((e) => ({ shotNum: e.shotNum, value: getValue(e) }))
     .filter((p) => p.value != null)
@@ -1214,8 +1264,13 @@ function narrateMeasure(entries, getValue, label, wordFor) {
   const worstDev = Math.abs(worst.dev);
   // A real gap: either the other shots were essentially identical to each other and this one
   // wasn't (othersScatter ~0 but worstDev isn't), or this shot sits meaningfully farther out
-  // than the others typically scatter (more than OUTLIER_SCATTER_FACTOR times their own average).
-  const isOutlier = worstDev > 1e-6 && (othersScatter < 1e-6 || worstDev > OUTLIER_SCATTER_FACTOR * othersScatter);
+  // than the others typically scatter (more than OUTLIER_SCATTER_FACTOR times their own average)
+  // — AND, regardless of how that comparison comes out, worstDev has to clear this measure's own
+  // measurement-precision floor. Without that second bar, a very tight session (small
+  // othersScatter) lets a gap of a fraction of the app's own noise floor look "statistically"
+  // enormous and get called out by name — exactly the false claim MEASUREMENT PRECISION FLOORS
+  // above exists to block.
+  const isOutlier = worstDev > floor && (othersScatter < 1e-6 || worstDev > OUTLIER_SCATTER_FACTOR * othersScatter);
   if (isOutlier) {
     return {
       text: `${label} — shot ${worst.shotNum} stands out: ${wordFor(Math.sign(worst.dev))} than your other ${others.length}.${qualifier}`,
@@ -1236,7 +1291,11 @@ function narrateMeasure(entries, getValue, label, wordFor) {
   const avgSecond = secondHalf.reduce((sum, p) => sum + p.value, 0) / half;
   const gap = avgSecond - avgFirst;
   const overallScatter = deviations.reduce((sum, d) => sum + Math.abs(d.dev), 0) / n;
-  const isDrift = Math.abs(gap) > 1e-6 && (overallScatter < 1e-6 || Math.abs(gap) > DRIFT_GAP_FACTOR * overallScatter);
+  // Same two-bar rule as the outlier check above: big relative to this session's own scatter,
+  // AND bigger than this measure's own measurement-precision floor. A tight, repeatable session
+  // has very little scatter to divide by, so without the floor a gap of noise-scale size can
+  // clear the relative bar easily and read as "drift" when nothing actually changed.
+  const isDrift = Math.abs(gap) > floor && (overallScatter < 1e-6 || Math.abs(gap) > DRIFT_GAP_FACTOR * overallScatter);
   if (isDrift) {
     const sign = Math.sign(gap); // +1 means the second half's own average sits above the first half's
     return {
@@ -1378,10 +1437,10 @@ function renderShotLog() {
   const shownNote = log.length < shotCount ? ` The consistency lines below are based on your most recent ${log.length}.` : "";
   const countLine = `<div class="shotlog-count">${shotCount} ${arrowWord} this session.${shownNote}</div>`;
 
-  const bowArm = narrateMeasure(log, (e) => e.bowArmAngle, "Bow arm", wordForBowArm);
-  const shoulderBow = narrateMeasure(log, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder);
-  const shoulderDraw = narrateMeasure(log, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder);
-  const elbow = narrateMeasure(log, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow);
+  const bowArm = narrateMeasure(log, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+  const shoulderBow = narrateMeasure(log, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT);
+  const shoulderDraw = narrateMeasure(log, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT);
+  const elbow = narrateMeasure(log, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG);
 
   const narrativeHtml = [bowArm, shoulderBow, shoulderDraw, elbow]
     .filter((r) => r) // a measure with every reading uncertain this session says nothing at all — see narrateMeasure
@@ -2152,7 +2211,7 @@ function selfTest() {
       { shotNum: 4, bowArmAngle: 170.5 },
       { shotNum: 5, bowArmAngle: 169.5 },
     ];
-    const steadyResult = narrateMeasure(steadyFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    const steadyResult = narrateMeasure(steadyFixture, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       steadyResult && steadyResult.text.startsWith("Bow arm — steady"),
       `a tight cluster of shots should read as steady, got: ${steadyResult && steadyResult.text}`
@@ -2170,7 +2229,7 @@ function selfTest() {
       { shotNum: 4, bowArmAngle: 170 },
       { shotNum: 5, bowArmAngle: 200 },
     ];
-    const outlierNarrResult = narrateMeasure(outlierNarrFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    const outlierNarrResult = narrateMeasure(outlierNarrFixture, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       outlierNarrResult && outlierNarrResult.outlierShotNum === 5,
       `shot 5 (200, wildly apart from the other four) should be named as the standout, got: ${outlierNarrResult && JSON.stringify(outlierNarrResult)}`
@@ -2185,7 +2244,7 @@ function selfTest() {
     // 160, 163, 166, 169, 172.
     const driftValues = [160, 163, 166, 169, 172];
     const driftFixture = driftValues.map((v, i) => ({ shotNum: i + 1, bowArmAngle: v }));
-    const driftResult = narrateMeasure(driftFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    const driftResult = narrateMeasure(driftFixture, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       driftResult && driftResult.text.includes("drifted"),
       `a steadily climbing session should read as drift, got: ${driftResult && driftResult.text}`
@@ -2197,15 +2256,73 @@ function selfTest() {
     // check is genuinely order-sensitive, not just "the numbers happen to have this much spread".
     const shuffledValues = [166, 160, 172, 163, 169]; // same 5 numbers as driftValues, different assignment to shotNum
     const shuffledFixture = shuffledValues.map((v, i) => ({ shotNum: i + 1, bowArmAngle: v }));
-    const shuffledResult = narrateMeasure(shuffledFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    const shuffledResult = narrateMeasure(shuffledFixture, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       shuffledResult && !shuffledResult.text.includes("drifted"),
       `the same values in shuffled (non-trending) order must not read as drift, got: ${shuffledResult && shuffledResult.text}`
     );
 
+    // --- MEASUREMENT PRECISION FLOOR: the field bug this was built to fix. A body held
+    // completely still still shows a point or two of noise (see the MEASUREMENT PRECISION
+    // FLOORS block above) — these are the coordinator's own reported numbers, bow-side shoulder
+    // drop reading 42, 41, 40, 40 with nothing actually happening. Relative to THIS session's own
+    // (tiny) scatter, that gap clears DRIFT_GAP_FACTOR easily; it must still come out "steady"
+    // because it never clears SHOULDER_BOW_CONSISTENCY_FLOOR_PCT.
+    const noiseOnlyFixture = [
+      { shotNum: 1, shoulderDrop: { bow: 42 } },
+      { shotNum: 2, shoulderDrop: { bow: 41 } },
+      { shotNum: 3, shoulderDrop: { bow: 40 } },
+      { shotNum: 4, shoulderDrop: { bow: 40 } },
+    ];
+    const noiseOnlyStats = narrateMeasure(noiseOnlyFixture, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", upDown, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT);
+    console.assert(
+      noiseOnlyStats && noiseOnlyStats.text.startsWith("Bow shoulder — steady"),
+      `a 1-2 point wobble on a tight, unmoving session must read as steady, not drift, got: ${noiseOnlyStats && noiseOnlyStats.text}`
+    );
+    console.assert(noiseOnlyStats.outlierShotNum === null, "measurement noise must not get named as an outlier shot either");
+    // Sanity check on the fixture itself: confirm the RELATIVE test alone (no floor) really would
+    // have called this drift, so the assertion above is actually exercising the floor and not
+    // just a fixture that never triggered the relative test in the first place.
+    const noiseOnlyNoFloor = narrateMeasure(noiseOnlyFixture, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", upDown, 0);
+    console.assert(
+      noiseOnlyNoFloor && noiseOnlyNoFloor.text.includes("drifted"),
+      `sanity check failed: this fixture should clear the relative drift test on its own (floor 0) — got: ${noiseOnlyNoFloor && noiseOnlyNoFloor.text}, so the floor test above isn't testing what it claims to`
+    );
+
+    // Same idea, the outlier side: one shot a hair off a tight cluster clears the relative
+    // outlier test but must still be called steady once it can't clear the floor either.
+    const noiseOutlierFixture = [
+      { shotNum: 1, shoulderDrop: { bow: 40 } },
+      { shotNum: 2, shoulderDrop: { bow: 40 } },
+      { shotNum: 3, shoulderDrop: { bow: 40 } },
+      { shotNum: 4, shoulderDrop: { bow: 40.75 } },
+    ];
+    const noiseOutlierStats = narrateMeasure(noiseOutlierFixture, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", upDown, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT);
+    console.assert(
+      noiseOutlierStats && noiseOutlierStats.text.startsWith("Bow shoulder — steady") && noiseOutlierStats.outlierShotNum === null,
+      `a sub-point gap on a tight session must not be named as an outlier shot, got: ${noiseOutlierStats && JSON.stringify(noiseOutlierStats)}`
+    );
+    const noiseOutlierNoFloor = narrateMeasure(noiseOutlierFixture, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", upDown, 0);
+    console.assert(
+      noiseOutlierNoFloor && noiseOutlierNoFloor.outlierShotNum === 4,
+      `sanity check failed: this fixture should clear the relative outlier test on its own (floor 0) — got: ${noiseOutlierNoFloor && JSON.stringify(noiseOutlierNoFloor)}, so the floor test above isn't testing what it claims to`
+    );
+
+    // The floor must not swallow a REAL trend or a REAL outlier, only noise-scale ones — both
+    // driftResult and outlierNarrResult above already exercise this (they pass a real,
+    // production floor and still correctly report drift/outlier), restated explicitly here.
+    console.assert(
+      driftResult.text.includes("drifted"),
+      "a genuine drift that clears the floor must still be reported as drift, not swallowed by it"
+    );
+    console.assert(
+      outlierNarrResult.outlierShotNum === 5,
+      "a genuine outlier that clears the floor must still be named, not swallowed by it"
+    );
+
     // One shot, or two shots: no honest consistency story to tell yet — must say so plainly and
     // never compute a fabricated steady/drift/outlier claim from almost nothing.
-    const oneNarr = narrateMeasure([{ shotNum: 1, bowArmAngle: 170 }], (e) => e.bowArmAngle, "Bow arm", upDown);
+    const oneNarr = narrateMeasure([{ shotNum: 1, bowArmAngle: 170 }], (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       oneNarr && oneNarr.text.includes("only one shot") && oneNarr.outlierShotNum === null,
       `a single shot must produce the honest one-shot wording, not a fabricated claim, got: ${oneNarr && oneNarr.text}`
@@ -2214,7 +2331,8 @@ function selfTest() {
       [{ shotNum: 1, bowArmAngle: 170 }, { shotNum: 2, bowArmAngle: 170 }],
       (e) => e.bowArmAngle,
       "Bow arm",
-      upDown
+      upDown,
+      BOW_ARM_CONSISTENCY_FLOOR_DEG
     );
     console.assert(
       twoNarr && twoNarr.text.includes("only two shots") && twoNarr.outlierShotNum === null,
@@ -2229,7 +2347,7 @@ function selfTest() {
       { shotNum: 2, shoulderDrop: { draw: null } },
       { shotNum: 3, shoulderDrop: { draw: null } },
     ];
-    const allUncertainResult = narrateMeasure(allUncertainFixture, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", upDown);
+    const allUncertainResult = narrateMeasure(allUncertainFixture, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", upDown, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT);
     console.assert(
       allUncertainResult === null,
       `a measure with every reading uncertain must produce no statement at all, got: ${JSON.stringify(allUncertainResult)}`

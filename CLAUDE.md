@@ -326,6 +326,34 @@ Rules the PM follows:
   on each row, for whoever eventually tunes those placeholder constants
   against a real session — they're just never the headline.
 
+- **Consistency claims need an absolute floor under the relative one, or a
+  tight session narrates its own noise back at the owner.** Caught in
+  testing: a synthetic body held completely still, with only the residual
+  jitter smoothing leaves behind (~±0.004 of normalised-coordinate noise per
+  landmark), still produced a 1-2 point wobble in shoulder drop — and because
+  `narrateMeasure`'s drift/outlier checks were purely RELATIVE (a gap judged
+  only against how much this session happened to scatter), a very tight,
+  repeatable session has almost no scatter to divide by, so that tiny wobble
+  looked "statistically" huge and got reported as drift. The tighter the
+  archer shoots, the more confidently the app would narrate pure noise as a
+  finding — the phantom-shot bug one level up, restated as a phantom trend.
+  Fix: `BOW_ARM_CONSISTENCY_FLOOR_DEG`, `ELBOW_CONSISTENCY_FLOOR_DEG`,
+  `SHOULDER_BOW_CONSISTENCY_FLOOR_PCT`, `SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT`
+  (one per measure, since degrees and percentage points aren't the same
+  number wearing different labels) — an absolute, in-that-measure's-own-units
+  floor a claim must ALSO clear, on top of the relative test, before
+  `narrateMeasure` will call it drift or name a shot as standing out. Below
+  the floor the honest answer is "steady", because that's the most this
+  pipeline can actually tell apart from its own noise. **Not a calibration
+  constant** — nothing about it judges the owner's archery, so it does not
+  belong in CALIBRATE WITH COACH and needs no coach to set: it is a statement
+  about how precisely this pipeline can measure a joint from a phone camera
+  at five metres, same family as `SMOOTH_*`. Defaults are derived, not
+  guessed, from each measure's own geometry at that ~±0.004 jitter level
+  (worked through in the constant block's own comment in `app.js`) — a
+  degree or two for the two angle measures, a few percentage points for
+  shoulder drop, matching the actual field numbers this bug was found from.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.
