@@ -74,6 +74,16 @@ phantom shot. If any movement gets thrown away, a line at the top of the log
 says how many: **"N movements ignored (too short, or never near full draw)."**
 A big number there next to a small arrow count is itself worth noticing.
 
+The app also needs a moment right after it starts (or right after it briefly
+loses track of you) before its readings are trustworthy enough to log — it's
+still catching up on how steady you're actually holding. In practice you'll
+never notice: you start the app, prop the phone, and walk to the line, which
+is already more time than it needs. If a draw somehow lands entirely inside
+that catching-up window, it says so in its own line — **"N arrows drawn
+before the app finished settling weren't recorded"** — worded differently
+from "movements ignored" on purpose, because it means something different:
+that was a real arrow, not noise, the app just wasn't ready to measure it.
+
 A draw that never quite reached full draw is still logged, and still worth
 seeing — that part hasn't changed — it's just marked **short of full draw**
 so you can tell it apart from one that went all the way.
