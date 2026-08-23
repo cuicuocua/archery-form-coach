@@ -54,6 +54,30 @@ const CLIP_MIME_CANDIDATES = [
 ];
 // ===========================================================================
 
+// ===== SMOOTHING — One Euro filter tunables for the pose landmarks. Performance/feel knobs,
+// not calibration like the CALIBRATE WITH COACH block above: change these freely, no coach
+// needed, just watch the skeleton and judge by eye (or check a recorded clip afterwards). See
+// the OneEuroFilter class below for what these numbers actually do; in short, "how much to
+// smooth a joint that's barely moving" (mincutoff) and "how fast to stop smoothing once a joint
+// speeds up" (beta). =====
+const SMOOTH_MIN_CUTOFF = 1.0; // Hz-scale smoothing floor, used when a joint is nearly still. LOWER this for a calmer, less jittery skeleton at full draw (where the archer is genuinely holding steady and every measurement gets taken); RAISE it if the skeleton starts to feel laggy even when barely moving. Picked at the paper's own default starting point (1.0), then left there — outdoor jitter is exactly the "nearly still, high-frequency noise" case this is built to kill.
+const SMOOTH_BETA = 8; // how fast smoothing backs off as a joint speeds up. Landmark positions here are normalised to roughly 0–1 across the frame (not pixels), so a joint moving during a real raise or draw covers a big fraction of that range per second — this needs to be much bigger than the tiny beta values you'll see in mouse-pointer examples online, or the skeleton would lag behind the archer's arm during the raise. RAISE this if the skeleton looks like it's dragging behind a fast motion; LOWER it if fast motion still looks jittery instead of smooth.
+const SMOOTH_DCUTOFF = 1.0; // smooths the estimated SPEED of a joint before beta reacts to it, so a single noisy frame can't fake a "fast motion" and prematurely unlock smoothing. Standard default from the paper; rarely worth touching — leave this one alone unless the adaptive behaviour itself (calm when still, responsive when moving) seems broken.
+// ===========================================================================
+
+// ===== POSE MODEL — performance knobs, not calibration; safe to change without a coach. =====
+// MediaPipe offers a "lite" pose model (fast, less stable) and a "full" one (steadier landmarks,
+// more GPU work per frame). This app starts on "full" for the steadier skeleton, then times
+// itself for a short window right after startup and switches itself to "lite" if this phone
+// can't keep full running at a usable frame rate. The owner never sees this decision happen —
+// per CLAUDE.md they get one interaction, after they're done shooting — so the result (which
+// model ended up running, and roughly how fast) is written into the shot log instead of shown
+// live anywhere.
+const MODEL_WARMUP_FRAMES = 10; // frames ignored before measuring starts — the first frames after startup are always slow (cold GPU pipeline, cold caches) and would make even a fast phone look like it needs the fallback
+const MODEL_MEASURE_FRAMES = 20; // frames averaged together, right after warm-up, to make the one-time full-vs-lite decision
+const MODEL_SLOW_FRAME_MS = 60; // average per-frame inference time above this triggers the switch to lite (60ms ≈ 16fps, noticeably behind a live camera feed). RAISE this to let the app stay on the steadier "full" model on a slower phone; LOWER it to fall back to "lite" more readily.
+// ===========================================================================
+
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
@@ -137,14 +161,151 @@ let clipsUnavailableReason = null;
 // The clip logic itself is tested separately below, by calling its pieces directly.
 let selfTestInProgress = false;
 
-async function initPoseLandmarker() {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-  );
-  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+// ===== One Euro filter — adaptive smoothing for the pose landmarks (Casiez/Roussel/Vogel 2012,
+// "1€ Filter"). Deliberately implemented inline rather than pulled in as a dependency — it's
+// short, and CLAUDE.md rules out adding a CDN dependency for this.
+//
+// Why not a plain moving average: a fixed amount of smoothing is a bad trade either way. Enough
+// to kill outdoor jitter at full draw also blurs the fast raise into a laggy smear that trails
+// behind the archer's real arm and throws off the full-draw-detection timing (see isAtFullDraw).
+// Not enough to blur the raise leaves the jitter untouched at full draw — the exact moment every
+// measurement is taken and jitter is most damaging. One Euro sidesteps the trade-off: it widens
+// its own low-pass cutoff frequency in proportion to how fast the signal is currently moving, so
+// it smooths hard when a joint is nearly still (full draw — a compound archer at let-off holds
+// genuinely steady for seconds) and gets out of the way automatically the instant the joint
+// speeds up (the raise). Pure function/class — no DOM, no MediaPipe — so selfTest can exercise
+// it directly.
+class OneEuroFilter {
+  constructor(mincutoff, beta, dcutoff) {
+    this.mincutoff = mincutoff;
+    this.beta = beta;
+    this.dcutoff = dcutoff;
+    this.reset();
+  }
+
+  // Clears all state. After a reset, the next call to filter() returns its input completely
+  // unsmoothed — see the tPrev === null branch below — so a stale position from before the reset
+  // can never be blended into a fresh one.
+  reset() {
+    this.xPrev = null; // last filtered value
+    this.dxPrev = 0; // last filtered speed estimate
+    this.tPrev = null; // last timestamp (seconds), so dt is measured from REAL elapsed time, not an assumed frame rate
+  }
+
+  // The smoothing factor (0–1) for a first-order low-pass filter with the given cutoff frequency
+  // (Hz) over an elapsed time dt (seconds). Standard formula from the One Euro paper.
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+
+  // Feeds one new raw sample through the filter and returns the smoothed value. `tSec` is a
+  // timestamp in seconds on any consistent clock — the render loop passes performance.now()/1000.
+  filter(value, tSec) {
+    if (this.tPrev === null) {
+      // First sample since construction (or since the last reset): nothing to smooth against
+      // yet, so the output IS the input. This is what makes reset() clean rather than a source
+      // of drag — see the "reset clears state" self-test below.
+      this.xPrev = value;
+      this.dxPrev = 0;
+      this.tPrev = tSec;
+      return value;
+    }
+    const dt = Math.max(tSec - this.tPrev, 1e-6); // guards divide-by-zero on a duplicate/out-of-order timestamp; real frames always have dt > 0
+    // Estimate how fast the signal is currently moving, itself low-pass filtered at a fixed
+    // dcutoff — an unfiltered derivative would be exactly as noisy as the raw signal and could
+    // never be trusted to decide how much to smooth.
+    const rawSpeed = (value - this.xPrev) / dt;
+    const speedAlpha = OneEuroFilter.alpha(this.dcutoff, dt);
+    const speed = this.dxPrev + speedAlpha * (rawSpeed - this.dxPrev);
+
+    // The adaptive part: the faster the signal is moving, the higher this cutoff climbs, and the
+    // less smoothing gets applied below.
+    const cutoff = this.mincutoff + this.beta * Math.abs(speed);
+    const a = OneEuroFilter.alpha(cutoff, dt);
+    const smoothed = this.xPrev + a * (value - this.xPrev);
+
+    this.xPrev = smoothed;
+    this.dxPrev = speed;
+    this.tPrev = tSec;
+    return smoothed;
+  }
+}
+
+// Runs one OneEuroFilter per landmark, per axis (x and y — NEVER visibility; visibility is a
+// confidence score, not a position, and smoothing it would let a low-confidence joint's readout
+// creep toward looking trustworthy over a few frames, which CLAUDE.md explicitly forbids — a
+// joint's visibility must reflect THIS frame's confidence only). Pure array-in, array-out — no
+// DOM, no MediaPipe — so selfTest can exercise it directly on plain fixture landmarks.
+class LandmarkSmoother {
+  constructor(mincutoff, beta, dcutoff) {
+    this.mincutoff = mincutoff;
+    this.beta = beta;
+    this.dcutoff = dcutoff;
+    this.filters = []; // filters[i] = { x: OneEuroFilter, y: OneEuroFilter }, created lazily per landmark index the first time it's seen
+  }
+
+  // Drops all filter state. Called whenever tracking is lost or the camera is switched, so a
+  // position left over from before the gap can never get smoothed together with a fresh position
+  // after it and drag the skeleton across the frame.
+  reset() {
+    this.filters = [];
+  }
+
+  // landmarks: MediaPipe's per-frame array of {x, y, z, visibility, ...}. tSec: timestamp in
+  // seconds. Returns a NEW array — the input array is never mutated — with x/y replaced by their
+  // smoothed values and every other field, visibility included, copied through untouched.
+  smooth(landmarks, tSec) {
+    return landmarks.map((lm, i) => {
+      if (!this.filters[i]) {
+        this.filters[i] = {
+          x: new OneEuroFilter(this.mincutoff, this.beta, this.dcutoff),
+          y: new OneEuroFilter(this.mincutoff, this.beta, this.dcutoff),
+        };
+      }
+      const f = this.filters[i];
+      return { ...lm, x: f.x.filter(lm.x, tSec), y: f.y.filter(lm.y, tSec) };
+    });
+  }
+}
+
+// One instance for the live session, built from the SMOOTHING constants above.
+const landmarkSmoother = new LandmarkSmoother(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+// ===========================================================================
+
+// ===== Pose model selection — see the POSE MODEL constants above for the full explanation.
+// These variables track the one-time "is full fast enough on this phone?" measurement and its
+// outcome, and the persistent shot-log line that reports it (the owner can't watch this happen
+// live, per CLAUDE.md).
+const POSE_MODEL_URLS = {
+  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+  lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+};
+let visionFileset = null; // cached FilesetResolver result, so switching models doesn't re-fetch the wasm runtime a second time
+let activePoseModel = "full"; // which model is actually loaded right now
+let modelDecisionMade = false; // true once the one-time full-vs-lite decision has run — after that, measurePoseModelPerf stops doing any work, so the model never hunts back and forth mid-session
+let modelWarmupSeen = 0; // frames seen since startup, counted toward MODEL_WARMUP_FRAMES then MODEL_MEASURE_FRAMES
+let modelMeasureTotalMs = 0; // summed inference time across the measurement window (after warm-up)
+// Persistent shot-log line recording which model ended up running and the measured frame rate —
+// same "written once, shown on every render, never only live" treatment as clipsUnavailableReason
+// below, and for the same reason: the owner is on the shooting line when this gets decided, not
+// watching the phone.
+let modelStatusLine = null;
+
+async function getVisionFileset() {
+  if (!visionFileset) {
+    visionFileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+  }
+  return visionFileset;
+}
+
+async function createPoseLandmarker(modelKey) {
+  const vision = await getVisionFileset();
+  return PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+      modelAssetPath: POSE_MODEL_URLS[modelKey],
       delegate: "GPU",
     },
     runningMode: "VIDEO",
@@ -152,7 +313,67 @@ async function initPoseLandmarker() {
   });
 }
 
+async function initPoseLandmarker() {
+  poseLandmarker = await createPoseLandmarker("full");
+  activePoseModel = "full";
+}
+
+// Called once per frame from renderLoop with how long that frame's detectForVideo call took, in
+// milliseconds. No-ops once modelDecisionMade is true — see that variable's comment. Skips the
+// first MODEL_WARMUP_FRAMES entirely (cold-start frames are always slow and not representative),
+// then averages the next MODEL_MEASURE_FRAMES to make the one-time decision.
+function measurePoseModelPerf(inferenceMs) {
+  if (modelDecisionMade) return;
+  modelWarmupSeen++;
+  if (modelWarmupSeen <= MODEL_WARMUP_FRAMES) return;
+  modelMeasureTotalMs += inferenceMs;
+  const measured = modelWarmupSeen - MODEL_WARMUP_FRAMES;
+  if (measured < MODEL_MEASURE_FRAMES) return;
+
+  modelDecisionMade = true;
+  const avgMs = modelMeasureTotalMs / measured;
+  const fps = 1000 / avgMs;
+  if (avgMs > MODEL_SLOW_FRAME_MS && activePoseModel === "full") {
+    switchToLitePoseModel(fps);
+  } else {
+    setModelStatusLine(fps);
+  }
+}
+
+// Rebuilds the landmarker on the lighter "lite" model because the warm-up measurement found
+// "full" running too slowly on this phone. Must never leave the app with no landmarker at all,
+// and a failed rebuild must never interrupt tracking: if creating the new landmarker throws (a
+// flaky fetch for the model file, most likely), the OLD "full" landmarker just keeps running —
+// slower than ideal, but still tracking, which is what matters (see CLAUDE.md: pose tracking
+// must never just stop).
+async function switchToLitePoseModel(measuredFps) {
+  try {
+    const next = await createPoseLandmarker("lite");
+    const old = poseLandmarker;
+    poseLandmarker = next;
+    activePoseModel = "lite";
+    old?.close?.();
+  } catch (err) {
+    console.error("archery-form-coach: falling back to lite pose model failed, staying on full", err);
+  }
+  setModelStatusLine(measuredFps);
+}
+
+function setModelStatusLine(measuredFps) {
+  const label =
+    activePoseModel === "full"
+      ? "full"
+      : "lite (auto-switched — full ran too slow on this phone)";
+  modelStatusLine = `Pose model: ${label} — about ${measuredFps.toFixed(1)} fps measured at startup.`;
+  renderShotLog();
+}
+// ===========================================================================
+
 async function startCamera() {
+  // A landmark position smoothed from BEFORE a camera switch (different framing, possibly a
+  // mirrored front camera) must never blend into positions AFTER it — that would drag the
+  // skeleton across the frame on the very first frames of the new camera. See LandmarkSmoother.
+  landmarkSmoother.reset();
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
   }
@@ -785,9 +1006,13 @@ function renderShotLog() {
   // every single render, for as long as clipsUnavailableReason is set (which is forever, once
   // it's set at all — see markClipsUnavailable).
   const banner = clipsUnavailableReason ? `<div class="shotlog-banner">${clipsUnavailableReason}</div>` : "";
+  // Which pose model ended up running, and how fast — set once, shortly after startup (see
+  // measurePoseModelPerf/setModelStatusLine), and shown on every render after that. Sits right
+  // under the clip banner, same reasoning: the owner can't be watching when this gets decided.
+  const modelBit = modelStatusLine ? `<div class="shotlog-modelinfo">${modelStatusLine}</div>` : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${banner}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${banner}${modelBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -804,7 +1029,7 @@ function renderShotLog() {
 
   const rowsHtml = log.map((e) => renderShotRow(e, stats)).join("");
 
-  shotLogEl.innerHTML = `${banner}<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
+  shotLogEl.innerHTML = `${banner}${modelBit}<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -860,18 +1085,29 @@ function renderLoop() {
 
   if (!poseLandmarker || video.readyState < 2) return;
 
+  const inferenceStart = performance.now();
   const result = poseLandmarker.detectForVideo(video, now);
-  const landmarks = result.landmarks?.[0];
+  measurePoseModelPerf(performance.now() - inferenceStart);
+  const rawLandmarks = result.landmarks?.[0];
 
-  if (!landmarks) {
+  if (!rawLandmarks) {
     drawVideoFrame(); // keep the clip (and the on-screen view) showing the camera even without a skeleton
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
     if (DEBUG) debugInfo = null;
+    // Tracking just lost the archer entirely — whatever the filters were smoothing toward is now
+    // stale. Reset so a fresh detection later starts clean rather than being dragged from
+    // wherever the skeleton was last seen (see LandmarkSmoother).
+    landmarkSmoother.reset();
     endAttempt(); // pose lost mid-attempt counts as the attempt ending, same as hands relaxing
   } else {
+    // Smoothed landmarks feed everything downstream — the skeleton drawing, all three readouts,
+    // and the full-draw/shot-log sampling inside isAtFullDraw — so a shaky raw detection can't
+    // show up in the numbers the owner reads later or the clip he watches back. Real elapsed time
+    // (performance.now(), converted to seconds), not an assumed frame rate — see OneEuroFilter.
+    const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
     drawSkeleton(landmarks);
     updateBowArmReadout(landmarks);
     updateShoulderDropReadout(landmarks);
@@ -1439,6 +1675,164 @@ function selfTest() {
       "evicting a row that has a clip attached must revoke its object URL"
     );
     URL.revokeObjectURL = savedRevoke;
+  }
+
+  // --- One Euro filter: pure logic, no DOM/MediaPipe involved, so these run straight against
+  // the class with plain fixture numbers.
+  {
+    // A constant input must converge to that constant with no drift and no lasting offset —
+    // once the filter has settled, feeding it the same value again and again should leave it
+    // sitting on that value, not creeping away from it.
+    const constFilter = new OneEuroFilter(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+    let t = 0;
+    let out = 0;
+    for (let i = 0; i < 60; i++) {
+      t += 1 / 30;
+      out = constFilter.filter(5, t);
+    }
+    console.assert(
+      Math.abs(out - 5) < 1e-6,
+      `a constant input should converge exactly to that constant, got ${out} instead of 5`
+    );
+
+    // A noisy signal around a fixed value should come out with LESS variance than it went in —
+    // that's the entire point of smoothing. Measured, not eyeballed: seeded pseudo-random noise
+    // so the test is deterministic.
+    let seed = 42;
+    const pseudoRandom = () => {
+      // simple deterministic LCG — good enough for a repeatable test fixture, no need for real
+      // randomness here
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed / 0x7fffffff) * 2 - 1; // -1..1
+    };
+    const noiseFilter = new OneEuroFilter(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+    const raw = [];
+    const smoothedOut = [];
+    let nt = 0;
+    for (let i = 0; i < 200; i++) {
+      nt += 1 / 30; // a steady 30fps signal
+      const noisy = 10 + pseudoRandom() * 0.05; // fixed value 10, ±0.05 noise
+      raw.push(noisy);
+      smoothedOut.push(noiseFilter.filter(noisy, nt));
+    }
+    const variance = (arr) => {
+      const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+      return arr.reduce((a, b) => a + (b - mean) ** 2, 0) / arr.length;
+    };
+    // Drop the first few samples of the smoothed series — the filter is still settling from a
+    // cold start right at the beginning, which isn't the steady-state behaviour under test.
+    const rawVar = variance(raw.slice(20));
+    const smoothedVar = variance(smoothedOut.slice(20));
+    console.assert(
+      smoothedVar < rawVar * 0.5,
+      `smoothed variance (${smoothedVar.toFixed(6)}) should be well under half the raw variance (${rawVar.toFixed(6)}) around a fixed value`
+    );
+
+    // A fast ramp must be tracked with materially less lag than a heavy FIXED low-pass filter
+    // (i.e. one that never adapts) would give — this is the actual point of using One Euro
+    // instead of a plain moving average. Compare against a plain fixed-cutoff low-pass run over
+    // the identical ramp.
+    const fixedLowPass = (cutoff, samples, dtSec) => {
+      let prev = null;
+      let outVal = 0;
+      for (const s of samples) {
+        if (prev === null) {
+          outVal = s;
+        } else {
+          outVal = outVal + OneEuroFilter.alpha(cutoff, dtSec) * (s - outVal);
+        }
+        prev = s;
+      }
+      return outVal;
+    };
+    const rampDt = 1 / 30;
+    const rampSamples = [];
+    for (let i = 0; i < 30; i++) rampSamples.push(i * 0.05); // a steady, fast ramp: 0 -> 1.45 over one second
+    const rampTrue = rampSamples[rampSamples.length - 1];
+
+    const adaptiveRampFilter = new OneEuroFilter(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+    let rt = 0;
+    let adaptiveOut = 0;
+    for (const s of rampSamples) {
+      rt += rampDt;
+      adaptiveOut = adaptiveRampFilter.filter(s, rt);
+    }
+    const adaptiveLag = Math.abs(rampTrue - adaptiveOut);
+    // A heavy fixed low-pass at the SAME cutoff the adaptive filter starts at when still
+    // (SMOOTH_MIN_CUTOFF) — i.e. what you'd get WITHOUT the beta term ever kicking in.
+    const fixedOut = fixedLowPass(SMOOTH_MIN_CUTOFF, rampSamples, rampDt);
+    const fixedLag = Math.abs(rampTrue - fixedOut);
+    console.assert(
+      adaptiveLag < fixedLag * 0.5,
+      `adaptive filter's lag on a fast ramp (${adaptiveLag.toFixed(4)}) should be well under a fixed heavy low-pass's lag (${fixedLag.toFixed(4)}) — otherwise beta isn't doing anything`
+    );
+
+    // Reset must clear state completely: the very next sample after a reset should come out
+    // exactly equal to itself, not dragged toward wherever the filter was before the reset.
+    const resetFilter = new OneEuroFilter(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+    let rst = 0;
+    for (let i = 0; i < 30; i++) {
+      rst += 1 / 30;
+      resetFilter.filter(0, rst); // settle near 0
+    }
+    resetFilter.reset();
+    const firstAfterReset = resetFilter.filter(100, 0); // a totally fresh position/time after reset
+    console.assert(
+      firstAfterReset === 100,
+      `first output after reset should equal the first new input exactly (100), got ${firstAfterReset} — state wasn't cleared`
+    );
+
+    // Elapsed time must be respected: the SAME sample sequence run at a different dt should
+    // produce different smoothing, since a filter using an assumed frame rate instead of real
+    // elapsed time would give the same answer regardless.
+    const seq = [0, 1, 1, 1, 1, 1];
+    const runAt = (dtSec) => {
+      const f = new OneEuroFilter(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+      let tt = 0;
+      let last = 0;
+      for (const v of seq) {
+        tt += dtSec;
+        last = f.filter(v, tt);
+      }
+      return last;
+    };
+    const outFast = runAt(1 / 60); // 60fps: less real time has passed by the same sample count
+    const outSlow = runAt(1 / 10); // 10fps: more real time has passed by the same sample count
+    console.assert(
+      Math.abs(outFast - outSlow) > 1e-6,
+      `identical sample sequence at different dt should NOT produce the same output (got ${outFast} and ${outSlow}) — dt is being ignored`
+    );
+  }
+
+  // --- LandmarkSmoother: the array-level wrapper around OneEuroFilter that renderLoop actually
+  // uses. Confirms it smooths x/y, leaves visibility completely untouched, and resets cleanly.
+  {
+    const smoother = new LandmarkSmoother(SMOOTH_MIN_CUTOFF, SMOOTH_BETA, SMOOTH_DCUTOFF);
+    const mkFrame = (x, y, visibility) => [{ x, y, z: 0, visibility }];
+    let st = 0;
+    let lastFrame = null;
+    for (let i = 0; i < 30; i++) {
+      st += 1 / 30;
+      // A still point plus a tiny wobble — same shape as outdoor camera jitter on a joint that
+      // isn't actually moving.
+      const wobble = i % 2 === 0 ? 0.01 : -0.01;
+      lastFrame = smoother.smooth(mkFrame(0.5 + wobble, 0.5, 0.9), st);
+    }
+    console.assert(
+      Math.abs(lastFrame[0].x - 0.5) < 0.01,
+      "LandmarkSmoother should settle near the true still position despite per-frame wobble"
+    );
+    console.assert(
+      lastFrame[0].visibility === 0.9,
+      "LandmarkSmoother must pass visibility through completely untouched, never smoothed"
+    );
+
+    smoother.reset();
+    const freshFrame = smoother.smooth(mkFrame(0.9, 0.1, 0.3), 0);
+    console.assert(
+      freshFrame[0].x === 0.9 && freshFrame[0].y === 0.1,
+      "LandmarkSmoother.reset() should make the next frame come out completely unsmoothed"
+    );
   }
 
   selfTestInProgress = false;

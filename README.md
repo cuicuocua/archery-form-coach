@@ -128,11 +128,38 @@ The green/amber ranges are estimates, not coaching standards. They live in one
 labelled block at the top of `app.js` called **CALIBRATE WITH COACH**. Nothing
 else in the file needs touching to change them.
 
+Two other labelled blocks sit right next to it — **SMOOTHING** and **POSE
+MODEL** — but those are a different thing entirely: performance knobs, not
+form targets. No coach needed for those; change them and judge by watching
+the skeleton (live or in a recorded clip). See "Steadying the skeleton"
+below.
+
 The shoulder-drop threshold in particular is a guess made at a desk from human
 proportions. To set it properly: in one session, shoot a few shots with your
 shoulders deliberately shrugged and a few with them deliberately dropped as far
 as you can. Read both off the log. The real threshold sits between the two
 clusters.
+
+---
+
+## Steadying the skeleton
+
+The camera picks up real jitter, especially outdoors at five metres — you take
+up a small part of the frame, so the pose model's guess for a joint wobbles a
+little frame to frame even when you're holding dead still. The app smooths
+this out itself before it draws the skeleton, feeds a readout, or logs a shot,
+using a filter that eases off automatically the moment you actually move —
+so it can smooth hard while you're motionless at full draw (exactly when
+every number gets read) without dragging the skeleton behind you during the
+raise.
+
+The app also tries the steadier of MediaPipe's two pose models by default, and
+quietly switches to the lighter one on its own if your phone can't keep it
+running fast enough — you'll never see this happen, but the shot log always
+shows a small line saying which one ended up running and roughly how many
+frames per second it managed. If you ever see this line say "lite
+(auto-switched)", it's telling you the full model was too much for that
+phone on that day; nothing to act on, just useful to know.
 
 ---
 

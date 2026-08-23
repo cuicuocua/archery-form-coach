@@ -38,10 +38,13 @@ Rules the PM follows:
 
 - Plain HTML/CSS/JS, no build step, no npm/frameworks. Libraries load from CDN
   (jsDelivr) at runtime.
-- Pose tracking: MediaPipe Tasks Vision `PoseLandmarker` (`pose_landmarker_lite`
-  model, GPU delegate), imported directly from jsDelivr as an ES module in
-  `app.js`. Fallback considered but not built: MoveNet/TensorFlow.js, only if
-  MediaPipe proves unreliable on iPhone Safari.
+- Pose tracking: MediaPipe Tasks Vision `PoseLandmarker` (GPU delegate),
+  imported directly from jsDelivr as an ES module in `app.js`. Starts on the
+  `pose_landmarker_full` model for steadier landmarks; auto-falls-back to
+  `pose_landmarker_lite` if a short warm-up measurement finds this phone can't
+  keep full running fast enough (see Key decisions below). Fallback considered
+  but not built: MoveNet/TensorFlow.js, only if MediaPipe itself proves
+  unreliable on iPhone Safari.
 - Camera access (`getUserMedia`) requires a secure context (HTTPS or
   localhost). Local dev/testing uses `python3 -m http.server` + a Cloudflare
   quick tunnel (`cloudflared tunnel --url http://localhost:8000`) for a
@@ -57,12 +60,13 @@ Rules the PM follows:
 - `style.css` — full-screen dark UI, large tap targets, green/amber/grey
   color states for readouts, plus the shot log's clip button/no-clip note and
   the clip player's own styling.
-- `app.js` — all logic: MediaPipe setup, camera start/switch, per-frame pose
-  detection, skeleton drawing (via MediaPipe's own `DrawingUtils`) burned into
+- `app.js` — all logic: MediaPipe setup (with the full→lite pose-model
+  fallback), camera start/switch, per-frame pose detection, One Euro landmark
+  smoothing, skeleton drawing (via MediaPipe's own `DrawingUtils`) burned into
   the overlay canvas together with the raw camera frame — that combined
   canvas is what per-shot clip recording actually captures — the two angle
-  calculations, the shot log, clip recording/playback, and the calibration
-  constants block at the top of the file.
+  calculations, the shot log, clip recording/playback, and the constants
+  blocks (calibration, smoothing, pose model) at the top of the file.
 
 ## Key decisions
 
@@ -105,6 +109,47 @@ Rules the PM follows:
 - **Calibration constants are placeholders.** `BOW_ARM_ANGLE_MIN/MAX`,
   `DRAW_ELBOW_HEIGHT_MIN/MAX`, and `MIN_VISIBILITY` live in one clearly labeled
   block at the top of `app.js` — owner will tune these with a coach.
+  Two other labelled blocks near the same spot (`SMOOTH_*` and `MODEL_*`) hold
+  a completely different kind of constant — performance/feel knobs, not form
+  targets. Nothing in either block needs a coach: change them freely and judge
+  by eye (watch the skeleton, or a recorded clip afterwards).
+
+- **Landmark smoothing: a One Euro filter, not a plain moving average.** Raw
+  MediaPipe output is jittery outdoors — the archer occupies a small part of
+  the frame at five metres, so each frame's joint estimate lands slightly
+  differently even standing still. A fixed amount of smoothing is the wrong
+  trade either way: enough to kill that jitter at full draw also blurs the
+  fast raise into a laggy skeleton that trails behind the archer's real
+  position and throws off full-draw-detection timing; not enough to blur the
+  raise leaves full draw jittery. One Euro adapts instead — it smooths hard
+  when a joint is nearly still and lets go automatically the instant the joint
+  speeds up. That matters specifically because full draw (a compound archer
+  holding steady at let-off) is both the stillest moment of a shot AND the
+  exact moment every measurement gets taken — the case this filter is built
+  to help most. Implemented inline in `app.js` (`OneEuroFilter` /
+  `LandmarkSmoother` classes, no dependency added), filtering `x`/`y` per
+  landmark — never `visibility`, which is a confidence score, not a position,
+  and smoothing it would let a low-confidence joint's readout creep toward
+  looking trustworthy over a few frames. Tunables: `SMOOTH_MIN_CUTOFF` (lower
+  = calmer at rest), `SMOOTH_BETA` (higher = less lag when moving fast),
+  `SMOOTH_DCUTOFF` (rarely needs touching). Filter state resets whenever
+  tracking is lost or the camera is switched, so a stale position can never
+  smooth into a fresh one and drag the skeleton across the frame. Smoothed
+  landmarks feed everything downstream: the skeleton drawing (and therefore
+  the recorded clips), all three readouts, and the shot-log sampling.
+
+- **Pose model: `full` by default, with an automatic fallback to `lite`.**
+  `pose_landmarker_full` tracks more steadily than `lite` but costs more GPU
+  time per frame. Rather than guess which a given phone can afford, the app
+  times a short warm-up window right after startup (skipping the first
+  `MODEL_WARMUP_FRAMES`, since cold-start frames are never representative) and
+  switches itself to `lite` if the average frame took longer than
+  `MODEL_SLOW_FRAME_MS`. A failed rebuild never interrupts tracking — the app
+  just keeps running on whichever landmarker it already has. The owner cannot
+  watch this decision happen (see "owner cannot touch or read the phone"
+  above), so it is never shown live: instead, a small persistent line at the
+  top of the shot log (same spot as the clip-recording banner) records which
+  model ended up running and roughly how many frames per second it managed.
 - **Freeze button: removed.** The prototype originally had a manual freeze
   button plus an auto-freeze that triggered at full draw and released itself
   after a few seconds. Both are gone — the owner confirmed in the field that

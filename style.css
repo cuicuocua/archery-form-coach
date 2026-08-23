@@ -210,6 +210,17 @@ html, body {
   margin-bottom: 10px;
 }
 
+/* Persistent line recording which pose model ended up running and the measured frame rate — set
+   once, shortly after startup, and shown on every render after that (see setModelStatusLine in
+   app.js). Neutral/informational, not a warning like shotlog-banner above it — this is normal
+   operation, not something gone wrong. */
+#shotlog .shotlog-modelinfo {
+  opacity: 0.55;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 10px;
+}
+
 /* Big, obvious tap target for watching a shot's clip back — same reasoning as every other
    control in this app: the owner is standing at the phone, possibly in sunlight, wearing a
    release aid, not carefully lining up a small tap. */
