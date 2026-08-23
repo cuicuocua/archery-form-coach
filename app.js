@@ -257,6 +257,11 @@ const debugEl = document.getElementById("debug");
 if (DEBUG) debugEl.classList.remove("hidden");
 const btnLog = document.getElementById("btn-log");
 const shotLogEl = document.getElementById("shotlog");
+// renderShotLog() writes into this inner scrolling element, never into shotLogEl itself — the
+// close button lives outside it in the DOM (see index.html) specifically so a long log can never
+// scroll it out of reach. See HANDOVER.md Stage 1a.
+const shotLogContentEl = document.getElementById("shotlog-content");
+const shotLogCloseBtn = document.getElementById("shotlog-close");
 const clipPlayerEl = document.getElementById("clipplayer");
 const clipPlayerVideo = document.getElementById("clipplayer-video");
 const clipPlayerClose = document.getElementById("clipplayer-close");
@@ -2323,7 +2328,7 @@ function renderShotLog() {
       : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -2359,7 +2364,7 @@ function renderShotLog() {
   const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -2613,6 +2618,38 @@ btnMirror.addEventListener("click", () => {
 // as shots come in (see logShot), so there's nothing to render here beyond the toggle itself.
 btnLog.addEventListener("click", () => {
   shotLogEl.classList.toggle("hidden");
+});
+
+// Fixes HANDOVER.md Stage 1a: the log used to be the only way to dismiss itself, and it covered
+// the very 📋 button that does that. closeShotLog is now the one place "put the log away" happens,
+// called from the always-visible #shotlog-close button (never inside the scrolling content, so a
+// long log can't carry it out of reach) and from the tap-outside-to-close handler below.
+function closeShotLog() {
+  shotLogEl.classList.add("hidden");
+}
+
+shotLogCloseBtn.addEventListener("click", closeShotLog);
+
+// Convenience, not the fix itself (the close button above is): tapping anywhere outside the log
+// panel while it's open also dismisses it. Skips btn-log itself so this can never race that
+// button's own open/close toggle — without the guard, a tap on 📋 to close the log would first
+// close it here, then immediately reopen it when the toggle handler ran on the same click.
+//
+// Also skips anything inside the clip player. #clipplayer is a DOM sibling of #shotlog, not a
+// descendant, but it opens ON TOP of the log (z-index 20 vs 10 — see style.css) whenever the
+// owner taps "Watch" on a row, and stays a sibling the whole time it's open. Without this, every
+// tap inside the player while reviewing a clip — its own ✕ Close, the video's own transport
+// controls, a scrub — reads as "outside the log" and closes the log behind it, so closing the
+// clip would dump the owner back at the camera view instead of back at the log he was reading.
+// Checked by DOM containment rather than the player's hidden state, so it can't race the
+// player's own close handler: containment still holds even after that handler has already
+// hidden the player earlier in the same click's bubble phase. #clipplayer is the only thing that
+// currently opens above the log's z-index; give any future full-screen overlay the same
+// treatment here.
+document.addEventListener("click", (ev) => {
+  if (shotLogEl.classList.contains("hidden")) return;
+  if (shotLogEl.contains(ev.target) || clipPlayerEl.contains(ev.target) || ev.target === btnLog) return;
+  closeShotLog();
 });
 
 // The clip player: a full-screen takeover opened by tapping "Watch" on a shot log row. One
