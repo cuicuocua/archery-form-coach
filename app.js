@@ -37,6 +37,22 @@ const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much 
 const SHOT_MIN_PEAK_SEP_FRACTION = 0.8; // the attempt's peak hand separation must reach at least this fraction of FULL_DRAW_HAND_SEP_MIN (0.8 x 0.75 = 0.6 torso-lengths apart) to count as a real draw attempt — comfortably above the ~0.3-0.5 range nocking/lowering the bow produces, comfortably below the 0.75 that counts as full draw itself
 const SHOT_MIN_DURATION_MS = 600; // an attempt must last at least this long, from when hands first cross DRAW_ATTEMPT_MIN_SEP to when they drop back below it, to count as a real draw rather than a brief noise spike (a hand passing near the body, a tracking glitch) — a real compound draw, even a rushed one, takes real time to raise, draw and settle
 
+// A shot's logged numbers are the MEDIAN of each measure across every eligible (settled — see
+// PIPELINE SETTLING above) frame of the hold, computed independently per measure — not a single
+// "best" frame any more. See the block comment above medianSampleOf below for why this replaced
+// picking the frame with the highest hand separation: that rule turned out to be a biased sample,
+// not just an arbitrary one. MEDIAN_SAMPLE_CAP bounds how many eligible frames one attempt keeps
+// in memory — a stuck full-draw held near CLIP_MAX_MS (20s) at 60fps could otherwise see north of
+// 1000 frames land in one attempt's array, an unbounded growth this constant rules out. Frames are
+// kept via reservoir sampling (reservoirAdd below), not "first N seen" or "most recent N" — either
+// of those would quietly bias the median toward one part of the hold (the raise-to-hold transition
+// for "first N", late-session fatigue for "most recent N"); reservoir sampling gives every eligible
+// frame of the WHOLE hold an equal chance of being kept, so the cap changes precision, never which
+// part of the hold the median leans toward. 200 is comfortably above how many eligible frames a
+// normal 1-4 second hold produces at a typical 20-60fps (so most real holds are never subsampled at
+// all) while still bounding memory hard for the pathological case.
+const MEDIAN_SAMPLE_CAP = 200;
+
 // Shot log display-only cutoffs — NOT form targets like the numbers above. These decide when a
 // shot's own DEVIATION FROM THE OWNER'S OWN SESSION AVERAGE (see summarizeShots) gets coloured
 // as "close to your average" vs "worth a look", nothing more. No coaching authority behind
@@ -222,10 +238,12 @@ let debugInfo = null;
 
 // Shot log: a persistent record the owner can check after they've finished shooting, because
 // they cannot read the screen or tap anything while actually on the line (see CLAUDE.md). One
-// row per draw attempt — the best (highest hand-separation) frame seen during it, whether or
-// not it ever reached full draw — kept until the page reloads. No timer anywhere in this:
-// entries never expire or get overwritten just because time passed, only because a newer
-// attempt bumps an old one out of the last SHOT_LOG_MAX.
+// row per draw attempt, whether or not it ever reached full draw — kept until the page reloads.
+// Each measure on that row is the MEDIAN of that measure across every eligible frame of the
+// hold, not a single "best" frame (see medianSampleOf's own block comment for why — a real,
+// measured bias, not just a simplification). No timer anywhere in this: entries never expire or
+// get overwritten just because time passed, only because a newer attempt bumps an old one out of
+// the last SHOT_LOG_MAX.
 const SHOT_LOG_MAX = 10;
 let shotCount = 0; // total LOGGED attempts this session (see endAttempt) — keeps counting even once the log above fills up
 let log = []; // newest first
@@ -977,11 +995,15 @@ function isAtFullDraw(landmarks, nowMs, frameEligible) {
 //   - peakHandSep: the best hand separation seen on ANY frame, eligible or not. This is what
 //     the SHOT_MIN_PEAK_SEP_FRACTION gate in endAttempt below judges — whether the archer really
 //     drew the bow is a fact about what his hands did, unaffected by whether the pipeline had
-//     finished settling yet.
-//   - sample: the best hand separation seen on an ELIGIBLE frame only (frameEligible, see
-//     PIPELINE SETTLING above and isAtFullDraw) — null until one comes along. THIS is what
-//     actually gets logged if the attempt qualifies: an unsettled frame's own numbers must never
-//     become the shot's displayed reading, even though the attempt around it is completely real.
+//     finished settling yet. UNCHANGED by the move to medians below: "did he draw far enough to
+//     count as a shot at all" is still, correctly, a question about the single most extreme
+//     moment of the attempt, not an average across it.
+//   - eligibleFrames: every ELIGIBLE frame's sample (frameEligible, see PIPELINE SETTLING above
+//     and isAtFullDraw), kept via reservoirAdd so the array stays bounded (see
+//     MEDIAN_SAMPLE_CAP above) without biasing which part of the hold survives. THIS is what
+//     endAttempt below draws the shot's logged numbers from, each measure medianed
+//     independently — see medianSampleOf. An unsettled frame's own numbers must never become
+//     part of the shot's reading, even though the attempt around it is completely real.
 // startMs is tracked from the very first frame regardless of eligibility too, for the same
 // reason as peakHandSep — SHOT_MIN_DURATION_MS is about how long the draw actually took, not
 // about when the pipeline happened to finish settling.
@@ -993,7 +1015,7 @@ function trackShotAttempt(sample, nowMs) {
   if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
     const isNewAttempt = !attempt; // hands just left the resting position — a fresh attempt, not a continuation
     if (isNewAttempt) {
-      attempt = { startMs: nowMs, peakHandSep: sample.handSep, sample: null, reachedFullDraw: false };
+      attempt = { startMs: nowMs, peakHandSep: sample.handSep, eligibleFrames: [], eligibleSeen: 0, reachedFullDraw: false };
       // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
       // the time endAttempt fires the good part is already over. Starts regardless of this
       // frame's eligibility — the clip is a recording of what happened, not a measurement.
@@ -1001,13 +1023,129 @@ function trackShotAttempt(sample, nowMs) {
     } else if (sample.handSep > attempt.peakHandSep) {
       attempt.peakHandSep = sample.handSep;
     }
-    if (sample.eligible && (!attempt.sample || sample.handSep >= attempt.sample.handSep)) {
-      attempt.sample = sample;
+    if (sample.eligible) {
+      reservoirAdd(attempt, sample);
+      // "Did any settled frame reach true full draw" — a plain OR over every eligible frame this
+      // attempt has seen, independent of which frames the reservoir above happened to keep (a
+      // frame that gets evicted from the reservoir must not un-say that full draw was reached;
+      // the reservoir bounds MEMORY for the medians, it must never bound what this flag can see).
       attempt.reachedFullDraw = attempt.reachedFullDraw || !!sample.atFullDraw;
     }
   } else {
     endAttempt(nowMs);
   }
+}
+
+// Reservoir sampling (Algorithm R): keeps an UNBIASED random subset of up to MEDIAN_SAMPLE_CAP
+// items from a stream of unknown/unbounded length, without ever seeing the whole stream at once.
+// The first MEDIAN_SAMPLE_CAP items are kept outright; after that, the n-th item (1-indexed via
+// eligibleSeen) replaces a uniformly-random existing slot with probability MEDIAN_SAMPLE_CAP/n —
+// the standard proof that every item ends up equally likely to survive to the end, regardless of
+// when it arrived. That property is the whole point here: "first N" would bias toward the
+// raise-to-hold transition, "most recent N" would bias toward late-hold fatigue, but reservoir
+// sampling can't lean toward any part of the hold, so capping memory this way can only ever cost
+// precision, never introduce a NEW selection bias of the kind this file just spent Part 1 finding.
+function reservoirAdd(attempt, sample) {
+  attempt.eligibleSeen++;
+  if (attempt.eligibleFrames.length < MEDIAN_SAMPLE_CAP) {
+    attempt.eligibleFrames.push(sample);
+  } else {
+    const j = Math.floor(Math.random() * attempt.eligibleSeen);
+    if (j < MEDIAN_SAMPLE_CAP) attempt.eligibleFrames[j] = sample;
+  }
+}
+
+// Plain median of a list of numbers — the middle value once sorted, or the average of the two
+// middle values on an even count. Returns null on an empty list rather than NaN, so callers can
+// tell "no readable frames for this measure" apart from a real zero. Pure, no module state — so
+// selfTest can check it directly.
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Turns an attempt's kept eligible frames (see reservoirAdd above) into ONE shot entry, shaped
+// exactly like the single-frame `sample` object endAttempt used to log directly — everything
+// downstream (logShot, summarizeShots, renderShotRow, narrateMeasure) reads a shot entry the same
+// way regardless of which of the two ever produced it, so this is the only place that needed to
+// change to fix the bias Part 1 measured.
+//
+// THE FIX ITSELF: Part 1 found that scoring a shot from "the single frame with the highest hand
+// separation" was not just an arbitrary choice among equally-good frames — it was a BIASED one.
+// Hand separation is a distance divided by an estimated torso length, and torso length jitters
+// frame to frame (it's built from noisy landmarks too), so the frame that happens to look most
+// "drawn" is disproportionately the frame where the torso-length ESTIMATE happened to land small,
+// inflating the ratio. Shoulder drop divides by that same torso-length estimate, so whichever
+// shoulder shares hand-separation's own scale reference (draw-side, by default — see
+// isAtFullDraw) inherits the bias directly: measured, it ran the logged shoulder-drop reading
+// about half a percentage point high across repeated trials, consistently in the same direction
+// almost every time, not the coin-flip a merely arbitrary choice would produce. Bow-arm angle and
+// elbow alignment are plain angles at a joint — no division by torso length anywhere in their
+// maths — and measured close to zero, no consistent direction. That contrast is exactly what
+// confirms it's the division, not "any single frame is untrustworthy": a single frame is a fine
+// sample, but hand separation is a bad SELECTOR for which one to trust, because it's built from
+// the same shaky denominator as one of the numbers being reported.
+//
+// The fix is not "pick a better frame" — any selection rule based on a ratio that shares a
+// denominator with a reported measure would reintroduce the same problem in a new shape. Instead:
+// stop selecting a frame at all. Take the median of each measure independently across every
+// eligible frame of the hold. A median is robust to exactly the kind of one-frame excursion a
+// peak-selection rule goes looking for, and since no single frame gets to "win," there is no
+// longer a selection process for measurement noise to bias.
+//
+// Each measure's median is computed from only the frames where THAT measure was actually
+// readable (not null, not below MIN_VISIBILITY — see shoulderDropOf/bowArmAngleOf/
+// drawElbowAlignmentOf, which already return null rather than a guess) — one measure being
+// unreadable on some frames must never shrink another measure's sample, and a measure that was
+// unreadable on EVERY eligible frame comes back null here, which renders exactly like a single
+// uncertain reading always has (see updateBowArmReadout etc. and shotValueHtml).
+//
+// Elbow alignment is medianed via its SIGNED value (see drawElbowAlignmentOf's own comment: "8
+// high" and "8 low" must not be treated as the same number) and only turned back into a plain
+// deviation + high/low/level direction afterwards, for exactly the same reason the live readout
+// and the session average both already use `signed` rather than averaging deviation and
+// direction separately.
+//
+// handSep and the four instantaneous trigger flags (anchorOk/armOk/sepOk/stillOk) are diagnostic,
+// ?debug-only fields, not one of the four measures the owner reads (see renderShotRow's debugBit)
+// — but there is no longer a single "the" frame to read them off either. handSep gets the same
+// median treatment as the real measures, for consistency; the four booleans get a MAJORITY vote
+// (true if more than half the eligible frames were true) rather than either a median (undefined
+// for booleans) or reviving a selection rule to pick one frame's flags — "was this typically true
+// across the hold" is the honest question a debug line summarizing many frames can actually answer.
+function medianSampleOf(frames) {
+  const nums = (getValue) => frames.map(getValue).filter((v) => v != null);
+  const majority = (getValue) => {
+    const bools = frames.map(getValue).filter((v) => v != null);
+    if (bools.length === 0) return null;
+    return bools.filter(Boolean).length * 2 > bools.length;
+  };
+
+  const bowArmAngle = median(nums((f) => f.bowArmAngle));
+  const shoulderBow = median(nums((f) => f.shoulderDrop?.bow ?? null));
+  const shoulderDraw = median(nums((f) => f.shoulderDrop?.draw ?? null));
+  const elbowSigned = median(nums((f) => f.elbowAlign?.signed ?? null));
+  const elbowAlign =
+    elbowSigned == null
+      ? null
+      : {
+          deviation: Math.abs(elbowSigned),
+          direction: elbowSigned > 0 ? "high" : elbowSigned < 0 ? "low" : "level",
+          signed: elbowSigned,
+        };
+
+  return {
+    handSep: median(nums((f) => f.handSep)),
+    bowArmAngle,
+    shoulderDrop: { bow: shoulderBow, draw: shoulderDraw },
+    elbowAlign,
+    anchorOk: majority((f) => f.anchorOk),
+    armOk: majority((f) => f.armOk),
+    sepOk: majority((f) => f.sepOk),
+    stillOk: majority((f) => f.stillOk),
+  };
 }
 
 // Ends whatever attempt is in progress (if any). Called when hand separation drops back to
@@ -1026,7 +1164,7 @@ function trackShotAttempt(sample, nowMs) {
 //
 // A THIRD, separate case, checked only once the attempt has cleared both gates above: a real
 // draw attempt whose every single frame happened to be unsettled (see PIPELINE SETTLING above)
-// has no honest sample to log — attempt.sample is still null. This is NOT the same claim as
+// has no eligible frames to log — a.eligibleFrames is still empty. This is NOT the same claim as
 // rejectedAttemptCount (noise that was never plausibly a draw at all): the owner really did draw
 // the bow here, the app just never got a settled enough look at it to log a number. Counted and
 // reported separately — unsettledAttemptCount, its own line in the log — so the two can never be
@@ -1046,14 +1184,17 @@ function endAttempt(nowMs) {
     return;
   }
 
-  if (!a.sample) {
+  if (a.eligibleFrames.length === 0) {
     unsettledAttemptCount++;
     finalizeRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to
     renderShotLog();
     return;
   }
 
-  const shotNum = logShot({ ...a.sample, startMs: a.startMs, reachedFullDraw: a.reachedFullDraw });
+  // Each of the four real measures (plus the diagnostic handSep/flags) is the MEDIAN of its own
+  // eligible frames, computed independently — see medianSampleOf's own comment for the full
+  // reasoning and what this replaced.
+  const shotNum = logShot({ ...medianSampleOf(a.eligibleFrames), startMs: a.startMs, reachedFullDraw: a.reachedFullDraw });
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
@@ -2026,10 +2167,10 @@ function selfTest() {
   );
 
   // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand
-  // separation stays at/above DRAW_ATTEMPT_MIN_SEP, tracking its best (highest-separation)
-  // frame; it ends when separation drops back below that floor OR the pose is lost — but only
-  // gets LOGGED if it also cleared the SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS gates
-  // in endAttempt (added after the field report: without these, nocking an arrow or lowering
+  // separation stays at/above DRAW_ATTEMPT_MIN_SEP, collecting its eligible frames along the way
+  // (see reservoirAdd); it ends when separation drops back below that floor OR the pose is lost —
+  // but only gets LOGGED if it also cleared the SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS
+  // gates in endAttempt (added after the field report: without these, nocking an arrow or lowering
   // the bow was logging as a phantom shot). Reset to a clean slate here — the outer save/restore
   // above puts it all back afterwards regardless.
   attempt = null;
@@ -2077,7 +2218,9 @@ function selfTest() {
     log[0].shotNum === 1,
     "the first LOGGED attempt should be shot 1 — the rejected wiggle above must not have consumed a shot number"
   );
-  console.assert(log[0].handSep === 0.65, "the logged row should carry the attempt's peak hand separation");
+  // Eligible handSeps for this attempt were 0.4, 0.65, 0.6 — the MEDIAN (middle of the sorted
+  // three) is 0.6, not the peak (0.65, which only the SHOT_MIN_PEAK_SEP_FRACTION gate above uses).
+  console.assert(log[0].handSep === 0.6, "the logged row should carry the median hand separation across eligible frames, not the peak");
   console.assert(log[0].reachedFullDraw === false, "an attempt that never reached full draw must be marked as such");
 
   // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, and
@@ -2106,7 +2249,9 @@ function selfTest() {
   endAttempt(7700); // pose lost 700ms after the attempt started — long enough (>= 600ms)
   console.assert(log.length === 3, "pose loss on a qualified attempt must still log it");
   console.assert(log[0].shotNum === 3, "third logged attempt should be shot 3");
-  console.assert(log[0].handSep === 0.7, "the logged row should still carry the attempt's peak separation even though it ended via pose loss");
+  // Eligible handSeps were 0.4 and 0.7 — median of an even count is the average of the two middle
+  // values: (0.4 + 0.7) / 2 = 0.55.
+  console.assert(log[0].handSep === 0.55, "the logged row should carry the median hand separation across eligible frames even though the attempt ended via pose loss");
 
   // --- A further, separate attempt becomes its own row, not merged into the previous one.
   trackShotAttempt(sample(0.4), 8000);
@@ -2255,17 +2400,90 @@ function selfTest() {
   console.assert(unsettledAttemptCount === 1, "the unsettled attempt should be counted in unsettledAttemptCount specifically");
 
   // A real draw where the app was STILL unsettled during the raise but settles partway through:
-  // the logged row must come from the eligible frame(s) only, never the higher-handSep
-  // ineligible one that came before settling finished.
+  // the logged row's median must be computed from the eligible frame(s) only — the two ineligible
+  // frames (including the higher-handSep one) must never enter the median at all, not even diluted
+  // in with the eligible ones.
   trackShotAttempt(sample(0.4, false, false), 21000); // crosses the floor, unsettled
   trackShotAttempt(sample(0.95, false, false), 21400); // higher handSep, but STILL unsettled — must never be logged
-  trackShotAttempt(sample(0.8, true, true, { bowArmAngle: 171 }), 21800); // settles now — lower handSep than the unsettled peak, but this is the one that must be used
+  trackShotAttempt(sample(0.8, true, true, { bowArmAngle: 171 }), 21800); // settles now — the ONLY eligible frame this attempt has
   trackShotAttempt(sample(0.05), 22400); // ends — 1400ms elapsed
   console.assert(log.length === 1, "an attempt that settles partway through should still log, once it has an eligible frame");
+  // Exactly one eligible frame — the median of a single value is that value itself, so this also
+  // covers "a single-frame attempt still works" from a real trackShotAttempt/endAttempt run, not
+  // just a direct call into medianSampleOf.
   console.assert(log[0].handSep === 0.8, "the logged reading must come from the eligible frame (0.8), not the higher-handSep unsettled one (0.95)");
   console.assert(log[0].bowArmAngle === 171, "the logged reading's other fields must also come from the eligible frame, not an unsettled one");
   console.assert(log[0].reachedFullDraw === true, "reachedFullDraw should reflect the eligible frame's own atFullDraw reading");
   console.assert(unsettledAttemptCount === 1, "a settled-in-time attempt must not also be counted as unsettled");
+
+  // --- Shot log MEDIAN aggregation: median(), reservoirAdd(), and medianSampleOf() — the fix
+  // Part 1's bias measurement led to. See medianSampleOf's own block comment for the full
+  // reasoning; these check the specific properties the fix promises.
+  {
+    // median(): plain odd/even/empty behaviour.
+    console.assert(median([3, 1, 2]) === 2, "median of an odd count should be the sorted middle value");
+    console.assert(median([1, 2, 3, 4]) === 2.5, "median of an even count should average the two middle values");
+    console.assert(median([5]) === 5, "median of a single value should be that value");
+    console.assert(median([]) === null, "median of an empty list should be null, not NaN or 0");
+
+    // medianSampleOf: each measure's null frames are excluded from THAT measure's median only —
+    // one measure being unreadable on a frame must never shrink another measure's sample. Built
+    // directly (not through trackShotAttempt) so the fixture can hand-place nulls precisely.
+    const mixedFrames = [
+      { handSep: 0.8, bowArmAngle: 170, shoulderDrop: { bow: 40, draw: null }, elbowAlign: { signed: 2 }, anchorOk: true, armOk: true, sepOk: true, stillOk: true, atFullDraw: true },
+      { handSep: 0.82, bowArmAngle: null, shoulderDrop: { bow: 42, draw: 50 }, elbowAlign: { signed: -2 }, anchorOk: true, armOk: false, sepOk: true, stillOk: true, atFullDraw: false },
+      { handSep: 0.78, bowArmAngle: 174, shoulderDrop: { bow: 44, draw: 52 }, elbowAlign: null, anchorOk: false, armOk: true, sepOk: false, stillOk: true, atFullDraw: false },
+    ];
+    const mixedResult = medianSampleOf(mixedFrames);
+    console.assert(mixedResult.handSep === 0.8, "handSep median should use all 3 frames (0.78, 0.8, 0.82 -> 0.8)");
+    console.assert(mixedResult.bowArmAngle === 172, "bowArmAngle median should skip the 1 null frame and use the other 2 (170, 174 -> 172)");
+    console.assert(mixedResult.shoulderDrop.bow === 42, "bow-shoulder median should use all 3 frames (40, 42, 44 -> 42)");
+    console.assert(mixedResult.shoulderDrop.draw === 51, "draw-shoulder median should skip its 1 null frame and use the other 2 (50, 52 -> 51)");
+    console.assert(mixedResult.elbowAlign.signed === 0, "elbow median should skip its 1 null frame and use the other 2 (2, -2 -> 0)");
+    console.assert(mixedResult.elbowAlign.direction === "level", "an elbow median of exactly 0 should report direction: level, same convention as a live 0deg reading");
+    // Majority vote on the boolean flags: anchorOk true on 2/3, armOk true on 2/3, sepOk true on
+    // 2/3, stillOk true on 3/3 — each independently, not tied to any one frame's own flag set.
+    console.assert(mixedResult.anchorOk === true && mixedResult.armOk === true && mixedResult.sepOk === true && mixedResult.stillOk === true, "boolean flags should be a majority vote across the eligible frames, computed independently per flag");
+
+    // A measure with NO readable frames at all must come back null — renders exactly like a
+    // single uncertain reading already does (see updateBowArmReadout/shotValueHtml), never a
+    // fabricated number and never NaN.
+    const allNullBowArm = [
+      { handSep: 0.8, bowArmAngle: null, shoulderDrop: { bow: 40, draw: 50 }, elbowAlign: { signed: 1 }, anchorOk: true, armOk: true, sepOk: true, stillOk: true, atFullDraw: true },
+      { handSep: 0.8, bowArmAngle: null, shoulderDrop: { bow: 41, draw: 51 }, elbowAlign: { signed: 1 }, anchorOk: true, armOk: true, sepOk: true, stillOk: true, atFullDraw: true },
+    ];
+    const allNullResult = medianSampleOf(allNullBowArm);
+    console.assert(allNullResult.bowArmAngle === null, "a measure that was unreadable on every eligible frame must come back null, not skip the other measures");
+    console.assert(allNullResult.shoulderDrop.bow === 40.5, "a sibling measure with real readings must still get its own median even when bowArmAngle is entirely null");
+
+    // The actual bias fix, demonstrated directly: an obvious one-frame excursion (the shape of a
+    // torso-length underestimate spiking hand separation for a single frame — see Part 1) must
+    // NOT move the reported value the way the old peak-selection rule did. Sixteen frames sitting
+    // tight around bowArmAngle 170, plus ONE wild outlier frame at 200 with the highest handSep in
+    // the set (so the OLD rule would have picked exactly that frame and reported 200).
+    const excursionFrames = [];
+    for (let i = 0; i < 16; i++) excursionFrames.push({ handSep: 0.8, bowArmAngle: 170, shoulderDrop: { bow: 45, draw: 45 }, elbowAlign: { signed: 0 }, anchorOk: true, armOk: true, sepOk: true, stillOk: true, atFullDraw: true });
+    excursionFrames.push({ handSep: 0.99, bowArmAngle: 200, shoulderDrop: { bow: 80, draw: 80 }, elbowAlign: { signed: 30 }, anchorOk: true, armOk: true, sepOk: true, stillOk: true, atFullDraw: true });
+    const oldRuleWouldPick = excursionFrames.reduce((best, f) => (f.handSep >= best.handSep ? f : best));
+    console.assert(oldRuleWouldPick.bowArmAngle === 200, "sanity check: the fixture's excursion frame really is the one the old peak-handSep rule would have picked");
+    const excursionResult = medianSampleOf(excursionFrames);
+    console.assert(excursionResult.bowArmAngle === 170, `the median must land on the tight cluster (170), not the excursion (200) the old rule would have reported, got ${excursionResult.bowArmAngle}`);
+    console.assert(excursionResult.shoulderDrop.bow === 45, "same for shoulder drop: median stays at the cluster (45), not the excursion (80)");
+
+    // reservoirAdd: bounds memory (never grows past MEDIAN_SAMPLE_CAP) no matter how many eligible
+    // frames one attempt sees, while eligibleSeen keeps an honest count of the true total.
+    const reservoirAttempt = { eligibleFrames: [], eligibleSeen: 0 };
+    const totalFed = MEDIAN_SAMPLE_CAP + 137;
+    for (let i = 0; i < totalFed; i++) reservoirAdd(reservoirAttempt, { handSep: i / totalFed, bowArmAngle: 170, shoulderDrop: { bow: 45, draw: 45 }, elbowAlign: { signed: 0 } });
+    console.assert(reservoirAttempt.eligibleFrames.length === MEDIAN_SAMPLE_CAP, `reservoir must cap at MEDIAN_SAMPLE_CAP (${MEDIAN_SAMPLE_CAP}) frames, has ${reservoirAttempt.eligibleFrames.length}`);
+    console.assert(reservoirAttempt.eligibleSeen === totalFed, "eligibleSeen must keep counting every frame offered, even ones the reservoir didn't keep");
+    // Every kept frame's handSep is a real value from the fed stream (0..1, i/totalFed) — the
+    // simplest smoke check that eviction swaps in real items rather than corrupting slots.
+    console.assert(
+      reservoirAttempt.eligibleFrames.every((f) => f.handSep >= 0 && f.handSep < 1),
+      "every frame the reservoir kept should still be one of the real fed samples, not a corrupted or missing slot"
+    );
+  }
 
   // --- Feature A: shoulder drop = ear-to-shoulder gap, normalised by torso length, as a %.
   // Same-side ear preferred, falling back to the other ear (or to null) when it's occluded —
