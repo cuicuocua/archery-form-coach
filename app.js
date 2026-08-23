@@ -243,6 +243,8 @@ const L_EAR = 7, R_EAR = 8;
 const video = document.getElementById("video");
 const canvas = document.getElementById("overlay");
 const ctx = canvas.getContext("2d");
+const stageEl = document.getElementById("stage");
+const cameraBoxEl = document.getElementById("camerabox");
 const statusEl = document.getElementById("status");
 const btnCamera = document.getElementById("btn-camera");
 const btnHand = document.getElementById("btn-hand");
@@ -1061,8 +1063,66 @@ function sizeCanvasToVideo() {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
   }
+  layoutCameraBox(); // the on-screen box's shape depends on these same dimensions — see its own comment
 }
 video.addEventListener("loadedmetadata", sizeCanvasToVideo); // module-scope, attached once — covers first startup, every later camera switch, and late-arriving dimensions alike
+
+// Sizes #camerabox (in index.html/style.css) to the largest box of the camera's own aspect ratio
+// that fits inside #stage, centred — the letterbox fix. Without this, #camerabox (and therefore
+// #video/#overlay, which always fill it at 100%x100%) was stretched to fill #stage's own box
+// (100vw x 100dvh, i.e. whatever shape the screen happens to be), and a <canvas> has no
+// `object-fit` of its own to correct that the way <video> does — so on any screen shape that
+// doesn't already match the camera's native aspect ratio, the picture visibly stretched. That
+// mismatch is small with the browser address bar taking up part of the screen, and much more
+// visible with it gone (launched from the Home Screen, `display-mode: standalone`) — see
+// HANDOVER.md. This ONLY changes the on-screen CSS box: canvas.width/height (the actual pixel
+// buffer every measurement and every recorded clip uses — see toPixelSpace and
+// startClipRecording's canvas.captureStream) are untouched, set purely from
+// video.videoWidth/videoHeight exactly as before. #video and #overlay both stay at 100%x100% of
+// this box (see style.css), so they are always scaled by the exact same factor and stay
+// pixel-registered with each other — there is no separate letterboxing calculation for each.
+function layoutCameraBox() {
+  if (!(video.videoWidth > 0 && video.videoHeight > 0)) return;
+  const stageWidth = stageEl.clientWidth;
+  const stageHeight = stageEl.clientHeight;
+  if (!stageWidth || !stageHeight) {
+    // #stage hasn't been laid out yet — seen right after a fresh page load, before the browser's
+    // first layout/paint pass, which is exactly when startCamera() calls this directly (found by
+    // testing, not assumed: a headless run hit this race on its very first call). Nothing sane to
+    // compute yet, but this must not just give up — the only other callers are event listeners
+    // (loadedmetadata/resize/orientationchange) that aren't guaranteed to fire again on their own,
+    // so a box left unsized here could stay unsized (and therefore still stretched, the exact bug
+    // this function exists to fix) for the rest of the session. Try again next frame instead.
+    requestAnimationFrame(layoutCameraBox);
+    return;
+  }
+  const cameraAspect = video.videoWidth / video.videoHeight;
+  const stageAspect = stageWidth / stageHeight;
+  let boxWidth, boxHeight;
+  if (cameraAspect > stageAspect) {
+    // Camera is relatively wider than the screen: full width, letterbox bars top/bottom.
+    boxWidth = stageWidth;
+    boxHeight = boxWidth / cameraAspect;
+  } else {
+    // Camera is relatively taller (or equal): full height, letterbox bars left/right.
+    boxHeight = stageHeight;
+    boxWidth = boxHeight * cameraAspect;
+  }
+  cameraBoxEl.style.width = `${boxWidth}px`;
+  cameraBoxEl.style.height = `${boxHeight}px`;
+}
+// Re-run whenever the SCREEN's shape can change, not just the camera's — the camera's own
+// dimensions don't change without a loadedmetadata event (already handled by sizeCanvasToVideo
+// above), but the viewport does: rotating the phone, and — the specific case from HANDOVER.md —
+// iOS Safari's address bar showing or hiding, which changes the available height without any
+// camera event firing at all. `resize`/`orientationchange` alone can miss that address-bar case on
+// some iOS versions, so `visualViewport`'s own resize event (where available) is also wired up as
+// a second path to the same call — cheap and idempotent either way if both happen to fire.
+window.addEventListener("resize", layoutCameraBox);
+window.addEventListener("orientationchange", layoutCameraBox);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", layoutCameraBox);
+}
 
 // Whether a given camera mirrors by default, before the owner's manual toggle is factored in.
 // Front camera ("user") defaults to mirrored, matching what people expect of a selfie view; rear

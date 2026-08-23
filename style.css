@@ -25,9 +25,33 @@ html, body {
   width: 100vw;
   height: 100dvh;
   background: var(--bg);
+  /* #camerabox below is a normal (non-absolutely-positioned) flex child, sized in JS
+     (layoutCameraBox in app.js) to the camera's own aspect ratio and centred here — this is the
+     letterboxing. Every other direct child of #stage (#status, #debug, #shotlog, #readouts,
+     #controls, #clipplayer) is still position:absolute/inset:0 and so is untouched by this: an
+     absolutely-positioned element takes no part in its container's flex layout and keeps covering
+     the full #stage exactly as before. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-/* Video fills the screen. Never transformed by CSS any more — mirroring is done by flipping the
+/* Holds the camera's native aspect ratio so the canvas — which has no object-fit of its own — is
+   never stretched into a box shaped differently from the pixel buffer it draws into. #video and
+   #overlay both fill this box at 100%x100% (see below), so as long as this box's own aspect ratio
+   matches the camera frame, both elements are scaled by the exact same uniform factor and stay
+   pixel-registered with each other; only the box itself (sized by layoutCameraBox in app.js, once
+   the video reports real dimensions, and re-run on resize/orientation change) ever has letterbox
+   bars around it. Before the camera has started this defaults to filling #stage entirely, same as
+   the old unconditional 100%x100% behaviour, so there's nothing to letterbox around while the
+   status text is still showing. */
+#camerabox {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* Video fills its box. Never transformed by CSS any more — mirroring is done by flipping the
    canvas's own pixels instead (see withMirror in app.js), so a recorded clip matches what was on
    screen. This element is fully covered every frame by the opaque canvas painted on top of it
    (same inset:0/100%x100% box, so there's no gap at any edge for it to show through). */
