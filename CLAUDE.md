@@ -79,13 +79,92 @@ Rules the PM follows:
   right (and swapped for left-handed). Toggle button, default right-handed.
 - **Bow-arm line** = angle at the bow elbow between shoulder→elbow and
   elbow→wrist vectors (180° = straight arm).
-- **Draw-elbow height** = NOT a raw angle off the shoulder line — the shoulder
-  line is nearly degenerate in a side-on view (both shoulders project close
-  together in x), so instead we measure the draw elbow's vertical pixel offset
-  from the draw shoulder and express it as `atan2(verticalOffset, torsoLength)`
-  in degrees, using shoulder-to-hip distance as the scale reference (draw side
-  preferred, bow side as fallback). This stays meaningful even when the
-  shoulder line itself is unreliable. Documented inline in `app.js`.
+- **Draw-elbow alignment** (`drawElbowAlignmentOf`, labelled "Elbow ↔ arrow
+  line" in the UI) = the angle **at the draw wrist** between the ray to the bow
+  wrist and the ray to the draw elbow. 180° means bow wrist, draw wrist and
+  draw elbow lie on one straight line — the elbow sitting exactly behind the
+  arrow. `deviation = 180 − angle`, so 0 = dead in line. High/low is read from
+  vertical position only, never a cross-product sign, so it survives mirroring
+  and the handedness toggle. **This description was corrected on 2026-08-24.**
+  This entry previously described a *different, deleted* measure — draw-elbow
+  *height*, a shoulder-relative `atan2(verticalOffset, torsoLength)`. That
+  algorithm is gone: `app.js` contains zero occurrences of `atan2`, and
+  `drawElbowAlignmentOf`'s own comment records that it "replaces the old
+  draw-elbow-height readout, which measured height off the wrong thing." Code,
+  UI label and constant name (`DRAW_ELBOW_ALIGN_MAX_DEVIATION`) all agreed with
+  each other; only this file was stale. Verified directly, not inferred.
+
+- **The draw-elbow measure pivots on a proxy point, and that is the leading
+  explanation for the field session's 19°-low reading.** Unlike `bowArmAngleOf`,
+  whose three points are the actual joints of the limb being measured, this
+  measure's vertex — the draw wrist landmark — stands in for a different
+  physical point: the nock / string contact near the anchor. With a release aid
+  the two are centimetres apart, and the error is close to linear at **≈3° per
+  centimetre** of perpendicular offset (computed, not guessed). 19° corresponds
+  to roughly 6.5cm, which is entirely plausible hand-and-gear geometry. That
+  also explains the part that looked most like a form fault: the reading was
+  *identical on every shot of the session*, which is what a fixed geometric
+  offset produces and what a real elbow — which fatigues and drifts — would
+  not. **A fixed bias of this kind is invisible to every guard in this file**:
+  `ELBOW_CONSISTENCY_FLOOR_DEG`, the medians, and the settle gates all reject
+  frame-to-frame *noise*, and none of them can see an offset that is the same
+  on every frame. **Do not move `DRAW_ELBOW_ALIGN_MAX_DEVIATION` to accommodate
+  19°** until the photo test below has been done — that would bury a
+  measurement bug inside one of the owner's two actual coaching goals.
+  **What settles it** (nothing else can, including further analysis): one
+  side-on full-draw photo with the arrow shaft visible from the anchor back
+  past the elbow. If the shaft passes near the elbow but the app says 19°, it
+  is the proxy offset and the fix is a reference point closer to the true
+  anchor. If the shaft really runs 19° off the elbow, the measurement is right
+  and only then does the threshold get retuned, with real numbers.
+- **Hand separation cannot be rescued by retuning. The poses come out in the
+  wrong ORDER, so there is no gap to put a threshold in.** Measured 2026-08-24
+  against a synthetic body, with the probe first proven faithful by reproducing
+  `selfTest`'s own aspect-ratio fixture exactly (1.988 → 1.157). At roughly the
+  camera angle the owner's own field data implies (~45° off perpendicular, back-
+  derived from his 2026-08-23 full-draw reading of 1.13): resting 0.56, walking
+  1.10, **full draw 1.17**, nocking 1.33, mid-raise 1.45. Nocking an arrow and
+  raising the bow both read as *more drawn than full draw*, and this holds at
+  every angle tested including 90°. Cause: the measure is a scalar distance, so
+  it sums total arm spread and discards direction — "bow arm out one way, draw
+  arm out the other" (nocking, mid-raise) geometrically beats "bow arm out,
+  draw hand tucked at the jaw" (real full draw). Independently corroborated
+  without the synthetic model at all: a live 1,497-sample session of the owner
+  **standing still in a kitchen, not shooting** produced a median of 1.07 —
+  above `DRAW_ATTEMPT_MIN_SEP` 97% of the time and above
+  `FULL_DRAW_HAND_SEP_MIN` 67% — which is essentially the same number as his
+  real full draw. It logged 12 draws and called 5 of them arrows.
+  Orientation sensitivity is separately severe: a fixed full-draw body swings
+  from 1.571 to 0.247 as the camera rotates, crossing below the 0.75 threshold
+  at ~65°, so a real full draw reads as "not drawn" from a phone placed 25° off.
+  This is NOT the aspect-ratio bug wearing a new hat — portrait and landscape
+  numbers matched to 1e-16; `toPixelSpace` is correct and orthogonal to this.
+
+- **The anchor check is the signal to build on, and it is currently excluded
+  from the decisions that matter.** Same measurement run: full draw reads
+  0.08–0.10, resting ~1.40, walking ~1.37 — a factor of fifteen, and it barely
+  moves with camera angle, because it asks whether the draw hand is *at the
+  face* (a relationship between two parts of one body) rather than how far
+  apart two things are. In the live kitchen session it was the only one of the
+  four gates that never produced a false pass. **But `trackShotAttempt` /
+  `endAttempt` never consult it**: attempt-opening, `SHOT_MIN_PEAK_SEP_FRACTION`
+  and shot-counting all run on raw hand separation alone, and `anchorOk` only
+  feeds `reachedFullDraw`. So the one trustworthy gate is structurally barred
+  from the path that generates phantom rows. Anchor alone does not separate
+  full draw from mid-raise (the hand is already near the head mid-raise) —
+  stillness and duration have to carry that, which compound let-off makes easy:
+  you hold at full draw, you do not hold mid-raise. **Any redesign starts from
+  anchor + stillness + duration, not from a better distance threshold.**
+
+- **`reachedFullDraw` is a single-frame OR and that is too weak a bar.** It is
+  true if *any one* eligible frame had all four gates aligned. Across a session
+  of hundreds of frames with the anchor check flickering, a few chance
+  alignments are inevitable — that is how 3 of tonight's 12 kitchen rows became
+  "arrows" despite the row's own median reading `anchor fail`. This is the same
+  mistake the median-of-eligible-frames work already corrected once for
+  *measurements*, still living in the full-draw *test*. Fix it the same way:
+  require a sustained condition, not a lucky instant.
+
 - **The owner cannot touch or read the phone while shooting.** They are on a
   shooting line five metres away, holding a drawn compound bow, looking at a
   target. They cannot tap a button, read a number, or take a screenshot at any
@@ -750,13 +829,18 @@ Rules the PM follows:
 
 ## Open work
 
-- **Retune the detection thresholds.** `FULL_DRAW_HAND_SEP_MIN`,
-  `DRAW_ATTEMPT_MIN_SEP`, `FULL_DRAW_ANCHOR_MAX`, `FULL_DRAW_STILL_MAX`,
-  `SHOT_MIN_PEAK_SEP_FRACTION` and the two `ATTENTION_REST_*` constants were all
-  chosen against geometry that has since been corrected. **Do not guess at new
-  values** — get a real session's `hand sep` figures off the shot log first. A
-  field session on 2026-08-23 read 1.13, which is the plausible range; the 2.3
-  that exposed the original bug is gone.
+- **Rebuild attempt detection around anchor + stillness + duration.** Supersedes
+  the old "retune the detection thresholds" item, which is now answered: see the
+  two Key decisions above. Retuning `FULL_DRAW_HAND_SEP_MIN` is proven not to
+  work at any value, because nocking and mid-raise read as more drawn than full
+  draw. The work is (a) stop `trackShotAttempt`/`endAttempt` gating on raw hand
+  separation, (b) make `reachedFullDraw` a sustained condition rather than a
+  single-frame OR, (c) re-derive `DRAW_ATTEMPT_MIN_SEP`,
+  `SHOT_MIN_PEAK_SEP_FRACTION` and the two `ATTENTION_REST_*` constants against
+  whatever replaces it, since all of them are defined in hand separation's
+  units and cannot simply be carried over. **Still do not guess values** — this
+  needs the recorded-footage harness working (see Testing) so a change can be
+  measured against real frames instead of argued about.
 - **Do clips actually record on the owner's iPhone?** Unknown. Failures now name
   themselves on the row. If every row reports the same failure, canvas-stream
   recording is likely unviable on that Safari version, and the fallback —
@@ -855,3 +939,43 @@ Manual only: run locally via `python3 -m http.server`, check in a desktop
 browser first (camera + toggles + shot log), then via the Cloudflare tunnel URL
 on iPhone Safari for the real side-on shooting test. See README.md for exact
 commands.
+
+### Recorded-footage harness (built 2026-08-24, NOT yet working end to end)
+
+The owner recorded a 95s portrait session (varied shot speeds, deliberately
+varied shoulder heights, plus walking away at the start and up to the camera at
+the end as fringe cases). It lives at `fixtures/session-2026-08-24.mov`.
+**`fixtures/` and every video extension are gitignored — this repo is public and
+that footage must never reach it. Do not remove those rules.**
+
+The intent: feed a recording to the app in place of the camera, so the whole
+real pipeline (crop, smoothing, settling, detection, shot log, clips) runs on
+identical footage every time and a threshold change can be measured rather than
+argued about. Right now every engineer verifies against synthetic stick-figures
+because the sandbox has no camera; this would replace that with reality.
+
+Built so far, all working:
+- `harness.html` — **generated from `index.html`, never hand-edited, gitignored.**
+  A `python3` one-liner re-injects a `<script>` before the module tag that
+  overrides `getUserMedia` to return `captureStream()` from a `<video>` playing
+  the fixture. Regenerate it whenever `index.html` changes; because it is
+  derived, it cannot drift. No test hooks in `app.js` — this is entirely outside
+  the app, per the standing rule.
+- A range-request-capable local server (`python3 -m http.server` returns 200 for
+  a `Range:` request, which Chrome's media stack will not accept). It must also
+  cap each range response — returning a whole 127MB file in one write stalls
+  Chrome indefinitely.
+
+**Where it is blocked:** Chrome would not decode the video at all — direct URL,
+blob URL, and re-typed blob all sat at `readyState 0`, `networkState 2`, with no
+`error` event, after 12s. Ruled out by direct test: the container (transcoded
+`.mov`→`.mp4`), HEVC (transcoded to H.264 via macOS `avconvert`, no `ffmpeg`
+here), the H.264 profile (verified Main 3.1 and High 4.0 by reading `avcC` out
+of the file), the MIME type (`video/mp4` on both the response and the blob), and
+the server (127MB in 51ms by curl; range requests return 206). It stalls
+identically for every variant, which points at the browser instance rather than
+the media. **Next step is to try a different browser or a plain `file://` page
+before touching the harness again — the harness itself is probably fine.**
+
+Once it works, the permanent version is a small `?video=` option inside `app.js`
+gated behind `?debug`, which removes the generated-harness step entirely.
