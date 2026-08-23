@@ -505,6 +505,128 @@ Rules the PM follows:
   print under the plain-English sentence, and — unlike the watchdog case —
   is never cleared, since `main()` has given up for the rest of the session.
 
+- **Routine-start attention gating: the pipeline idles between shots and wakes
+  itself up, but it never stops watching.** Field report: "between shots I
+  move around a lot even just to nock the next arrow and I'd like to contain
+  the app functionality to only when I'm actually shooting." Until this,
+  every frame ran the full pipeline continuously, whether the owner was
+  mid-shot or nocking, turning to the quiver, or twenty feet away collecting
+  arrows. `ATTENTION_GATING_ENABLED` (master on/off switch, same escape hatch
+  as `ROI_CROPPING_ENABLED`) turns on a two-state gate — `attentionEngaged`
+  (full rate, every frame) vs. idle (pose detection throttled to once every
+  `ATTENTION_IDLE_SAMPLE_INTERVAL_MS`, currently 150ms) — sitting in front of
+  everything else in `renderLoop`. Idle is never "off": it is structurally
+  impossible for the app to stop watching altogether, because the idle-rate
+  sample never stops running on its own throttle, independent of any
+  threshold getting tuned right. That is the "cannot latch off" guarantee the
+  brief asked for — it does not depend on the calm/engage logic being
+  correct, only on the throttle itself never being skipped, which
+  `updateAttentionState`'s selfTest proves directly (adversarial idle/wake
+  cycling, and a `gatingEnabled` parameter threaded through explicitly, the
+  same convention `nowMs`/`frameEligible` already use, so the master switch
+  is provable without a mutable module constant).
+
+  **The owner's explicit instruction, and the one rule everything here is
+  built around: when this detector is unsure, it fails toward RECORDING, not
+  toward idling.** His words: "fail toward recording, keep the ignored count
+  visible" — a phantom row is visible and he can say so; a missed arrow is
+  invisible and he never knows. In code this is a deliberate asymmetry, not a
+  slogan: `attentionIsClearlyCalm` is the one signal both directions share,
+  but the two callers trust opposite defaults. Allowing the app to idle
+  requires POSITIVE, continuous proof of calm — hands relaxed together (or
+  nobody in frame at all) AND the body not stepping/walking, held for
+  `ATTENTION_IDLE_AFTER_MS` (1.5s) straight, not just one lucky sample.
+  Staying idle requires that same proof to keep holding, sample to sample —
+  anything else at all (a wrist not visible, hands apart, the body moving, an
+  attempt already in progress) wakes it back up on that very sample, no
+  confirmation, no cooldown. **Do not add a "wait for a second confirming
+  sample before waking up" step, or any other change that makes waking up
+  more reluctant — that would quietly reverse the owner's explicit
+  instruction.** Anything the detector legitimately can't avoid — an idle
+  period happening at all, or a wake-up landing after a movement had already
+  started (see below) — is counted and shown in the shot log, worded
+  differently from the existing `rejectedAttemptCount`/`unsettledAttemptCount`
+  lines on purpose: `attentionIdlePeriods` means "the app throttled itself
+  between shots to save battery," never "a movement was thrown away."
+
+  **PIPELINE SETTLING, worked through as the brief asked.** A frame can't
+  score a shot until `SETTLE_FRAMES_REQUIRED` consecutive good-tracking
+  frames have passed since the last reset, and idling introduces a new kind
+  of reset the moment the app wakes back up: `updateAttentionState` resets
+  `landmarkSmoother`, the settling counter, and the ROI crop box — the exact
+  same three things every other recovery point in this file resets (session
+  start, tracking lost, camera switched) — and does it *before* returning, so
+  the very frame that wakes the app up already runs its own
+  smoothing/settling/`isAtFullDraw` against the fresh state, not the frame
+  after. Getting that ordering right matters: doing it a frame late would let
+  a frame right after a long idle gap read as "already settled" just because
+  `settledFrames` happened to be high from a streak that ended seconds
+  earlier — precisely the bias the PIPELINE SETTLING work already spent real
+  effort removing, reappearing in a new shape. Going idle itself resets
+  nothing — there is nothing worth resetting for, since `attempt` is null by
+  construction the whole time the app is idle (see the hard rule below), so
+  no idle-rate sample's numbers can ever reach the shot log unsettled.
+
+  **Signal, deliberately kept simple.** Hand separation (bow wrist to draw
+  wrist, scaled by torso length — the same `Math.hypot(...)/torsoLength(...)`
+  convention `DRAW_ATTEMPT_MIN_SEP`/`FULL_DRAW_STILL_MAX` already use, kept in
+  its own small function rather than reaching into `isAtFullDraw`'s own
+  computation so the two changes never collide on the same lines) plus
+  whole-body stillness (the hip midpoint's drift, same convention) are the
+  only two signals used. "Standing side-on" specifically was considered and
+  left out: side-on-ness is hard to read reliably from a single camera's
+  landmark visibility alone, and — since idling only ever costs battery,
+  never correctness (see the fail-toward-recording asymmetry above) — the
+  generous engage side of the gate already covers the case a stricter
+  orientation check would have tried to add.
+
+  **Numeric invariants, both enforced by `selfTest`.**
+  `ATTENTION_REST_HAND_SEP_MAX` (0.2) sits below `DRAW_ATTEMPT_MIN_SEP` (0.3)
+  on purpose — hands cannot read as "calm" by this feature's own standard
+  while also being far enough apart to count as an in-progress attempt, which
+  is what makes the explicit hard rule in `updateAttentionState` ("an attempt
+  in progress is never allowed to idle") true by construction, not just by
+  the rule itself. `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` (150ms) sits well
+  under `SHOT_MIN_DURATION_MS` (600ms), so a genuine draw can never start and
+  finish entirely inside one blind idle-rate gap and go completely unnoticed.
+  A softer, empirical risk sits alongside that hard guarantee and is *not*
+  fully eliminated: a wake-up can land after a movement has already started
+  (an idle-rate sample simply hasn't run yet), which backdates that attempt's
+  measured `startMs` to the wake instant rather than the true start — shaving
+  up to one idle-sample-interval off its *measured* duration. Counted
+  separately as `attentionLateWakeCount` for exactly this reason. Verified
+  directly (see the PM's verification report): a draw whose real motion was
+  only ~850ms — comfortably over `SHOT_MIN_DURATION_MS` but not by a wide
+  margin — starting immediately after a long idle period, was still logged
+  correctly. RAISE `SETTLE_FRAMES_REQUIRED` or `SHOT_MIN_DURATION_MS`'s
+  margin above `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` if a real session ever
+  shows a shot lost to this; LOWER `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` first,
+  since it shrinks the risk directly at a modest, tunable battery cost.
+
+  **Interaction with the one-time pose-model measurement.** `POSE MODEL`'s
+  warm-up window needs its frames spaced at the pipeline's real full-rate
+  cadence to mean anything — an idle throttle landing mid-measurement would
+  stretch the window's wall-clock length without changing the frame count,
+  quietly deflating the reported "rendered fps" the exact same way the bug
+  that feature's own write-up describes. The owner is very likely standing
+  calmly at exactly this moment (still setting the phone up), so this isn't
+  theoretical: `updateAttentionState` refuses to idle at all until
+  `modelDecisionMade` is true.
+
+  **GEOMETRY-FIX NOTE.** `ATTENTION_REST_HAND_SEP_MAX` and
+  `ATTENTION_REST_MOVE_MAX_PER_SEC` are both torso-length-scaled distances,
+  computed the same way `DRAW_ATTEMPT_MIN_SEP`/`FULL_DRAW_STILL_MAX` already
+  are — deliberately, so both inherit the in-progress fix to this app's
+  coordinate maths (MediaPipe's x/y are normalised to frame width/height
+  separately, not one shared scale, so today's Euclidean distances are
+  stretched on a non-square frame) automatically through the shared
+  `torsoLength()` function, rather than being tuned against today's
+  distorted numbers. They were set relative to the existing constants they
+  sit near (comfortably below/above `DRAW_ATTEMPT_MIN_SEP`/
+  `FULL_DRAW_STILL_MAX`) specifically so that relationship survives the fix;
+  whoever does that retuning should sanity-check these two alongside it, the
+  same way `DRAW_ATTEMPT_MIN_SEP` itself needs revisiting.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.

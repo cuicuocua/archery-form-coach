@@ -100,6 +100,18 @@ before the app finished settling weren't recorded"** — worded differently
 from "movements ignored" on purpose, because it means something different:
 that was a real arrow, not noise, the app just wasn't ready to measure it.
 
+Between shots, once things have looked calm for a little while — hands
+relaxed, nobody stepping around — the app throttles itself down to save
+battery and heat, checking every so often instead of every single frame, and
+snaps straight back to full speed the instant anything looks like it might be
+the start of a shot. You'll never notice this happening (there's nothing to
+notice — it's designed to never miss a real draw), but if it happened at
+least once, a line at the top of the log says so: **"Paused full tracking
+between shots N times to save battery."** If it's ever unsure whether
+something is really the start of a shot, it always guesses "yes" — a false
+alarm just costs a little battery, but missing a real shot is the one mistake
+this app is built never to make.
+
 A draw that never quite reached full draw is still logged, and still worth
 seeing — that part hasn't changed — it's just marked **short of full draw**
 so you can tell it apart from one that went all the way.
