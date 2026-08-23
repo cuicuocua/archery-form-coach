@@ -94,8 +94,8 @@ html, body {
 }
 
 /* Hand separation is the number most likely to need retuning, so it gets top billing at
-   headline size; "recent best" (second-most-important — it's what you check when the
-   freeze never fires at all) is next; everything else is small print underneath. */
+   headline size; "recent best" (second-most-important — it's what you check when full
+   draw never gets detected at all) is next; everything else is small print underneath. */
 #debug .debug-big {
   font-size: clamp(20px, 6.5vw, 32px);
   font-weight: 800;
@@ -276,9 +276,4 @@ html, body {
 
 #controls button:active {
   background: rgba(255, 255, 255, 0.25);
-}
-
-#btn-freeze.active {
-  background: var(--amber);
-  color: #000;
 }

@@ -20,12 +20,10 @@ const DRAW_ELBOW_ALIGN_MAX_DEVIATION = 8; // degrees the draw elbow may sit off 
 // recurve archer anchors differently (fingers under the chin, not a release hand near the jaw)
 // and can't hold nearly as steady (no let-off, fighting full poundage the whole time).
 const FULL_DRAW_ANCHOR_MAX = 0.45; // draw-hand wrist must be this close to the mouth/nose, as a fraction of torso length, to count as "at anchor" — looser than you might expect because a release aid sits the hand further back near the jaw than fingers under the chin would; hand separation (below) does the real discriminating, this just filters out the grossly wrong
-const FULL_DRAW_BOW_ARM_MIN = 150; // degrees; bow arm must be at least this straight to count as "drawn" (looser than the good-form target above — a freeze should still fire on so-so form)
+const FULL_DRAW_BOW_ARM_MIN = 150; // degrees; bow arm must be at least this straight to count as "drawn" (looser than the good-form target above — full draw should still be detected on so-so form)
 const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. THE key signal: a compound's draw length is fixed by a mechanical stop, so this is near-binary (mid-raise vs. hard against the wall) and can be set with confidence
 const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one
 const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
-const FULL_DRAW_HOLD_MS = 900; // must stay at full draw this long before we freeze. Compound let-off means the archer can comfortably hold for several seconds, so there's room to be generous here without risking a missed shot — 900ms firmly rules out passing through on the way up
-const AUTO_FREEZE_HOLD_MS = 4000; // how long an automatic freeze holds the frame before releasing itself
 
 // Shot log display-only cutoffs — NOT form targets like the numbers above. These decide when a
 // shot's own DEVIATION FROM THE OWNER'S OWN SESSION AVERAGE (see summarizeShots) gets coloured
@@ -54,7 +52,6 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const btnCamera = document.getElementById("btn-camera");
 const btnHand = document.getElementById("btn-hand");
-const btnFreeze = document.getElementById("btn-freeze");
 const readoutBowArm = document.getElementById("readout-bowarm");
 const valueBowArm = document.getElementById("value-bowarm");
 const valueShoulderBow = document.getElementById("value-shoulder-bow");
@@ -72,37 +69,24 @@ let facingMode = "environment"; // rear camera first
 let rightHanded = true;
 let drawingUtils = null;
 
-// Auto-freeze state machine. kind is one of:
-//   'armed'    — watching for full draw
-//   'holding'  — full draw seen, waiting out FULL_DRAW_HOLD_MS before triggering
-//   'frozen'   — auto-froze the frame, waiting out AUTO_FREEZE_HOLD_MS before releasing
-//   'cooldown' — just released; waits for the archer to leave full draw before re-arming
-//   'manual'   — the owner tapped Freeze; only the button can end this, never the logic below
-let freezeState = { kind: "armed" };
-
 // Previous frame's draw-wrist position + timestamp, for the stillness check in isAtFullDraw
 // below. Deliberately just one remembered frame, not a history buffer — cheap and enough.
 let lastDrawWrist = null;
 
 // Last frame's full-draw condition values, for the ?debug overlay only (see syncDebugOverlay).
-// Stays null whenever isAtFullDraw bails out before it can compute them, and while frozen
-// (isAtFullDraw isn't called then) it simply keeps showing the frame that triggered the freeze.
+// Stays null whenever isAtFullDraw bails out before it can compute them.
 let debugInfo = null;
 
 // Shot log: a persistent record the owner can check after they've finished shooting, because
 // they cannot read the screen or tap anything while actually on the line (see CLAUDE.md). One
 // row per draw attempt — the best (highest hand-separation) frame seen during it, whether or
-// not it went on to trigger a freeze — kept until the page reloads. No timer anywhere in this:
+// not it ever reached full draw — kept until the page reloads. No timer anywhere in this:
 // entries never expire or get overwritten just because time passed, only because a newer
 // attempt bumps an old one out of the last SHOT_LOG_MAX.
 const SHOT_LOG_MAX = 10;
 let shotCount = 0; // total attempts this session, keeps counting even once the log above fills up
 let log = []; // newest first
 let attempt = null; // the attempt currently in progress, if any — see trackShotAttempt below
-
-function isFrozen(state) {
-  return state.kind === "frozen" || state.kind === "manual";
-}
 
 async function initPoseLandmarker() {
   const vision = await FilesetResolver.forVisionTasks(
@@ -405,7 +389,7 @@ function isAtFullDraw(landmarks, nowMs) {
 function trackShotAttempt(sample) {
   if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
     if (!attempt || sample.handSep >= attempt.handSep) {
-      attempt = { ...sample, froze: attempt?.froze ?? false };
+      attempt = { ...sample };
     }
   } else {
     endAttempt();
@@ -545,7 +529,6 @@ function renderShotRow(e, stats) {
       : `${Math.round(e.elbowAlign.deviation)}° ${e.elbowAlign.direction}`;
   const elbow = shotValueHtml(elbowText, e.elbowAlign?.signed ?? null, "°", e.shotNum, stats.elbow, ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION);
 
-  const froze = e.froze ? "auto-froze" : "no freeze";
   // At most one outlier mark for the whole row (not one per measure, per the brief) — the reader
   // already knows from the summary note what a ⚠ means, so a bare mark next to the shot number
   // is enough.
@@ -553,7 +536,7 @@ function renderShotRow(e, stats) {
   const debugBit = DEBUG
     ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
     : "";
-  return `<div class="shotlog-row">Shot ${e.shotNum}${outlierMark} · ${froze}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div>`;
+  return `<div class="shotlog-row">Shot ${e.shotNum}${outlierMark}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div>`;
 }
 
 // Plain-language shot log — this is what the owner actually reads, standing at the phone after
@@ -584,27 +567,6 @@ function renderShotLog() {
   shotLogEl.innerHTML = `<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
 }
 
-// Pure state-machine transition for the auto-freeze logic — no DOM, no MediaPipe, easy to
-// unit-test in isolation (see selfTest below). 'manual' is a dead end on purpose: this
-// function must never be the thing that ends a manual freeze.
-function nextFreezeState(state, atFullDraw, nowMs) {
-  switch (state.kind) {
-    case "manual":
-      return state;
-    case "armed":
-      return atFullDraw ? { kind: "holding", since: nowMs } : state;
-    case "holding":
-      if (!atFullDraw) return { kind: "armed" };
-      return nowMs - state.since >= FULL_DRAW_HOLD_MS ? { kind: "frozen", since: nowMs } : state;
-    case "frozen":
-      return nowMs - state.since >= AUTO_FREEZE_HOLD_MS ? { kind: "cooldown" } : state;
-    case "cooldown":
-      return atFullDraw ? state : { kind: "armed" };
-    default:
-      return { kind: "armed" };
-  }
-}
-
 function drawSkeleton(landmarks) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
@@ -614,24 +576,7 @@ function drawSkeleton(landmarks) {
   drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", radius: 4 });
 }
 
-function syncFreezeUI() {
-  const shouldPause = isFrozen(freezeState);
-  if (shouldPause && !video.paused) video.pause();
-  if (!shouldPause && video.paused) video.play();
-
-  btnFreeze.classList.toggle("active", shouldPause);
-  btnFreeze.textContent = shouldPause ? "▶ Resume" : "⏸ Freeze";
-
-  // Only the auto-frozen state gets a status message — a manual freeze needs no explanation.
-  if (freezeState.kind === "frozen") {
-    statusEl.classList.remove("hidden");
-    statusEl.textContent = "Auto-froze at full draw";
-  } else if (freezeState.kind !== "manual") {
-    statusEl.classList.add("hidden");
-  }
-}
-
-// ?debug-only readout of why the auto-freeze trigger is (or isn't) firing. No-op — not even
+// ?debug-only readout of why the full-draw trigger is (or isn't) firing. No-op — not even
 // a DOM lookup beyond the one at startup — when ?debug isn't in the URL. Deliberately big and
 // blunt: this has to be readable from ~5 metres away while the owner is mid-shot, not tidy.
 // Hand separation gets top billing because it's the number most likely to need retuning. This
@@ -645,30 +590,19 @@ function syncDebugOverlay() {
     ? `<div class="debug-big debug-fail">hand sep: no pose seen</div>`
     : `<div class="debug-big ${debugInfo.sepOk ? "debug-ok" : "debug-fail"}">hand sep ${debugInfo.handSep.toFixed(2)} of ${FULL_DRAW_HAND_SEP_MIN} needed — ${debugInfo.sepOk ? "far enough apart" : "too close together"}</div>`;
 
-  const stateHtml = `<div class="debug-small">state: ${freezeState.kind}${debugInfo ? " · " + otherChecks(debugInfo) : ""}</div>`;
+  const checksHtml = debugInfo ? `<div class="debug-small">${otherChecks(debugInfo)}</div>` : "";
 
-  debugEl.innerHTML = liveHtml + stateHtml;
+  debugEl.innerHTML = liveHtml + checksHtml;
 }
 
 function renderLoop() {
   requestAnimationFrame(renderLoop);
   const now = performance.now();
 
-  if (freezeState.kind === "manual") return; // holds until the button is tapped again
-
-  if (isFrozen(freezeState)) {
-    // Auto-frozen: no new landmarks to look at, just watch the clock for the auto-release.
-    freezeState = nextFreezeState(freezeState, false, now);
-    syncFreezeUI();
-    syncDebugOverlay();
-    return;
-  }
-
   if (!poseLandmarker || video.readyState < 2) return;
 
   const result = poseLandmarker.detectForVideo(video, now);
   const landmarks = result.landmarks?.[0];
-  let atFullDraw = false;
 
   if (!landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -683,14 +617,13 @@ function renderLoop() {
     updateBowArmReadout(landmarks);
     updateShoulderDropReadout(landmarks);
     updateDrawElbowReadout(landmarks);
-    atFullDraw = isAtFullDraw(landmarks, now);
+    // Return value intentionally unused here — isAtFullDraw's real job on every frame is its
+    // side effect, calling trackShotAttempt (below) to feed the shot log. It used to also drive
+    // the auto-freeze state machine, which read the true/false result; that machine is gone, but
+    // the shot log still depends on this call happening every frame, so it stays.
+    isAtFullDraw(landmarks, now);
   }
 
-  freezeState = nextFreezeState(freezeState, atFullDraw, now);
-  // Mark the in-progress attempt as having triggered a freeze the moment it actually happens —
-  // this is the only place that knows, since nextFreezeState decides it one line above.
-  if (freezeState.kind === "frozen" && attempt) attempt.froze = true;
-  syncFreezeUI();
   syncDebugOverlay();
 }
 
@@ -706,14 +639,6 @@ btnCamera.addEventListener("click", async () => {
 btnHand.addEventListener("click", () => {
   rightHanded = !rightHanded;
   updateHandButtonLabel();
-});
-
-btnFreeze.addEventListener("click", () => {
-  // Manual tap always wins: it resumes anything frozen (auto or manual), or freezes
-  // indefinitely from live. Resuming goes to "cooldown" rather than "armed" so the auto
-  // logic doesn't immediately re-trigger if the archer is still at full draw.
-  freezeState = isFrozen(freezeState) ? { kind: "cooldown" } : { kind: "manual" };
-  syncFreezeUI();
 });
 
 // The one interaction the owner needs after they're done shooting: tap once to see everything
@@ -743,38 +668,9 @@ async function main() {
   }
 }
 
-// Plain-assert checks for the auto-freeze state machine — no framework, no fixtures.
+// Plain-assert checks for the full-draw detection and shot log. No framework, no fixtures.
 // Open the page as ...index.html?selftest and read the console.
 function selfTest() {
-  const HOLD = FULL_DRAW_HOLD_MS;
-  const FREEZE = AUTO_FREEZE_HOLD_MS;
-
-  // Fires only after the hold duration.
-  let s = nextFreezeState({ kind: "armed" }, true, 0);
-  console.assert(s.kind === "holding", "full draw should start the hold, not fire immediately");
-  s = nextFreezeState(s, true, HOLD - 1);
-  console.assert(s.kind === "holding", "should not fire before the hold duration elapses");
-  s = nextFreezeState(s, true, HOLD);
-  console.assert(s.kind === "frozen", "should fire once the hold duration elapses");
-
-  // Does not re-fire without leaving full draw first.
-  let s2 = nextFreezeState(s, true, HOLD + FREEZE); // hold window ends, still at full draw
-  console.assert(s2.kind === "cooldown", "should release into cooldown, not straight back to frozen");
-  s2 = nextFreezeState(s2, true, HOLD + FREEZE + 1000);
-  console.assert(s2.kind === "cooldown", "should stay in cooldown while still at full draw");
-  s2 = nextFreezeState(s2, false, HOLD + FREEZE + 2000);
-  console.assert(s2.kind === "armed", "should re-arm only after leaving full draw");
-
-  // Releases after the hold window.
-  let s3 = nextFreezeState({ kind: "frozen", since: 0 }, false, FREEZE - 1);
-  console.assert(s3.kind === "frozen", "should still be frozen just before the hold window ends");
-  s3 = nextFreezeState(s3, false, FREEZE);
-  console.assert(s3.kind === "cooldown", "should release once the hold window ends");
-
-  // Manual freeze is not overridden.
-  const s4 = nextFreezeState({ kind: "manual" }, true, 999999);
-  console.assert(s4.kind === "manual", "manual freeze must never be auto-released or overridden");
-
   // isAtFullDraw: the raise (bow arm straight, both hands up near the face together) must
   // NOT read as full draw — that was the field bug. Only real full draw (hands apart, held
   // still) should. Saves/restores the module state isAtFullDraw depends on so this doesn't
@@ -941,23 +837,11 @@ function selfTest() {
   );
   console.assert(log[1].shotNum === 1, "the earlier attempt should still be present, just not first");
 
-  // froze flag: renderLoop sets attempt.froze directly the instant a freeze actually triggers;
-  // it must survive later, higher-handSep updates of the very same attempt.
-  trackShotAttempt(sample(0.5));
-  attempt.froze = true; // simulates: if (freezeState.kind === "frozen" && attempt) attempt.froze = true;
-  trackShotAttempt(sample(1.8)); // a later, better frame in the SAME attempt
-  console.assert(attempt.froze === true, "froze must survive the attempt's best frame being updated");
-  trackShotAttempt(sample(0.05));
-  console.assert(log[0].froze === true, "an attempt that triggered a freeze should log froze: true");
-
   // Losing the pose entirely also ends whatever attempt was in progress (endAttempt, called
   // directly from renderLoop's !landmarks branch rather than through trackShotAttempt).
   trackShotAttempt(sample(0.6));
   endAttempt();
-  console.assert(
-    log.length === 4 && log[0].froze === false,
-    "pose loss mid-attempt should still log it, with froze: false since it never triggered"
-  );
+  console.assert(log.length === 3, "pose loss mid-attempt should still log it");
   console.assert(attempt === null, "ending an attempt must clear it so the next rise starts fresh");
 
   // Cap: only the newest SHOT_LOG_MAX entries are kept, still newest-first.

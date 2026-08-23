@@ -51,12 +51,13 @@ Rules the PM follows:
 ## Files
 
 - `index.html` — page structure: video element, drawing canvas, status text,
-  two readout panels, three control buttons (camera flip, handedness, freeze).
+  two readout panels, three control buttons (camera flip, handedness, shot
+  log).
 - `style.css` — full-screen dark UI, large tap targets, green/amber/grey
   color states for readouts.
 - `app.js` — all logic: MediaPipe setup, camera start/switch, per-frame pose
   detection, skeleton drawing (via MediaPipe's own `DrawingUtils`), the two
-  angle calculations, freeze/resume, and the calibration constants block at
+  angle calculations, the shot log, and the calibration constants block at
   the top of the file.
 
 ## Key decisions
@@ -100,8 +101,16 @@ Rules the PM follows:
 - **Calibration constants are placeholders.** `BOW_ARM_ANGLE_MIN/MAX`,
   `DRAW_ELBOW_HEIGHT_MIN/MAX`, and `MIN_VISIBILITY` live in one clearly labeled
   block at the top of `app.js` — owner will tune these with a coach.
-- **Freeze button** pauses the `<video>` element itself (not just the canvas
-  overlay), so the frozen skeleton and the frozen video frame stay in sync.
+- **Freeze button: removed.** The prototype originally had a manual freeze
+  button plus an auto-freeze that triggered at full draw and released itself
+  after a few seconds. Both are gone — the owner confirmed in the field that
+  neither helps: he cannot tap a button while holding a drawn bow five metres
+  away, and a frame that freezes for four seconds and releases itself is gone
+  by the time he walks over (see "owner cannot touch or read the phone" above).
+  `isAtFullDraw` still runs every frame — it now exists purely to feed the shot
+  log via `trackShotAttempt`, and its boolean return value is otherwise unused
+  by the app (selfTest still reads it directly). The `<video>` element is never
+  paused after startup any more.
 
 ## Not built / explicitly out of scope for this prototype
 
@@ -114,6 +123,6 @@ Rules the PM follows:
 ## Testing
 
 Manual only: run locally via `python3 -m http.server`, check in a desktop
-browser first (camera + toggles + freeze), then via the Cloudflare tunnel URL
+browser first (camera + toggles + shot log), then via the Cloudflare tunnel URL
 on iPhone Safari for the real side-on shooting test. See README.md for exact
 commands.

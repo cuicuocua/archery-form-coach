@@ -24,9 +24,11 @@ your torso length.
 It decides which arm is scored as the bow arm and which as the draw arm. Get it
 backwards and every number is nonsense.
 
-**Then shoot.** Don't touch the phone. It freezes itself when you reach full
-draw, holds the frame about four seconds so the skeleton and the video stay
-together, then releases and gets ready for the next arrow.
+**Then shoot.** Don't touch the phone — you can't, mid-shot, and the app knows
+it. There used to be a freeze button here; it's gone, because you're five
+metres away holding a drawn bow and can never tap it, and by the time you walk
+over, whatever it froze has long since released itself. Everything the app
+needs you to see instead gets recorded to the shot log as it happens.
 
 **Afterwards, tap 📋 Log.** That's the one interaction you need, and you do it
 standing at the phone when you've finished. It lists your last ten draws.
@@ -62,12 +64,12 @@ figure it isn't sure of.
 
 ## The shot log
 
-Every draw is recorded, including ones where the auto-freeze never fired. That's
-deliberate — "it didn't fire" is exactly the case worth knowing about, and an
-empty log would teach you nothing.
+Every draw is recorded, including ones where you never reached full draw at
+all. That's deliberate — a near-miss is exactly the case worth knowing about,
+and an empty log would teach you nothing.
 
-Each row gives the shot number, all three readouts from the moment you were most
-fully drawn, and whether it froze.
+Each row gives the shot number and all three readouts from the moment you were
+most fully drawn.
 
 The log holds the last ten draws and lasts until you reload the page. Reloading
 clears it. There's no history between sessions.
@@ -78,9 +80,6 @@ clears it. There's no history between sessions.
 
 - **🔄 Camera** — rear or front camera.
 - **🎯 Right-handed / Left-handed** — which arm is which. Set before shooting.
-- **⏸ Freeze** — manual freeze, if you want to hold a frame yourself. It
-  overrides the automatic one: tap it and the app won't take the frame back off
-  you until you tap again.
 - **📋 Log** — show or hide the shot log.
 
 ---
@@ -107,14 +106,14 @@ Add `?debug` to the address:
 https://cuicuocua.github.io/archery-form-coach/?debug
 ```
 
-This shows a large panel with the live values behind the auto-freeze trigger —
+This shows a large panel with the live values behind full-draw detection —
 how far apart your hands are, how close your draw hand is to your face, how
 straight your bow arm is, how still you are — each marked pass or fail. The shot
 log gains the same detail per row.
 
-Use it when the freeze is firing at the wrong moment or not at all. The numbers
-say which condition is the problem, which turns "it didn't work" into a specific
-threshold to change.
+Use it when full draw is being detected at the wrong moment or not at all. The
+numbers say which condition is the problem, which turns "it didn't work" into a
+specific threshold to change.
 
 ---
 
@@ -128,9 +127,9 @@ Pushing to `main` publishes to the live URL above via GitHub Pages, usually
 within a minute or two.
 
 **Self-check:** add `?selftest` to the URL and open the browser console. It runs
-assertions over the auto-freeze state machine, the full-draw detection, the
-shot-log attempt boundaries, and the two form calculations. Silence means they
-passed. There is no test framework and no test files — this is the whole of it.
+assertions over the full-draw detection, the shot-log attempt boundaries, and
+the two form calculations. Silence means they passed. There is no test
+framework and no test files — this is the whole of it.
 
 **Running it locally**, if you're changing something and don't want to publish
 first. Camera access needs HTTPS or localhost, so a plain file won't do:
