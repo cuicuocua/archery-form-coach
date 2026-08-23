@@ -286,11 +286,17 @@ html, body {
 }
 
 /* Shown in place of the play button on a row with no clip (recording unsupported, or it failed
-   for just this one shot) — the row and its numbers are otherwise unaffected. */
+   for just this one shot) — the row and its numbers are otherwise unaffected. Text here is either
+   the plain word "no clip" or a short specific reason from explainClipFailure in app.js (e.g.
+   "no clip — camera feed cut out"), so this wraps rather than forcing one long line, and is
+   capped to a sensible width so a longer reason can't push the row wider than the screen. */
 #shotlog .shotlog-noclip {
+  display: inline-block;
+  max-width: 130px;
   font-size: 12px;
   opacity: 0.55;
-  white-space: nowrap;
+  text-align: right;
+  white-space: normal;
 }
 
 #readouts {

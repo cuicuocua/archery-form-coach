@@ -68,6 +68,7 @@ const ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION = 4; // degrees from this session's 
 // clip length/size; change freely without asking a coach first. =====
 const CLIP_TAIL_MS = 2500; // how long to keep recording AFTER endAttempt, so the release and follow-through make it into the clip, not just the draw
 const CLIP_MAX_MS = 20000; // hard ceiling on one clip's length, so a full-draw detection that gets stuck "in progress" can't record forever
+const CLIP_STOP_TIMEOUT_MS = 4000; // how long finalizeRecording waits for MediaRecorder's onstop to actually fire after .stop() is called before giving up on it and cleaning up anyway (see resolveClipOutcome) — canvas-stream recording on some browsers has been seen to leave a recorder stuck mid-stop with onstop never firing at all, which without this bound would both leak that clip's capture track forever and leave its shot's row showing a bare "no clip" with no explanation
 const CLIP_FRAME_RATE = 24; // fps requested from canvas.captureStream — modest on purpose, see CLIP_BITRATE
 const CLIP_BITRATE = 1_500_000; // ~1.5 Mbps target — keeps a clip a couple of MB, not tens, since these live in memory for the whole session
 // Tried in this order, first one the browser claims to support wins. iPhone Safari (the real
@@ -224,6 +225,17 @@ const clipPlayerRateBtns = document.querySelectorAll(".clipplayer-rate");
 // discovering it the first time an attempt starts — that way the "clips unavailable" banner
 // (see markClipsUnavailable) can go up before the owner ever shoots, not after their first shot
 // quietly has no video.
+//
+// IMPORTANT LIMITATION, found investigating a field report where this read true, no banner ever
+// showed, and yet neither of two real shots produced a clip: this is plain feature detection — it
+// only proves the two functions EXIST, never that a real recording started through them will
+// actually come back with usable video. That gap is real on iOS Safari specifically, where
+// MediaRecorder-from-canvas.captureStream is a thin, quirky combination (as opposed to recording
+// straight from a camera stream): a MIME type can report itself "supported" and still fail to mux,
+// `ondataavailable` can fire nothing but empty chunks, and a recorder can simply never call
+// `onstop`. None of that can be caught by asking two functions whether they exist — it only shows
+// up once a real recording is actually attempted, which is now checked and explained per-attempt
+// instead (see resolveClipOutcome / explainClipFailure further down) rather than assumed safe here.
 const CLIP_SUPPORTED = typeof MediaRecorder !== "undefined" && typeof canvas.captureStream === "function";
 
 let poseLandmarker = null;
@@ -313,6 +325,16 @@ let activeRecording = null;
 // toast at the moment recording fails; they find out later, standing at the phone, so that's the
 // only place this can usefully be said.
 let clipsUnavailableReason = null;
+
+// Carries forward the reason a clip recording failed when it finished (or was forcibly given up
+// on — see resolveClipOutcome) BEFORE the attempt it belonged to had actually logged a shot — the
+// one case where the failure has no row yet to explain itself on. That only happens when the
+// CLIP_MAX_MS safety cap cuts a stuck-in-progress recording off before endAttempt ever runs (see
+// finalizeRecording's capTimer). The very next call to attachRecordingToShot (from the endAttempt
+// that follows moments later) consumes this and writes it onto that shot's own row, so the owner
+// still gets a specific reason instead of a bare, unexplained "no clip". Cleared the instant it's
+// consumed; never carries over to a later, unrelated shot.
+let pendingClipNote = null;
 
 // True only while selfTest() below is running. trackShotAttempt calls startClipRecording every
 // time a fresh attempt begins, and selfTest drives trackShotAttempt directly with fake
@@ -1315,9 +1337,8 @@ function medianSampleOf(frames) {
 // Two gates first, both against the attempt's own peak (ALL frames, eligible or not — see
 // trackShotAttempt above) — see SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS above for
 // why these two specifically. An attempt that fails either one gets thrown away, not logged:
-// counted in rejectedAttemptCount, and any clip recording still running for it gets finalised
-// (and therefore its capture track stopped) right now rather than left to expire on its own —
-// see finalizeRecording, and CLAUDE.md on why a clip must never outlive the shot it belongs to.
+// counted in rejectedAttemptCount, and any clip recording still running for it gets DISCARDED
+// (see discardRecording) right now rather than left to expire on its own.
 //
 // A THIRD, separate case, checked only once the attempt has cleared both gates above: a real
 // draw attempt whose every single frame happened to be unsettled (see PIPELINE SETTLING above)
@@ -1325,7 +1346,18 @@ function medianSampleOf(frames) {
 // rejectedAttemptCount (noise that was never plausibly a draw at all): the owner really did draw
 // the bow here, the app just never got a settled enough look at it to log a number. Counted and
 // reported separately — unsettledAttemptCount, its own line in the log — so the two can never be
-// confused for each other; see renderShotLog.
+// confused for each other; see renderShotLog. Its recording is discarded the same way as the
+// rejected case above — no shot ever gets logged for this attempt either.
+//
+// Both of these throw the ATTEMPT away, not just its recording — no shot ever gets logged for
+// it, so its clip (if any) must never raise the "at least one clip failed" banner or explain
+// itself on some unrelated later row (see discardRecording / resolveClipOutcome's own discarded
+// check). A field bug caught this the hard way: a single landmark-noise blip lasting one or two
+// frames is easily long enough to cross DRAW_ATTEMPT_MIN_SEP and start a real recording, but far
+// too short for canvas.captureStream/MediaRecorder to ever encode a single frame of video before
+// it's thrown away here — that recording resolving with zero chunks used to read as a genuine
+// recording FAILURE and raise the banner, even in a session where the one real shot recorded
+// perfectly.
 function endAttempt(nowMs) {
   if (!attempt) return;
   const a = attempt;
@@ -1336,14 +1368,14 @@ function endAttempt(nowMs) {
 
   if (!gotDeepEnough || !lastedLongEnough) {
     rejectedAttemptCount++;
-    finalizeRecording(activeRecording); // this attempt's clip (if any) never gets a shot number — drop it and stop its capture track now, not later
+    discardRecording(activeRecording); // this attempt's clip (if any) never gets a shot number, AND must never be reported as a clip failure — see discardRecording
     renderShotLog(); // the "N movements ignored" line needs to move even when nothing gets logged
     return;
   }
 
   if (a.eligibleFrames.length === 0) {
     unsettledAttemptCount++;
-    finalizeRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to
+    discardRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to, and never report it as a failure either
     renderShotLog();
     return;
   }
@@ -1363,10 +1395,29 @@ function endAttempt(nowMs) {
 // anything here throws, the shot log and pose tracking must carry on exactly as if clips didn't
 // exist (see CLAUDE.md and the brief this was built from) — so every entry point is wrapped in
 // its own try/catch rather than trusting the caller to catch it.
+//
+// FIELD BUG this section was rewritten for: the owner shot two arrows on his iPhone and both rows
+// showed a bare "no clip" — with NO "clips unavailable" banner at all. That absence is the whole
+// clue: CLIP_SUPPORTED only checks that `MediaRecorder` and `canvas.captureStream` exist as
+// functions, and startClipRecording's try/catch only fires if `.start()` throws synchronously.
+// Neither of those is what actually happened — recording believed it had started fine and then
+// produced nothing, silently, which is a failure mode plain feature-detection cannot see and the
+// old code had no way to report even if it noticed. iOS Safari recording a canvas.captureStream
+// through MediaRecorder is a known-thin combination (as opposed to recording straight from a
+// camera stream) — MIME types can come back "supported" from isTypeSupported and still fail to
+// actually mux frames, `ondataavailable` can fire with only zero-byte blobs, `onerror` can fire
+// with nothing listening for it (the old code only console.error'd it), and a recorder can get
+// stuck never firing `onstop` at all. This sandbox cannot reproduce Safari itself, so every one of
+// those specific shapes is simulated below (see the verification notes this shipped with) and each
+// is now given its own explanation instead of a silent "no clip" — see `explainClipFailure`.
 
 // Picks a MIME type by trying CLIP_MIME_CANDIDATES in order and returning the first one this
 // browser claims to support; null means "nothing on the list — let the browser pick its own
-// default" rather than refusing to record at all.
+// default" rather than refusing to record at all. NOTE: this only reflects what
+// `MediaRecorder.isTypeSupported` CLAIMS, which on Safari has historically been thin/optimistic —
+// a type can come back "supported" here and still fail to actually produce video once recording
+// starts. That downstream failure is caught and explained where it actually shows up (see
+// resolveClipOutcome below), not here — isTypeSupported has no way to predict it in advance.
 function pickMimeType() {
   if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") return null;
   for (const type of CLIP_MIME_CANDIDATES) {
@@ -1406,26 +1457,63 @@ function startClipRecording() {
     if (mimeType) options.mimeType = mimeType;
     clipStream = canvas.captureStream(CLIP_FRAME_RATE);
     const recorder = new MediaRecorder(clipStream, options);
-    const rec = { recorder, clipStream, chunks: [], shotNum: null, finished: false, capTimer: null, tailTimer: null };
+    // `failReason`: the first specific explanation something below finds for why this recording
+    // is going to come back empty, if any does — surfaced to the owner by resolveClipOutcome
+    // rather than staying a console-only message. `settled`: true once this recording's outcome
+    // has been fully resolved, one way or another (real onstop, or the stop-watchdog giving up on
+    // it) — guards resolveClipOutcome against running twice for the same recording, since more
+    // than one of those can end up racing to call it for the same rec.
+    const rec = {
+      recorder, clipStream, chunks: [], shotNum: null,
+      finished: false, settled: false, failReason: null, discarded: false,
+      capTimer: null, tailTimer: null, stopWatchdog: null,
+    };
     recorder.ondataavailable = (ev) => {
       try {
         if (ev.data && ev.data.size > 0) rec.chunks.push(ev.data);
+        // A zero-size chunk isn't an error by itself (MediaRecorder can emit one on an empty
+        // interval) — it's just not kept. If EVERY chunk this recording ever produces turns out
+        // to be zero-size, rec.chunks stays empty and resolveClipOutcome's generic "came out
+        // empty" explanation below is exactly the right, honest thing to tell the owner.
       } catch (err) {
         console.error("archery-form-coach: clip data handling failed", err);
       }
     };
-    recorder.onerror = (ev) => console.error("archery-form-coach: clip recorder error", ev?.error ?? ev);
+    // A MediaRecorder error mid-recording used to only reach console.error — invisible to the
+    // owner, who cannot watch a console (see CLAUDE.md). Now it both stops this recording right
+    // away (a recorder that has errored can't be trusted to keep going) and raises the SAME
+    // "at least one clip failed this session" banner a synchronous start() failure already raises
+    // below — from the owner's side, a recorder that errors out mid-shot is exactly that claim.
+    recorder.onerror = (ev) => {
+      console.error("archery-form-coach: clip recorder error", ev?.error ?? ev);
+      rec.failReason = rec.failReason || "no clip — recorder error";
+      markClipsUnavailable("Some shots couldn't be recorded — at least one clip failed this session.");
+      finalizeRecording(rec);
+    };
     // Stopping the recorder does NOT stop canvas.captureStream's tracks — they keep pulling
     // frames off the canvas at CLIP_FRAME_RATE forever unless something stops them explicitly,
     // which without this would mean one live, still-pulling capture track per shot for the rest
     // of the session (found in review: 3 shots -> 3 leaked live tracks, unbounded over an end).
     // Stopped here, in onstop, deliberately AFTER ondataavailable/onstop have already handed the
-    // recorder its final data (see finishClipRecording) rather than the instant .stop() is
+    // recorder its final data (see resolveClipOutcome) rather than the instant .stop() is
     // called — so cleaning up the source can never cost the recording its last frame.
     recorder.onstop = () => {
+      clearTimeout(rec.stopWatchdog); // it actually stopped -- the stop-watchdog below doesn't need to force anything
       stopClipStreamTracks(rec.clipStream);
-      finishClipRecording(rec);
+      resolveClipOutcome(rec);
     };
+    // Each capture track ending on its own (not because WE stopped it) is a distinct failure
+    // shape from anything above: the source of frames vanished out from under a recorder that's
+    // otherwise still "running" and may never call onstop or onerror about it at all. Caught here
+    // so it can't turn into a silently-hung recording (see the stop-watchdog below, which is the
+    // other half of this same protection) or a leaked track sitting in "ended" limbo forever.
+    clipStream.getTracks().forEach((track) => {
+      track.addEventListener("ended", () => {
+        if (rec.settled) return; // recording already wrapped up through the normal path -- this is just the track's own cleanup firing after the fact, not news
+        rec.failReason = rec.failReason || "no clip — camera feed cut out";
+        finalizeRecording(rec);
+      });
+    });
     recorder.start();
     // Absolute ceiling from the moment recording starts, independent of whether/when the attempt
     // ever ends — this is what stops a stuck full-draw detection from recording forever.
@@ -1455,9 +1543,17 @@ function stopClipStreamTracks(clipStream) {
 // still-running recording which row it belongs to, and starts the post-shot tail timer so the
 // release and follow-through get a couple more seconds of recording before it stops. If there is
 // no active recording (recording never started, or a stuck-attempt cap already cut it off before
-// this attempt ever ended), there's nothing to tell — this shot simply won't have a clip.
+// this attempt ever ended), there's usually nothing to tell — this shot simply won't have a clip
+// — UNLESS that earlier ending left a reason behind in pendingClipNote (see its own comment), in
+// which case this shot's row gets to explain itself instead of showing a bare "no clip".
 function attachRecordingToShot(shotNum) {
-  if (!activeRecording || activeRecording.shotNum !== null) return;
+  if (!activeRecording || activeRecording.shotNum !== null) {
+    if (pendingClipNote) {
+      explainClipFailure(shotNum, pendingClipNote);
+      pendingClipNote = null;
+    }
+    return;
+  }
   activeRecording.shotNum = shotNum;
   activeRecording.tailTimer = setTimeout(() => finalizeRecording(activeRecording), CLIP_TAIL_MS);
 }
@@ -1465,7 +1561,11 @@ function attachRecordingToShot(shotNum) {
 // Stops a recording (idempotent — safe to call twice, from both its cap timer and its tail timer
 // racing, or from a fresh attempt cutting it short) and clears it from activeRecording. The
 // actual blob only becomes available later, asynchronously, in the recorder's onstop handler —
-// see finishClipRecording.
+// see resolveClipOutcome. Arms a bounded stop-watchdog alongside the real stop() call: iOS Safari
+// has been seen to leave a MediaRecorder recording from a canvas stream stuck mid-stop with
+// onstop never firing at all, which — left unbounded — would both leak that recording's capture
+// track forever (see stopClipStreamTracks) and leave its shot's row silently showing "no clip"
+// with no explanation, forever, since nothing would ever run to say why.
 function finalizeRecording(rec) {
   if (!rec || rec.finished) return;
   rec.finished = true;
@@ -1473,39 +1573,132 @@ function finalizeRecording(rec) {
   clearTimeout(rec.tailTimer);
   try {
     if (rec.recorder.state !== "inactive") {
-      rec.recorder.stop(); // capture tracks get stopped from the onstop handler above, once the data is safely out
+      rec.recorder.stop(); // onstop above (or the watchdog below, if onstop never comes) is what actually resolves this recording's outcome
+      rec.stopWatchdog = setTimeout(() => {
+        rec.failReason = rec.failReason || "no clip — recorder never finished";
+        stopClipStreamTracks(rec.clipStream); // onstop is the thing that was supposed to do this -- it hasn't, so do it ourselves rather than leave the track running
+        resolveClipOutcome(rec);
+      }, CLIP_STOP_TIMEOUT_MS);
     } else {
       // Already inactive without us calling stop() here — onstop won't fire again on our
       // account, so nothing else is going to stop the capture tracks; do it ourselves.
       stopClipStreamTracks(rec.clipStream);
+      resolveClipOutcome(rec); // safety net: covers the rare case where the recorder never even reached "recording" (e.g. start() silently no-op'd) and onstop was never going to fire at all
     }
   } catch (err) {
     console.error("archery-form-coach: failed to stop clip recording", err);
     stopClipStreamTracks(rec.clipStream); // stop() itself failed, so onstop may never fire -- don't leak the tracks over that
+    rec.failReason = rec.failReason || "no clip — recorder failed to stop";
+    resolveClipOutcome(rec);
   }
   if (activeRecording === rec) activeRecording = null;
 }
 
-// Runs once a stopped recorder has finished handing over its data. If this clip never got a shot
-// number (the stuck-attempt cap fired before the attempt ever ended) there's nothing to attach it
-// to, so it's dropped — the rare cost of the CLIP_MAX_MS safety valve.
-function finishClipRecording(rec) {
+// Marks a recording as belonging to an attempt the app has just decided to THROW AWAY (failed
+// SHOT_MIN_PEAK_SEP_FRACTION/SHOT_MIN_DURATION_MS, or never produced a single settled frame) —
+// see endAttempt's two early-return branches, the only callers. This is a genuinely different
+// claim from a recording that failed: the app is not reporting "this clip broke", it's reporting
+// "there was never going to be a shot here to have a clip at all." Set BEFORE finalizeRecording
+// runs, so that whichever path eventually resolves this recording's outcome (a real onstop, or
+// the stop-watchdog) can see it via resolveClipOutcome's own discarded check below and skip every
+// bit of owner-facing reporting for it — no banner, no per-row reason, no pendingClipNote left
+// for some later, unrelated shot to inherit.
+//
+// Why this needs its own flag rather than just leaving shotNum null (which resolveClipOutcome
+// already treated as "not a failure" for the CLIP_MAX_MS case): a discarded attempt's recording
+// can genuinely have FAILED too (chunks.length === 0) — most commonly because the discarded
+// attempt itself was too brief for canvas.captureStream/MediaRecorder to ever encode a single
+// frame before it got thrown away, which is not a malfunction, just an attempt that never
+// deserved a recording in the first place. Without distinguishing this from a real failure, that
+// empty-chunks outcome used to fall straight into resolveClipOutcome's generic "recording came
+// out empty" branch and raise the "at least one clip failed" banner — a false positive even in a
+// session where the one real, logged shot recorded perfectly. Found and fixed after a false
+// "clips failed" banner surfaced on a run with exactly one successful, fully-attached clip.
+function discardRecording(rec) {
+  if (rec) rec.discarded = true;
+  finalizeRecording(rec);
+}
+
+// Runs once a recording's outcome is actually known — either the real onstop fired, or the
+// stop-watchdog above gave up waiting for one. Guarded by rec.settled so whichever of those two
+// gets here first is the one that counts; the other is a harmless no-op (both can legitimately
+// fire for the same rec — e.g. a late onstop arriving just after the watchdog already forced
+// cleanup — and processing a recording's outcome twice could double-attach or double-count it).
+//
+// A clip with real, non-empty video attaches to its shot as before. Everything else is a failure
+// that used to just `return` — the owner would see an unexplained "no clip" and have no way to
+// tell "recording never worked at all" apart from "this one shot's recording came back empty"
+// apart from "the clip arrived after its row was already gone". Those are different claims (see
+// CLAUDE.md on why clipsUnavailableReason's own two messages stay distinct) and now say so:
+// explainClipFailure writes a specific reason onto the row itself rather than a bare "no clip".
+//
+// EXCEPT for a recording marked `discarded` (see discardRecording above): the app itself threw
+// that attempt away, so there is no shot for a clip to have been owed to. Whatever this recording
+// did or didn't produce is simply not a story the owner needs told — bail out before any of the
+// chunk/blob inspection below, so a discarded attempt's recording can never raise the banner,
+// write a per-row reason, or leave a pendingClipNote for some unrelated later shot to inherit.
+function resolveClipOutcome(rec) {
+  if (rec.settled) return;
+  rec.settled = true;
+  if (rec.discarded) return; // the attempt itself was thrown away -- see discardRecording; nothing here is ever a failure worth reporting
   try {
-    if (!rec.chunks.length || rec.shotNum === null) return;
-    const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || "video/webm" });
-    if (blob.size === 0) return;
-    attachClipToShot(rec.shotNum, blob);
+    if (rec.chunks.length > 0) {
+      const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || "video/webm" });
+      if (blob.size > 0) {
+        if (rec.shotNum === null) {
+          // The video itself is genuinely fine — this is the CLIP_MAX_MS safety cap cutting a
+          // stuck-in-progress recording off before endAttempt ever ran, so there's no shot number
+          // yet to attach it to, and there never will be one this recording still exists to hear
+          // about. Remembered as a pending note (see explainClipFailure/pendingClipNote) so that
+          // shot's row — once endAttempt logs it moments later — can still explain why it has no
+          // clip, instead of a bare, unexplained one.
+          explainClipFailure(null, "no clip — recording hit the 20-second limit before the shot ended");
+          return;
+        }
+        attachClipToShot(rec.shotNum, blob);
+        return;
+      }
+    }
+    // Nothing usable came out of this recording. This is the shape the field bug itself actually
+    // took — recording believed it had started fine (no synchronous throw, see startClipRecording's
+    // own catch) and simply never produced real video — so it gets its own honest explanation
+    // rather than silently falling through to a bare "no clip", and it also raises the same
+    // session-level banner a synchronous start() failure or a mid-recording onerror would.
+    markClipsUnavailable("Some shots couldn't be recorded — at least one clip failed this session.");
+    explainClipFailure(rec.shotNum, rec.failReason || "no clip — recording came out empty");
   } catch (err) {
     console.error("archery-form-coach: failed to finalise clip", err);
+    explainClipFailure(rec.shotNum, "no clip — failed to save");
   }
 }
 
+// Writes a specific failure reason onto a shot's row (rendered in place of the plain "no clip"
+// note — see renderShotRow), so a failed clip explains itself instead of just being absent. If
+// this recording's attempt hasn't actually logged a shot yet — shotNum is still null, which only
+// happens when the CLIP_MAX_MS safety cap cuts a stuck recording off before endAttempt has run —
+// there's no row to write to yet, so the reason is remembered in pendingClipNote instead, for the
+// next call to attachRecordingToShot (the endAttempt that follows moments later) to pick up. Never
+// overwrites a reason a row (or the pending note) already has — the FIRST cause found is the one
+// that actually explains what happened; whatever ran on to fail again after that is noise on top.
+function explainClipFailure(shotNum, reason) {
+  if (shotNum === null) {
+    if (!pendingClipNote) pendingClipNote = reason;
+    return;
+  }
+  const entry = log.find((e) => e.shotNum === shotNum);
+  if (!entry || entry.clipFailReason) return;
+  entry.clipFailReason = reason;
+  renderShotLog();
+}
+
 // Attaches a finished clip to its shot's row in the log, by shot number — reuniting the two,
-// since the clip finishes recording well after logShot already ran. If that shot has since been
-// bumped off the end of the log (SHOT_LOG_MAX newer attempts happened first), there is no row
-// left to attach it to: the blob is simply dropped, and since no object URL was ever created for
-// it, there's nothing to revoke either.
+// since the clip finishes recording well after logShot already ran. Two reasons there might be
+// no row to attach to: this shot has since been bumped off the end of the log (SHOT_LOG_MAX newer
+// attempts happened first), or shotNum is still null because the attempt this clip belongs to
+// hasn't finished (and logged a shot) yet. Either way the blob is simply dropped — and since no
+// object URL was ever created for it, there's nothing to revoke either.
 function attachClipToShot(shotNum, blob) {
+  if (shotNum === null) return;
   const entry = log.find((e) => e.shotNum === shotNum);
   if (!entry) return;
   entry.clipBlob = blob;
@@ -1823,13 +2016,16 @@ function renderShotRow(e, stats, outliers, words) {
   // only thing separating "he drew short of full draw" from "he drew all the way".
   const shortMark = e.reachedFullDraw === false ? ` <span class="shotlog-shortdraw">· short of full draw</span>` : "";
 
-  // A big, obvious watch button when this shot has a clip; a plain "no clip" note when it
-  // doesn't (recording unsupported, or it failed for just this one shot) — never nothing, so a
-  // missing clip never reads as a missing shot. data-shot carries the shot number for the click
-  // handler on shotLogEl (see openClipPlayer wiring) to look the entry back up by.
+  // A big, obvious watch button when this shot has a clip; otherwise a "no clip" note — never
+  // nothing, so a missing clip never reads as a missing shot. When something specific is known
+  // about WHY (see explainClipFailure — a recorder error, an empty recording, one that arrived
+  // too late, etc.), that reason is shown instead of the bare word "no clip", since a non-coder
+  // owner standing at the phone is the only person who will ever see this and has no console to
+  // check instead. data-shot carries the shot number for the click handler on shotLogEl (see
+  // openClipPlayer wiring) to look the entry back up by.
   const clipBit = e.clipUrl
     ? `<button type="button" class="shotlog-play" data-shot="${e.shotNum}">▶ Watch</button>`
-    : `<span class="shotlog-noclip">no clip</span>`;
+    : `<span class="shotlog-noclip">${e.clipFailReason || "no clip"}</span>`;
 
   return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum} — ${highlightText}${shortMark}${rawHtml}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
 }
@@ -3217,6 +3413,155 @@ function selfTest() {
       "evicting a row that has a clip attached must revoke its object URL"
     );
     URL.revokeObjectURL = savedRevoke;
+  }
+
+  // --- Clip failure explaining: every distinct way a recording can come back with nothing
+  // usable now writes a specific reason onto its shot's row (see explainClipFailure) instead of
+  // silently leaving a bare "no clip" — the field bug this rewrite was built from (two real shots
+  // on the owner's iPhone, both silently "no clip", no banner at all) is exactly what a silent
+  // return used to produce. Exercised here by calling resolveClipOutcome / explainClipFailure /
+  // attachRecordingToShot directly against fabricated `rec` objects — same "test the bookkeeping,
+  // not a real MediaRecorder" approach as the block above, and for the same reason (no real camera
+  // or recorder here, and startClipRecording is deliberately suppressed during selfTest).
+  {
+    const fakeRec = (overrides) => ({
+      recorder: { mimeType: "video/webm" },
+      chunks: [],
+      shotNum: null,
+      settled: false,
+      failReason: null,
+      ...overrides,
+    });
+
+    // A successful recording (real, non-empty chunks, a known shot number) attaches normally,
+    // leaves no failure reason behind, and must never raise the clips-unavailable banner.
+    log = [{ shotNum: 40 }];
+    const savedClipsUnavailableReason = clipsUnavailableReason;
+    clipsUnavailableReason = null;
+    resolveClipOutcome(fakeRec({ chunks: [new Blob(["x"], { type: "video/webm" })], shotNum: 40 }));
+    const row40 = log.find((e) => e.shotNum === 40);
+    console.assert(row40.clipUrl && !row40.clipFailReason, "a recording with real data and a known shot number should attach a clip, not a failure reason");
+    console.assert(clipsUnavailableReason === null, "a successful recording must never raise the clips-unavailable banner");
+    URL.revokeObjectURL(row40.clipUrl);
+
+    // Empty chunks -- the field bug's actual shape: recording believed it started fine and simply
+    // never produced usable video -- gets its own explanation on the row, AND raises the same
+    // session banner a synchronous recorder failure already raises (see markClipsUnavailable);
+    // from the owner's side a clip that silently comes back empty IS a clip that failed.
+    log = [{ shotNum: 41 }];
+    resolveClipOutcome(fakeRec({ chunks: [], shotNum: 41 }));
+    const row41 = log.find((e) => e.shotNum === 41);
+    console.assert(
+      row41.clipFailReason === "no clip — recording came out empty",
+      `an empty recording should explain itself on its row, got: ${row41.clipFailReason}`
+    );
+    console.assert(
+      clipsUnavailableReason === "Some shots couldn't be recorded — at least one clip failed this session.",
+      "a recording that came back empty should raise the same banner a synchronous recorder failure would"
+    );
+    clipsUnavailableReason = savedClipsUnavailableReason;
+
+    // A more specific reason set earlier (e.g. by the track-ended listener or onerror in
+    // startClipRecording) wins over the generic "came out empty" fallback, and the FIRST reason
+    // found for a shot is the one that sticks -- a later cause must never overwrite it.
+    log = [{ shotNum: 42 }];
+    resolveClipOutcome(fakeRec({ chunks: [], shotNum: 42, failReason: "no clip — camera feed cut out" }));
+    console.assert(
+      log.find((e) => e.shotNum === 42).clipFailReason === "no clip — camera feed cut out",
+      "a specific failure reason set before resolveClipOutcome runs should win over the generic empty-recording message"
+    );
+    explainClipFailure(42, "no clip — recorder error");
+    console.assert(
+      log.find((e) => e.shotNum === 42).clipFailReason === "no clip — camera feed cut out",
+      "the first failure reason found for a shot must stick -- a later cause must not overwrite it"
+    );
+
+    // resolveClipOutcome must be idempotent: a real onstop firing and the stop-watchdog giving up
+    // can both end up calling it for the same recording (see finalizeRecording), and it must only
+    // ever be processed once.
+    log = [{ shotNum: 43 }];
+    const rec43 = fakeRec({ chunks: [], shotNum: 43 });
+    resolveClipOutcome(rec43);
+    log.find((e) => e.shotNum === 43).clipFailReason = "sentinel"; // stand-in for whatever the row legitimately held after the first call
+    resolveClipOutcome(rec43); // rec43.settled is already true -- this must be a complete no-op
+    console.assert(
+      log.find((e) => e.shotNum === 43).clipFailReason === "sentinel",
+      "resolveClipOutcome must not process the same recording's outcome twice"
+    );
+
+    // A recording that resolves before its attempt has logged a shot (shotNum still null -- only
+    // happens when CLIP_MAX_MS's safety cap cuts a stuck recording off before endAttempt has run)
+    // has no row yet to explain itself on: the reason is remembered in pendingClipNote, and the
+    // NEXT shot logged (via attachRecordingToShot, exactly as endAttempt calls it) picks it up
+    // instead of that shot showing a bare, unexplained "no clip".
+    pendingClipNote = null;
+    resolveClipOutcome(fakeRec({ chunks: [], shotNum: null }));
+    console.assert(
+      pendingClipNote === "no clip — recording came out empty",
+      `a recording resolving before its shot is logged should leave a pending note, got: ${pendingClipNote}`
+    );
+    log = [{ shotNum: 44 }];
+    attachRecordingToShot(44); // activeRecording is null here -- the "recording already ended" path
+    console.assert(
+      log.find((e) => e.shotNum === 44).clipFailReason === "no clip — recording came out empty",
+      "a pending note left by an earlier-resolved recording should attach to the next shot logged"
+    );
+    console.assert(pendingClipNote === null, "a pending note should be consumed, not reused, once it's attached to a shot");
+  }
+
+  // --- Clip false-positive lock-down: a discarded (thrown-away) attempt's recording must NEVER
+  // look like a clip failure. Written after a real false positive was caught in review: a single
+  // clean, successful shot raised the "at least one clip failed" banner anyway. Root cause: a
+  // landmark-noise blip lasting one or two frames is easily long enough to cross
+  // DRAW_ATTEMPT_MIN_SEP and start a real recording, but far too short for
+  // canvas.captureStream/MediaRecorder to ever encode a single frame before endAttempt's own
+  // gates threw the attempt away — and that empty-chunks outcome used to read as a genuine
+  // recording failure. These two cases are exactly what the coordinator asked this fix be locked
+  // down against, so a regression here fails loudly instead of quietly shipping the same bug
+  // back to the owner's phone.
+  {
+    // Case 1: one clean, successful shot, nothing else in the session. Must produce no failure
+    // text anywhere -- no banner, no per-row reason.
+    log = [{ shotNum: 60 }];
+    const savedReason1 = clipsUnavailableReason;
+    clipsUnavailableReason = null;
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [new Blob(["a"], { type: "video/webm" })], shotNum: 60,
+      settled: false, failReason: null, discarded: false,
+    });
+    const row60 = log.find((e) => e.shotNum === 60);
+    console.assert(row60.clipUrl && !row60.clipFailReason, "a single successful shot must attach a clip with no failure reason on its row");
+    console.assert(clipsUnavailableReason === null, "a single successful shot must never raise the clips-unavailable banner");
+    URL.revokeObjectURL(row60.clipUrl);
+    clipsUnavailableReason = savedReason1;
+
+    // Case 2: a rejected movement (its recording resolves with EMPTY chunks -- the realistic
+    // shape, since a movement too brief/shallow to count as a shot is also too brief for the
+    // recorder to have encoded anything) alongside a real, successful shot in the same session.
+    // Neither the discarded recording NOR the real one may show any failure text, and the real
+    // shot's clip must attach exactly as if the discarded one never existed.
+    log = [{ shotNum: 61 }];
+    const savedReason2 = clipsUnavailableReason;
+    clipsUnavailableReason = null;
+    pendingClipNote = null;
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [], shotNum: null,
+      settled: false, failReason: null, discarded: true, // marked by discardRecording -- see endAttempt's rejected/unsettled branches
+    });
+    console.assert(clipsUnavailableReason === null, "a discarded (thrown-away) attempt's empty recording must never raise the clips-unavailable banner");
+    console.assert(pendingClipNote === null, "a discarded attempt's recording must never leave a pending note behind for a later, unrelated shot to inherit");
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [new Blob(["b"], { type: "video/webm" })], shotNum: 61,
+      settled: false, failReason: null, discarded: false,
+    });
+    const row61 = log.find((e) => e.shotNum === 61);
+    console.assert(
+      row61.clipUrl && !row61.clipFailReason,
+      "a real shot's clip must attach normally even when a rejected movement's recording resolved earlier in the same session"
+    );
+    console.assert(clipsUnavailableReason === null, "a session with one rejected movement and one real, successful shot must show no clips-unavailable banner");
+    URL.revokeObjectURL(row61.clipUrl);
+    clipsUnavailableReason = savedReason2;
   }
 
   // --- One Euro filter: pure logic, no DOM/MediaPipe involved, so these run straight against
