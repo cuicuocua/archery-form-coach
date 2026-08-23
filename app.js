@@ -2429,6 +2429,14 @@ function selfTest() {
   const savedUnsettledAttemptCount = unsettledAttemptCount;
   const savedSettledFrames = settledFrames;
   const savedPrevUsedCropBox = prevUsedCropBox;
+  // The clip-failure tests further down drive resolveClipOutcome/explainClipFailure directly
+  // (see their own comments) and, in doing so, touch these same two module-level variables the
+  // real app uses to remember an unresolved clip problem across renders. Saved/restored here —
+  // once, for the whole run — for the same reason as everything else on this list: a diagnostic
+  // run must never leave the app started while corrupting the exact state a diagnostic run
+  // exists to double check.
+  const savedClipsUnavailableReason = clipsUnavailableReason;
+  const savedPendingClipNote = pendingClipNote;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   const mkLandmarks = (overrides) => {
@@ -3326,9 +3334,12 @@ function selfTest() {
     });
 
     // A successful recording (real, non-empty chunks, a known shot number) attaches normally,
-    // leaves no failure reason behind, and must never raise the clips-unavailable banner.
+    // leaves no failure reason behind, and must never raise the clips-unavailable banner. Reset
+    // to a known-clean null here as test SETUP, not a save/restore -- the whole function's outer
+    // savedClipsUnavailableReason (see the top of selfTest) is what actually restores the real
+    // original value once, at the very end; nothing in between needs to preserve it, only start
+    // each sub-test from a clean slate so its own assertions mean what they say.
     log = [{ shotNum: 40 }];
-    const savedClipsUnavailableReason = clipsUnavailableReason;
     clipsUnavailableReason = null;
     resolveClipOutcome(fakeRec({ chunks: [new Blob(["x"], { type: "video/webm" })], shotNum: 40 }));
     const row40 = log.find((e) => e.shotNum === 40);
@@ -3351,7 +3362,6 @@ function selfTest() {
       clipsUnavailableReason === "Some shots couldn't be recorded — at least one clip failed this session.",
       "a recording that came back empty should raise the same banner a synchronous recorder failure would"
     );
-    clipsUnavailableReason = savedClipsUnavailableReason;
 
     // A more specific reason set earlier (e.g. by the track-ended listener or onerror in
     // startClipRecording) wins over the generic "came out empty" fallback, and the FIRST reason
@@ -3413,9 +3423,12 @@ function selfTest() {
   // back to the owner's phone.
   {
     // Case 1: one clean, successful shot, nothing else in the session. Must produce no failure
-    // text anywhere -- no banner, no per-row reason.
+    // text anywhere -- no banner, no per-row reason. clipsUnavailableReason is reset to null here
+    // as test SETUP, not a local save/restore -- see selfTest's own outer
+    // savedClipsUnavailableReason, which is what restores the true original value once, at the
+    // very end of the whole run (a local save/restore here is exactly the pattern that let this
+    // bug slip through the first time: it only ever covered part of a block).
     log = [{ shotNum: 60 }];
-    const savedReason1 = clipsUnavailableReason;
     clipsUnavailableReason = null;
     resolveClipOutcome({
       recorder: { mimeType: "video/webm" }, chunks: [new Blob(["a"], { type: "video/webm" })], shotNum: 60,
@@ -3425,7 +3438,6 @@ function selfTest() {
     console.assert(row60.clipUrl && !row60.clipFailReason, "a single successful shot must attach a clip with no failure reason on its row");
     console.assert(clipsUnavailableReason === null, "a single successful shot must never raise the clips-unavailable banner");
     URL.revokeObjectURL(row60.clipUrl);
-    clipsUnavailableReason = savedReason1;
 
     // Case 2: a rejected movement (its recording resolves with EMPTY chunks -- the realistic
     // shape, since a movement too brief/shallow to count as a shot is also too brief for the
@@ -3433,7 +3445,6 @@ function selfTest() {
     // Neither the discarded recording NOR the real one may show any failure text, and the real
     // shot's clip must attach exactly as if the discarded one never existed.
     log = [{ shotNum: 61 }];
-    const savedReason2 = clipsUnavailableReason;
     clipsUnavailableReason = null;
     pendingClipNote = null;
     resolveClipOutcome({
@@ -3453,7 +3464,6 @@ function selfTest() {
     );
     console.assert(clipsUnavailableReason === null, "a session with one rejected movement and one real, successful shot must show no clips-unavailable banner");
     URL.revokeObjectURL(row61.clipUrl);
-    clipsUnavailableReason = savedReason2;
   }
 
   // --- One Euro filter: pure logic, no DOM/MediaPipe involved, so these run straight against
@@ -3763,6 +3773,11 @@ function selfTest() {
     "front camera, toggle on, should flip to unmirrored (away from its mirrored default)"
   );
 
+  // Every one of these was BORROWED for the run, on the promise that it comes back exactly as it
+  // went in — most of them (log, shotCount, lastDrawWrist, settledFrames, unsettledAttemptCount,
+  // attempt...) are deliberately left "dirty" by the test blocks above right up until this point,
+  // by design, so restoring is genuinely a one-shot operation here, not an invariant kept
+  // throughout the run.
   selfTestInProgress = false;
   rightHanded = savedHanded;
   lastDrawWrist = savedLastWrist;
@@ -3773,6 +3788,37 @@ function selfTest() {
   unsettledAttemptCount = savedUnsettledAttemptCount;
   settledFrames = savedSettledFrames;
   prevUsedCropBox = savedPrevUsedCropBox;
+  clipsUnavailableReason = savedClipsUnavailableReason;
+  pendingClipNote = savedPendingClipNote;
+
+  // Lock-down: after the restore above, every borrowed variable must read back EXACTLY as it was
+  // saved at the top of this function — a diagnostic mode that quietly leaves the live app
+  // mutated is worse than no diagnostic mode at all, because it makes the app lie in precisely
+  // the tool used to check whether it's lying. Written after a real leak reached exactly that
+  // state: ?selftest left a false "clips failed" banner standing for the rest of that page load,
+  // because clipsUnavailableReason had no restore line here at all — only a couple of local,
+  // partial ones scattered inside individual test blocks, one of which covered only PART of its
+  // own block and left a later sub-test's own re-triggering of the banner with nothing left to
+  // undo it. These assertions won't catch a mid-run leak that the restore above also happens to
+  // paper over (nothing here could, from JS — a straight assignment always "succeeds"), but they
+  // do catch the much more likely future mistake: a new piece of borrowed state that gets a
+  // `savedX` capture but no matching restore line above, or a restore line that assigns the wrong
+  // saved value to the wrong variable. Add both a restore line above AND an assertion here
+  // whenever a future test starts borrowing another piece of module state.
+  console.assert(rightHanded === savedHanded, "selfTest leaked: rightHanded was not restored to its original value");
+  console.assert(lastDrawWrist === savedLastWrist, "selfTest leaked: lastDrawWrist was not restored to its original value");
+  console.assert(attempt === savedAttempt, "selfTest leaked: attempt was not restored to its original value");
+  console.assert(log === savedLog, "selfTest leaked: log was not restored to its original value");
+  console.assert(shotCount === savedShotCount, "selfTest leaked: shotCount was not restored to its original value");
+  console.assert(rejectedAttemptCount === savedRejectedAttemptCount, "selfTest leaked: rejectedAttemptCount was not restored to its original value");
+  console.assert(unsettledAttemptCount === savedUnsettledAttemptCount, "selfTest leaked: unsettledAttemptCount was not restored to its original value");
+  console.assert(settledFrames === savedSettledFrames, "selfTest leaked: settledFrames was not restored to its original value");
+  console.assert(prevUsedCropBox === savedPrevUsedCropBox, "selfTest leaked: prevUsedCropBox was not restored to its original value");
+  console.assert(
+    clipsUnavailableReason === savedClipsUnavailableReason,
+    `selfTest leaked: clipsUnavailableReason was not restored to its original value (left as ${JSON.stringify(clipsUnavailableReason)}) — a diagnostic run must never leave a false "clips failed" banner behind`
+  );
+  console.assert(pendingClipNote === savedPendingClipNote, "selfTest leaked: pendingClipNote was not restored to its original value");
 
   console.log("selfTest done — check above for any failed console.assert");
 }
