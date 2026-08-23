@@ -54,9 +54,10 @@ Rules the PM follows:
 ## Files
 
 - `index.html` — page structure: video element, drawing canvas, status text,
-  two readout panels, three control buttons (camera flip, handedness, shot
-  log), and the full-screen clip player (video + slow-motion/close buttons)
-  that opens over everything else when a shot log row's clip is tapped.
+  two readout panels, four control buttons (camera flip, handedness, mirror
+  toggle, shot log), and the full-screen clip player (video +
+  slow-motion/close buttons) that opens over everything else when a shot log
+  row's clip is tapped.
 - `style.css` — full-screen dark UI, large tap targets, green/amber/grey
   color states for readouts, plus the shot log's clip button/no-clip note and
   the clip player's own styling.
@@ -193,6 +194,29 @@ Rules the PM follows:
   the same claim, and telling the owner "recording doesn't work" while half
   the log has working Watch buttons would be actively misleading. Either
   message latches once set and is never cleared or overwritten by the other.
+
+- **Mirroring is done in the canvas pixels, not CSS.** The front camera has
+  always needed to mirror on-screen (the normal selfie convention), and there
+  is now a manual 🪞 toggle on top of that (set-up-time only, same as
+  handedness — the owner can't reach the button once he's walked to the
+  line). Both used to be a CSS `transform: scaleX(-1)` on `#video`/`#overlay`,
+  which only changes how the browser *displays* those elements — it never
+  touched a pixel. That was a real bug once clips existed: `canvas.captureStream`
+  reads the canvas's actual pixel buffer, which the CSS transform never
+  touched, so a mirrored on-screen view recorded an *unmirrored* clip — what
+  the owner watched back didn't match what he saw live. The fix: mirroring now
+  happens by wrapping the canvas draw itself (video frame and skeleton
+  together, in one `ctx.save()`/`translate`/`scale(-1,1)`/`restore()`) in
+  `withMirror`, so the canvas's own pixels are what's flipped — on-screen view
+  and recorded clip are the same pixels, so they can never disagree again.
+  This is now the *only* place mirroring happens anywhere in the app — the old
+  CSS class is gone, so there is no way for the picture to end up
+  double-mirrored or mirrored in one place and not the other. Effective
+  mirror state is `defaultMirrorFor(facingMode) XOR mirrorToggled` — a pure
+  function, checked directly in `selfTest`. Mirroring only ever changes how a
+  frame is drawn; it never touches a landmark coordinate, so it cannot move a
+  measured number or interfere with the handedness toggle's job of deciding
+  which arm is which.
 
 ## Not built / explicitly out of scope for this prototype
 

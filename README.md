@@ -82,7 +82,9 @@ clears it. There's no history between sessions.
 
 Every row that has a clip gets a green **▶ Watch** button. Tap it and the clip
 opens full-screen: the exact video the app was recording, skeleton and all,
-covering the whole shot — raise, draw, hold, release, follow-through. Three
+covering the whole shot — raise, draw, hold, release, follow-through. If the
+🪞 mirror toggle was on when you shot, the clip is mirrored too — whatever
+you saw live is exactly what got recorded, not a mismatched flip of it. Three
 buttons let you slow it down: **1×**, **0.5×**, **0.25×**. Full speed is
 basically useless for checking your own form; slow it down. **✕ Close** takes
 you back — the camera never stopped running behind the player, so nothing
@@ -118,6 +120,11 @@ numbers) keeps working regardless.
 
 - **🔄 Camera** — rear or front camera.
 - **🎯 Right-handed / Left-handed** — which arm is which. Set before shooting.
+- **🪞 Mirrored / Not mirrored** — flips the picture left-right, like looking in a mirror. The
+  front camera starts mirrored by default (the normal selfie convention), the rear camera starts
+  un-mirrored; this button flips whichever camera you're currently on away from its own default.
+  Like the handedness button, it always shows what's true right now, not what tapping it would
+  do — set it before you shoot, since you can't reach the phone once you've walked to the line.
 - **📋 Log** — show or hide the shot log.
 
 ---

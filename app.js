@@ -94,6 +94,7 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const btnCamera = document.getElementById("btn-camera");
 const btnHand = document.getElementById("btn-hand");
+const btnMirror = document.getElementById("btn-mirror");
 const readoutBowArm = document.getElementById("readout-bowarm");
 const valueBowArm = document.getElementById("value-bowarm");
 const valueShoulderBow = document.getElementById("value-shoulder-bow");
@@ -120,6 +121,15 @@ let stream = null;
 let facingMode = "environment"; // rear camera first
 let rightHanded = true;
 let drawingUtils = null;
+
+// Manual mirror toggle (🪞 button) — set at setup time, before the owner walks off, same as the
+// handedness toggle. Deliberately NOT "mirrored: true/false" on its own: it means "flip away from
+// whatever this camera's own default is", so switching cameras while the toggle is on still
+// mirrors relative to the new camera's default rather than snapping to one fixed state. See
+// effectiveMirror below for the actual combination of the two. Starts false — untouched, each
+// camera just shows its own default (front mirrored, rear not), which is what the button already
+// did before this toggle existed.
+let mirrorToggled = false;
 
 // Previous frame's draw-wrist position + timestamp, for the stillness check in isAtFullDraw
 // below. Deliberately just one remembered frame, not a history buffer — cheap and enough.
@@ -384,12 +394,29 @@ async function startCamera() {
   video.srcObject = stream;
   await video.play();
 
-  const mirrored = facingMode === "user";
-  video.classList.toggle("mirrored", mirrored);
-  canvas.classList.toggle("mirrored", mirrored);
-
+  // No CSS mirroring here any more — see effectiveMirror/withMirror below for why. The <video>
+  // element itself is left completely alone (never flipped, never classed); the canvas painted
+  // on top of it is opaque every frame (see drawVideoFrame) and is what actually gets mirrored,
+  // in its pixels, when that's called for.
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
+}
+
+// Whether a given camera mirrors by default, before the owner's manual toggle is factored in.
+// Front camera ("user") defaults to mirrored, matching what people expect of a selfie view; rear
+// camera doesn't. Pure and camera-agnostic on purpose — this is the one place that convention
+// lives, so selfTest can check it directly instead of poking at the DOM.
+function defaultMirrorFor(facingMode) {
+  return facingMode === "user";
+}
+
+// The actual on-screen (and in-clip, now that mirroring lives in the canvas pixels — see
+// withMirror) mirror state: the camera's own default, flipped once more if the owner's manual
+// toggle is on. Pure function of the two pieces of state that decide it, so every combination —
+// which camera, toggle on or off — can be asserted directly in selfTest without touching the DOM
+// or a real camera.
+function effectiveMirror(facingMode, toggled) {
+  return defaultMirrorFor(facingMode) !== toggled; // XOR: toggled flips whichever default applies
 }
 
 function angleAt(a, b, c) {
@@ -1039,13 +1066,18 @@ function renderShotLog() {
 // way to bake the skeleton into a clip), the canvas needs its own copy of the video frame every
 // time, landmarks or not, so a clip is never missing frames just because the pose was briefly
 // lost. canvas.width/height are set to the video's native resolution in startCamera, so this
-// plain draw lines up exactly with no cropping or letterboxing needed.
+// plain draw lines up exactly with no cropping or letterboxing needed. Always draws the RAW,
+// unmirrored video frame — see withMirror below for where the flip actually happens; this
+// function has no idea whether the current picture is mirrored or not, deliberately.
 //
-// Mirroring note: the front camera mirrors on-screen via a CSS transform on both #video and
-// #overlay (see style.css), which only affects how the browser displays the elements — it does
-// not touch the pixels drawn here. So a front-camera clip plays back unmirrored. That's fine
-// (the owner shoots on the rear camera) and is NOT a bug to "fix" by mirroring the canvas draw —
-// doing that would put every landmark coordinate on the wrong side of the frame.
+// This fully repaints canvas.width × canvas.height every call (clearRect then a drawImage that
+// covers the same rectangle), so the <video> element underneath — which sits at the same CSS
+// box (inset: 0, 100% × 100%) as this canvas — can never show through at an edge, even if the
+// two elements' internal pixel dimensions differ (they can: canvas.width/height are the video's
+// native capture resolution, while the CSS box both are stretched into is the on-screen viewport
+// size). "Stretched into a differently-sized box" is not "gaps at the edges" — both elements
+// always cover their entire box, just at different effective scales, so there is no seam for the
+// unflipped video to leak through.
 function drawVideoFrame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -1058,6 +1090,39 @@ function drawSkeleton(landmarks) {
     lineWidth: 3,
   });
   drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", radius: 4 });
+}
+
+// Runs one frame's worth of canvas drawing (video frame, and the skeleton on top of it when
+// there is one) inside a horizontal flip, when effectiveMirror says this frame should be
+// mirrored. This is now the ONLY place mirroring happens in the whole app — replacing the old
+// CSS `.mirrored` class on #video/#overlay, which only changed how the browser displayed those
+// elements and never touched a single pixel. That mattered because clips are recorded straight
+// off this canvas (canvas.captureStream, see startClipRecording): a CSS transform is invisible
+// to a pixel-capture stream, so the old approach meant a mirrored on-screen view recorded an
+// UNmirrored clip — the owner would watch back something that didn't match what he saw live.
+// Doing the flip here instead means the canvas's own pixels are mirrored, so whatever the owner
+// saw on screen is exactly what the recorder captured.
+//
+// The flip is pure presentation: it happens in ctx's transform, applied only to what gets drawn
+// AFTER it, and is undone (ctx.restore) before this function returns. It never touches a
+// landmark coordinate — bowArmAngleOf, shoulderDropSampleOf, drawElbowAlignmentOf, isAtFullDraw
+// and trackShotAttempt all run on the same raw (smoothed) landmarks whether this frame is
+// mirrored or not, so mirroring can never move a measured number or silently swap which arm the
+// existing 🎯 handedness toggle is scoring. Video frame and skeleton are drawn inside the SAME
+// save/restore pair (the caller passes both in one drawFn), not flipped separately, so the two
+// can never end up mismatched by half a frame's worth of transform state.
+function withMirror(drawFn) {
+  const mirror = effectiveMirror(facingMode, mirrorToggled);
+  ctx.save();
+  if (mirror) {
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+  }
+  try {
+    drawFn();
+  } finally {
+    ctx.restore();
+  }
 }
 
 // ?debug-only readout of why the full-draw trigger is (or isn't) firing. No-op — not even
@@ -1091,7 +1156,7 @@ function renderLoop() {
   const rawLandmarks = result.landmarks?.[0];
 
   if (!rawLandmarks) {
-    drawVideoFrame(); // keep the clip (and the on-screen view) showing the camera even without a skeleton
+    withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
@@ -1108,7 +1173,7 @@ function renderLoop() {
     // show up in the numbers the owner reads later or the clip he watches back. Real elapsed time
     // (performance.now(), converted to seconds), not an assumed frame rate — see OneEuroFilter.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
-    drawSkeleton(landmarks);
+    withMirror(() => drawSkeleton(landmarks));
     updateBowArmReadout(landmarks);
     updateShoulderDropReadout(landmarks);
     updateDrawElbowReadout(landmarks);
@@ -1126,14 +1191,30 @@ function updateHandButtonLabel() {
   btnHand.textContent = rightHanded ? "🎯 Right-handed" : "🎯 Left-handed";
 }
 
+// Shows the CURRENT effective state, same convention as updateHandButtonLabel above — "what is
+// true right now", not "what tapping this will do". The owner sets this up before walking away
+// and can't come back to check it mid-shot, so at-a-glance current state is what matters.
+function updateMirrorButtonLabel() {
+  const mirrored = effectiveMirror(facingMode, mirrorToggled);
+  btnMirror.textContent = mirrored ? "🪞 Mirrored" : "🪞 Not mirrored";
+}
+
 btnCamera.addEventListener("click", async () => {
   facingMode = facingMode === "environment" ? "user" : "environment";
   await startCamera();
+  // Switching cameras changes the DEFAULT this toggle flips away from (see effectiveMirror), so
+  // the label can change here even though the owner didn't touch the mirror button at all.
+  updateMirrorButtonLabel();
 });
 
 btnHand.addEventListener("click", () => {
   rightHanded = !rightHanded;
   updateHandButtonLabel();
+});
+
+btnMirror.addEventListener("click", () => {
+  mirrorToggled = !mirrorToggled;
+  updateMirrorButtonLabel();
 });
 
 // The one interaction the owner needs after they're done shooting: tap once to see everything
@@ -1196,6 +1277,7 @@ async function main() {
 
     statusEl.classList.add("hidden");
     updateHandButtonLabel();
+    updateMirrorButtonLabel();
     renderLoop();
   } catch (err) {
     statusEl.classList.remove("hidden");
@@ -1834,6 +1916,30 @@ function selfTest() {
       "LandmarkSmoother.reset() should make the next frame come out completely unsmoothed"
     );
   }
+
+  // --- Mirror toggle: effectiveMirror (and the defaultMirrorFor it's built on) are pure
+  // functions of facingMode + the toggle, never touched by module state, so every combination
+  // can be checked directly rather than by poking classList/DOM. This is also the exact table
+  // the brief asked for: default state per camera, and what the toggle does to each.
+  console.assert(defaultMirrorFor("user") === true, "front camera should default to mirrored");
+  console.assert(defaultMirrorFor("environment") === false, "rear camera should default to unmirrored");
+
+  console.assert(
+    effectiveMirror("environment", false) === false,
+    "rear camera, toggle off, should be unmirrored (matches its default)"
+  );
+  console.assert(
+    effectiveMirror("environment", true) === true,
+    "rear camera, toggle on, should flip to mirrored (away from its unmirrored default)"
+  );
+  console.assert(
+    effectiveMirror("user", false) === true,
+    "front camera, toggle off, should be mirrored (matches its default)"
+  );
+  console.assert(
+    effectiveMirror("user", true) === false,
+    "front camera, toggle on, should flip to unmirrored (away from its mirrored default)"
+  );
 
   selfTestInProgress = false;
   rightHanded = savedHanded;
