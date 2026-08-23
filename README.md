@@ -66,6 +66,22 @@ figure it isn't sure of.
 
 ## The shot log
 
+**Each shot's numbers are a typical value across the whole hold, not one
+instant.** Earlier versions picked the single moment your hands looked
+furthest apart and reported the numbers from exactly that moment. That turned
+out to be a bad idea: how far apart your hands look and how dropped your
+shoulder looks are both worked out using the same rough measurement of your
+torso, and on any one frame that measurement can come out a little too small
+or a little too large just from camera jitter — so the "hands furthest apart"
+frame was quietly more likely to also be the "shoulder looks more dropped"
+frame, for no reason to do with your actual form. Now the app takes the
+middle value of each of the four numbers across every good frame of your
+hold and reports that instead, which can't get pulled around by one noisy
+frame the same way. Nothing about how the numbers themselves are calculated
+changed, and nothing about which draws count as a real shot changed either —
+just what one number represents: not a single snapshot, but what your hold
+looked like typically.
+
 Only real draws get a row. The app watches for hand movement that's deep
 enough and lasts long enough to plausibly be a draw before it logs anything —
 nocking an arrow, lowering the bow, adjusting a release aid, or the camera

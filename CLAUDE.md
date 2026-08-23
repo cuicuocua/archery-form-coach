@@ -372,8 +372,11 @@ Rules the PM follows:
   needed) counts consecutive good-tracking frames since the last reset;
   `trackShotAttempt`/`endAttempt` now track an attempt's true peak hand
   separation (all frames, for the existing gates — untouched) separately from
-  its best ELIGIBLE frame (settled frames only — see `advanceSettling` /
-  `resetSettling`), and only ever log the latter. An attempt that's real
+  its ELIGIBLE frames (settled frames only — see `advanceSettling` /
+  `resetSettling`), and only ever log a shot's numbers from the latter (see
+  the median-of-eligible-frames bullet below for what "log a shot's numbers
+  from" means today — it changed after this fix shipped, but the ELIGIBLE-only
+  requirement it's built on here did not). An attempt that's real
   (clears the existing gates) but has no eligible frame at all is neither
   logged nor silently dropped: it's counted in `unsettledAttemptCount`, its
   own persistent line, worded differently on purpose from the
@@ -390,6 +393,58 @@ Rules the PM follows:
   dropped from roughly 3 claims in 16 measure-lines to 0 in 200 — with the
   floor constants above left untouched, since nothing survived to need them
   raised further.
+
+- **A shot's logged numbers are now the MEDIAN of each measure across the
+  whole hold, not a single "best" frame — because that single-frame rule
+  turned out to be a biased sample, not just an arbitrary one.** Until this
+  fix, `endAttempt` logged whichever eligible frame had the HIGHEST hand
+  separation (the two wrists' distance apart, divided by an estimated torso
+  length). Investigated on suspicion, then measured directly: torso length is
+  itself estimated from noisy landmarks, so a frame's hand-separation ratio
+  can read high either because the archer's hands really were far apart THAT
+  frame, or because the noisy torso-length ESTIMATE happened to come out
+  small that frame and inflate the ratio — the peak-selection rule can't tell
+  those two apart, and prefers both equally. That would be harmless on its
+  own, except shoulder drop is ALSO a distance divided by that same estimated
+  torso length, so the frame most likely to "win" on hand separation is
+  disproportionately likely to also over-report shoulder drop, by the exact
+  same mechanism. A synthetic-archer measurement (32 attempts, ~4,600 eligible
+  frames, two independent trial runs, full pipeline — ROI cropping, One Euro
+  smoothing, pipeline settling — all running for real, only the pose model
+  itself replaced) confirmed it: torso-length estimates on the selected frame
+  ran below that attempt's own mean in every single attempt measured (32/32);
+  draw-side shoulder drop — which shares hand separation's own default torso
+  scale (see `isAtFullDraw`: draw-side torso preferred, bow-side as fallback)
+  — read on the order of half a percentage point high on the selected frame,
+  consistently in the same direction (28/32 attempts), not the coin-flip a
+  merely arbitrary choice would produce. Bow-side shoulder drop, which uses a
+  DIFFERENT (independently-noisy) torso-length estimate, showed no consistent
+  direction — and neither did bow-arm angle or draw-elbow alignment, both
+  plain angles with no division by torso length anywhere in their maths. That
+  contrast (strong + consistent where a measure shares hand separation's own
+  denominator, absent where it doesn't or can't) is what confirms the bias is
+  the division, not merely "one frame is untrustworthy." Fix: `endAttempt` no
+  longer selects a frame at all. Each measure — bow-arm angle, bow- and
+  draw-side shoulder drop, draw-elbow alignment — is now the MEDIAN of that
+  measure across every ELIGIBLE frame of the hold, computed independently per
+  measure (`medianSampleOf` in `app.js`; see its own block comment for the
+  full reasoning and the null-handling rules). A median can't be dragged
+  toward one noisy frame's ratio the way a peak-selection rule can, and
+  because no single frame "wins," there is no longer a selection process for
+  measurement noise to bias. Re-measured after the fix, same synthetic
+  archer, same probe: the shipped, real logged shoulder-drop readings sit
+  within noise of the attempt's own population mean, no consistent direction
+  left. **Unaffected by this change, on purpose**: `peakHandSep` (all frames,
+  eligible or not) still decides `SHOT_MIN_PEAK_SEP_FRACTION` — "did he draw
+  far enough to count as a shot at all" is correctly a question about the
+  single most extreme moment of the attempt, not an average across it — and
+  `reachedFullDraw` still means "did any eligible frame reach true full
+  draw." Memory is bounded per attempt (`MEDIAN_SAMPLE_CAP`, 200 eligible
+  frames) via reservoir sampling, not "first N" or "most recent N" — either
+  of those would bias the median toward one part of the hold; reservoir
+  sampling gives every eligible frame of the whole hold an equal chance of
+  surviving the cap, so bounding memory this way costs precision, never
+  introduces a new selection bias of the same shape as the one just fixed.
 
 ## Not built / explicitly out of scope for this prototype
 
