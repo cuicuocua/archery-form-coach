@@ -445,6 +445,21 @@ html, body {
   font-size: 15px;
 }
 
+/* The very first thing shown when a reload recovered a session (see sessionWasRestored in
+   app.js) — a phone getting backgrounded/reloaded mid-session is common on iOS, and he needs to
+   be able to tell "the app restarted and kept my shots" apart from a normal fresh start. Green,
+   not amber, on purpose: this is reassurance, not a warning — the log survived. */
+#shotlog .shotlog-restored {
+  background: rgba(46, 204, 113, 0.14);
+  border: 1px solid rgba(46, 204, 113, 0.4);
+  color: var(--green);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  margin-bottom: 10px;
+}
+
 /* Persistent notice when clip recording isn't working — set once, shown on every render, never
    cleared (see markClipsUnavailable in app.js). Sits above the summary block, so it's the first
    thing visible whether or not any shots have been logged yet. */
