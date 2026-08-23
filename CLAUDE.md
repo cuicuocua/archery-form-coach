@@ -505,6 +505,37 @@ Rules the PM follows:
   print under the plain-English sentence, and — unlike the watchdog case —
   is never cleared, since `main()` has given up for the rest of the session.
 
+- **The 15s watchdog above was itself a false alarm waiting to happen for one
+  specific step, and it happened.** Field report: at a real shooting range on
+  phone data, the owner saw "The pose tracker never finished loading. Close
+  the app and reopen it." — and restarted the app several times because of
+  it. The pose model is a multi-megabyte download; on a slow connection,
+  fetching it can genuinely take longer than 15 seconds while nothing is
+  actually wrong. The banner *did* clear itself once the download landed
+  (`clearStartupProblem` was never the bug — that path works correctly and
+  was left untouched). The bug was treating "slow" and "stuck" as the same
+  thing for a step whose duration depends on network conditions the app has
+  no control over, and — per "owner cannot touch or read the phone" — a
+  message that shows up alarming and later retracts itself is one he may
+  well see only in its wrong state, exactly what happened: restarting a slow
+  download just throws away its progress and starts the countdown over,
+  which is why restarting "did not solve it." Fix: `startupStep` transitions
+  now go through `setStartupStep`, which also records when the current step
+  began (`stepStartedAt`), so the watchdog (`armStartupWatchdog`, now a 1s
+  poll instead of a single timer) can judge each step against its own
+  allowance instead of one shared deadline — a slow step 1 no longer leaves
+  step 2 looking instantly overdue the moment it begins. The pose-model
+  download step specifically gets two checkpoints instead of one: past
+  `STARTUP_WATCHDOG_MS` (15s) the status text calmly says loading is taking a
+  while — no alarm wording, nothing written to the persistent shot-log
+  banner — and only past the far more generous `STARTUP_MODEL_WATCHDOG_MS`
+  (45s) does it get the same "close the app and reopen it" treatment every
+  other stuck step still gets at 15s. This is a bound, not a disabled
+  watchdog: a model that truly never lands (bad URL, blocked host, no signal
+  at all) is still caught and reported, just with patience appropriate to a
+  large download instead of the tight bound that suits every other, download-
+  free startup step.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.

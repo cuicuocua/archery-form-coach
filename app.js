@@ -178,12 +178,14 @@ const CROP_BOX_STABLE_MAX_DELTA = 0.02; // the crop box's size AND position must
 // ===== STARTUP — timeouts, not calibration; safe to change without a coach. The owner cannot
 // read a console or tap anything mid-session (see CLAUDE.md's "one interaction" rule), so an app
 // that silently sits on "Starting camera…" forever is the worst failure mode there is for him —
-// he can't tell "still loading" from "dead". These two constants exist so startup can never hang
+// he can't tell "still loading" from "dead". These constants exist so startup can never hang
 // silently: VIDEO_READY_TIMEOUT_MS bounds one internal wait (see waitForVideoReady), and
-// STARTUP_WATCHDOG_MS bounds the whole of main() (see armStartupWatchdog) before the status text
-// is replaced with a plain-English line naming whatever step didn't finish.
+// STARTUP_WATCHDOG_MS/STARTUP_MODEL_WATCHDOG_MS together bound the whole of main() (see
+// armStartupWatchdog) before the status text is replaced with a plain-English line naming
+// whatever step didn't finish.
 const VIDEO_READY_TIMEOUT_MS = 5000; // how long ONE wait attempt for the video's real width/height runs before re-arming rather than staying stuck on that one attempt forever (see the retry loop in startCamera) — bounds each attempt, not the overall wait; STARTUP_WATCHDOG_MS below is what bounds the overall wait and tells the owner if dimensions never show up at all
-const STARTUP_WATCHDOG_MS = 15000; // if main() hasn't reached the live tracking state within this long, replace the status text with a message naming the stuck step (see armStartupWatchdog/startupStuckMessage) instead of leaving the generic "Loading…"/"Starting…" text up with no explanation
+const STARTUP_WATCHDOG_MS = 15000; // if a startup step OTHER than the pose-model download (see STARTUP_MODEL_WATCHDOG_MS below) hasn't finished within this long, treat it as stuck and report it — see armStartupWatchdog/startupStuckMessage. Also doubles as the "this is taking a while" checkpoint for the model-download step itself: past this point on a slow connection the status text says so, calmly, without raising the alarm yet.
+const STARTUP_MODEL_WATCHDOG_MS = 45000; // how long the pose-model DOWNLOAD step specifically gets before the watchdog gives up on it and raises the same alarm the other steps raise at STARTUP_WATCHDOG_MS. Field bug this fixes: the pose model is a multi-megabyte file (see POSE MODEL above), and on ordinary phone data at a shooting range, downloading it can genuinely take longer than STARTUP_WATCHDOG_MS while completely healthy — the owner saw exactly this: the "never finished loading" alarm fired, then cleared itself once the download landed and tracking started fine. A slow download is not the same failure as a step that will never finish; treating it as one made him restart the app several times, each restart throwing away whatever download progress the previous attempt had made. This is deliberately many times STARTUP_WATCHDOG_MS so an ordinary slow connection is never mistaken for a dead one — but it is still a bound, not a disabled watchdog: a model that truly never lands (bad URL, blocked host, no signal at all) is still caught and reported once this elapses.
 // ===========================================================================
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
@@ -230,11 +232,20 @@ let facingMode = "environment"; // rear camera first
 let rightHanded = true;
 let drawingUtils = null;
 
-// Which step of startup is currently in flight — read by the startup watchdog (see STARTUP
-// above) so its message can name the actual stuck step rather than a generic one. Only meaningful
-// while main() is still running; set at each transition in main()/startCamera() and never read
-// again once startup finishes.
+// Which step of startup is currently in flight, and when it started — read by the startup
+// watchdog (see STARTUP above) so its message can name the actual stuck step rather than a
+// generic one, and so each step is judged against its OWN allowance rather than one deadline for
+// the whole of main() (a slow step must not leave the next step looking instantly overdue the
+// moment it begins). Only meaningful while main() is still running; set together, at each
+// transition, by setStartupStep below — never assigned directly — and never read again once
+// startup finishes.
 let startupStep = "loading the pose model";
+let stepStartedAt = 0;
+
+function setStartupStep(step) {
+  startupStep = step;
+  stepStartedAt = performance.now();
+}
 
 // Set (see recordStartupProblem, further down) when startup stalls past STARTUP_WATCHDOG_MS or
 // fails outright — the persistent, plain-English record of a startup failure that renderShotLog
@@ -723,7 +734,7 @@ async function startCamera() {
   // fall into main()'s catch block and report a false "Error:" for a camera that is actually fine.
   video.play().catch(() => {});
 
-  startupStep = "waiting for the camera picture";
+  setStartupStep("waiting for the camera picture");
   // Each single call is bounded (VIDEO_READY_TIMEOUT_MS) so this can never hang the way `await
   // video.play()` used to — but a video that STILL has no real dimensions after one bounded wait
   // must not be treated as ready either, or startCamera() would return "successfully" with a 0×0
@@ -2165,40 +2176,72 @@ function clearStartupProblem() {
 }
 
 // Starts the startup watchdog: if main() hasn't finished (disarmed via the returned function)
-// within STARTUP_WATCHDOG_MS, the status text is replaced with a message naming whatever step was
-// still in flight (startupStep), AND the same fact is written to the persistent shot log (see
+// within a step's own allowance, the status text is replaced with a message naming whatever step
+// was still in flight (startupStep), AND the same fact is written to the persistent shot log (see
 // recordStartupProblem) so it is still there whenever the owner actually walks over. This is the
 // fix for the deeper failure, not just the video.play() hang above — ANY step that stalls (a
 // slow/broken model fetch, a camera permission prompt the owner never sees, a picture that never
 // arrives) leaves no exception for main()'s own catch block to report, since a promise that never
-// settles never throws. Returns a function that disarms the watchdog; call it as soon as startup
-// actually finishes (success OR error) so it can never fire after the fact and stomp on a status
-// the app has already resolved on its own.
+// settles never throws.
+//
+// Polls once a second (cheap; nothing here needs finer resolution) rather than firing once at a
+// single deadline, because — per setStartupStep — each step now gets judged against its own
+// allowance, and the pose-model download step gets TWO checkpoints, not one:
+//   - past STARTUP_WATCHDOG_MS: might just be a slow connection (see STARTUP_MODEL_WATCHDOG_MS's
+//     own comment for the field bug this fixes), so the status text says so CALMLY — no alarm, no
+//     "close the app and reopen it", nothing written to the persistent shot-log banner.
+//   - past STARTUP_MODEL_WATCHDOG_MS: only now is it treated the same as every other stuck step.
+// Every other step keeps the original single-checkpoint behaviour at STARTUP_WATCHDOG_MS — there
+// is no large download to explain a slow one, so a stall there is reported immediately, same as
+// before this fix. Per CLAUDE.md the owner may see whatever is on screen at one instant and never
+// again before he walks over, so a message that will go on to retract itself must never be the
+// alarming one — that's the whole reason the calm checkpoint exists as a separate step from the
+// alarm, rather than just pushing the single alarm threshold out to STARTUP_MODEL_WATCHDOG_MS.
+//
+// Returns a function that disarms the watchdog; call it as soon as startup actually finishes
+// (success OR error) so it can never fire after the fact and stomp on a status the app has already
+// resolved on its own.
 function armStartupWatchdog() {
-  const timer = setTimeout(() => {
+  let announcedSlowModel = false; // so the calm "still loading" checkpoint only overwrites the status text once, not every poll
+  const interval = setInterval(() => {
+    const step = startupStep;
+    const elapsedMs = performance.now() - stepStartedAt;
+    if (step === "loading the pose model") {
+      if (elapsedMs < STARTUP_MODEL_WATCHDOG_MS) {
+        if (!announcedSlowModel && elapsedMs >= STARTUP_WATCHDOG_MS) {
+          announcedSlowModel = true;
+          statusEl.classList.remove("hidden");
+          statusEl.textContent = "Still loading the pose tracker — this can take a while on a slow connection…";
+        }
+        return; // within this step's generous allowance — slow, not stuck, nothing alarming shown
+      }
+    } else if (elapsedMs < STARTUP_WATCHDOG_MS) {
+      return; // within this step's ordinary allowance
+    }
+    clearInterval(interval);
     statusEl.classList.remove("hidden");
-    statusEl.textContent = startupStuckMessage(startupStep);
+    statusEl.textContent = startupStuckMessage(step);
     recordStartupProblem(
-      `${startupStepProblem(startupStep)} — nothing was tracked this session.`,
-      `Startup hadn't finished after ${Math.round(STARTUP_WATCHDOG_MS / 1000)} seconds.`
+      `${startupStepProblem(step)} — nothing was tracked this session.`,
+      `Startup hadn't finished after ${Math.round(elapsedMs / 1000)} seconds.`
     );
-  }, STARTUP_WATCHDOG_MS);
-  return () => clearTimeout(timer);
+  }, 1000);
+  return () => clearInterval(interval);
 }
 
 async function main() {
+  setStartupStep("loading the pose model");
   const disarmWatchdog = armStartupWatchdog();
   try {
-    startupStep = "loading the pose model";
     statusEl.textContent = "Loading pose model…";
     await initPoseLandmarker();
     drawingUtils = new DrawingUtils(ctx);
 
-    startupStep = "starting the camera";
+    setStartupStep("starting the camera");
     statusEl.textContent = "Starting camera…";
     await startCamera(); // updates startupStep to "waiting for the camera picture" partway through, see startCamera
 
-    startupStep = "starting tracking";
+    setStartupStep("starting tracking");
     disarmWatchdog();
     clearStartupProblem(); // startup made it through after all — remove any watchdog banner left by a step that stalled earlier but then recovered on its own
     statusEl.classList.add("hidden");
