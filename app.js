@@ -176,6 +176,47 @@ const SETTLE_FRAMES_REQUIRED = 30; // consecutive good-tracking frames needed af
 const CROP_BOX_STABLE_MAX_DELTA = 0.02; // the crop box's size AND position must each change by less than this fraction of its own size, frame to frame, to count as settled rather than still catching up — see the derivation above. RAISE if measurements still look inflated right after a raise-to-hold transition (rare box shapes may need more than 4 frames to fully decay); LOWER only with real measured box-jitter data in hand, not a guess — too low and ordinary steady-state box jitter (never truly zero) could block eligibility forever
 // ===========================================================================
 
+// ===== ROUTINE-START ATTENTION GATING — performance/battery knob, not calibration; safe to
+// change without a coach, same family as ROI_*/SETTLE_*. Owner's own field report: "between
+// shots I move around a lot even just to nock the next arrow and I'd like to contain the app
+// functionality to only when I'm actually shooting." Right now the app runs the full pipeline
+// (pose detection at full rate, plus everything downstream) continuously, whether he's mid-shot
+// or nocking, turning to the quiver, or twenty feet away collecting arrows. This block lets the
+// app run pose detection at a slower, cheaper rate whenever things look plainly calm (see
+// attentionIsClearlyCalm below) and switch back to full rate the instant they don't — WITHOUT
+// ever fully turning detection off, which is what makes recovery structural rather than
+// something a threshold has to get right (see ATTENTION_GATING_ENABLED's own note, and the
+// runtime block further down, for the "cannot latch off" guarantee in detail).
+//
+// THE OWNER'S EXPLICIT INSTRUCTION, and the one rule everything below is built around: when this
+// detector is unsure, it must fail toward RECORDING, not toward idling. "A phantom row is
+// visible and he can tell me about it; a missed arrow is invisible and he never knows." In code
+// terms that becomes a deliberate asymmetry: allowing the app to go idle requires POSITIVE proof
+// of calm (attentionIsClearlyCalm returning true, held continuously for ATTENTION_IDLE_AFTER_MS)
+// — anything ambiguous keeps it engaged. Waking back up needs only the ABSENCE of that same
+// proof on a single sample — anything ambiguous wakes it up. The two checks share the exact same
+// function on purpose (see updateAttentionState): "should I stay idle" and "should I idle in the
+// first place" are literally the same question, asked with opposite defaults baked into which
+// side of the boolean each caller trusts.
+//
+// GEOMETRY-FIX NOTE (see the PM's brief this was built from): ATTENTION_REST_HAND_SEP_MAX and
+// ATTENTION_REST_MOVE_MAX_PER_SEC are both torso-length-scaled distances, computed the exact same
+// Math.hypot(...)/torsoLength(...) way as DRAW_ATTEMPT_MIN_SEP and FULL_DRAW_STILL_MAX already
+// are elsewhere in this file — deliberately, so that when the in-progress fix to this app's
+// coordinate maths lands (MediaPipe's x/y are normalised to frame WIDTH/HEIGHT separately, not
+// one shared scale, so today's Euclidean distances are stretched on a non-square frame), these
+// two constants inherit the correction automatically through the shared torsoLength() function,
+// the same way DRAW_ATTEMPT_MIN_SEP will. They were NOT tuned against today's distorted numbers —
+// they're set relative to DRAW_ATTEMPT_MIN_SEP/FULL_DRAW_STILL_MAX's own existing values instead
+// (comfortably below/above them) specifically so they stay sensibly related after that fix, but
+// whoever does that retuning should still sanity-check these two alongside it.
+const ATTENTION_GATING_ENABLED = true; // master on/off switch. Set to false to go back to full-rate detection on every frame, exactly like before this feature existed — flip this first if the detector is ever suspected of causing trouble in the field. Structural safety net even while true: idle NEVER means "stopped detecting", only "detecting less often" (see the runtime block below) — so this switch changes cost, never correctness or recoverability
+const ATTENTION_IDLE_SAMPLE_INTERVAL_MS = 150; // while idle, pose detection still runs this often — this (plus one frame's own processing time) is the WORST-CASE delay between the owner actually starting a routine and the app noticing and returning to full rate. LOWER for a faster reaction (less battery/heat saved); RAISE for more battery/heat saved (slower reaction) — keep it well under SHOT_MIN_DURATION_MS (600ms) so a genuine draw can never start and finish inside one blind gap; see the selfTest assertion enforcing that relationship
+const ATTENTION_IDLE_AFTER_MS = 1500; // how long the calm condition below must hold, continuously, before the app allows itself to idle at all — a single calm-looking frame proves nothing (an archer pausing mid-routine for a second looks identical for one frame), so this requires a genuine held stretch of stillness, not just one lucky sample. RAISE to make the app more reluctant to idle (safer, more battery used); LOWER to idle sooner
+const ATTENTION_REST_HAND_SEP_MAX = 0.2; // hand separation (torso-length fraction) at/below which the hands count as "relaxed" for the calm check — deliberately well BELOW DRAW_ATTEMPT_MIN_SEP (0.3, the floor that starts a tracked attempt), so hands can never be resting by this measure's standard while also being in the middle of a real draw attempt; see the invariant assertion in selfTest. RAISE cautiously (never above DRAW_ATTEMPT_MIN_SEP) if ordinary at-rest hand position sits higher than expected; LOWER for a stricter definition of "relaxed"
+const ATTENTION_REST_MOVE_MAX_PER_SEC = 0.5; // how fast the body's reference point (hip midpoint, see bodyReferencePoint) may drift, in torso-lengths per second, and still count as "not walking/stepping". Ordinary standing sway is a small fraction of this; a real step or a walk toward/away from the line covers far more than a torso-length in a second. RAISE if ordinary standing sway is ever mistaken for movement (blocks idling, safe but wastes battery); LOWER if genuine walking is ever mistaken for standing still (also safe on its own — it only delays idling — but defeats the point of this feature if it happens often)
+// ===========================================================================
+
 // ===== STARTUP — timeouts, not calibration; safe to change without a coach. The owner cannot
 // read a console or tap anything mid-session (see CLAUDE.md's "one interaction" rule), so an app
 // that silently sits on "Starting camera…" forever is the worst failure mode there is for him —
@@ -726,6 +767,190 @@ function advanceSettling(cropBoxUsedThisFrame, cropBoxStableThisFrame) {
 function resetSettling() {
   settledFrames = 0;
   prevUsedCropBox = null;
+}
+// ===========================================================================
+
+// ===== ROUTINE-START ATTENTION GATING — runtime state and the logic behind the constants above.
+// See that block's own comment for the full reasoning; this is the mechanism.
+
+let attentionEngaged = true; // true = full rate (every frame gets pose detection); false = idle (throttled, see ATTENTION_IDLE_SAMPLE_INTERVAL_MS in renderLoop). Starts true: fail toward recording from the very first frame, same as everything else in this feature — the owner may start shooting right after the page loads, and there is no "calm" evidence yet either way to justify starting idle
+let attentionCalmSinceMs = null; // wall-clock time the CURRENT unbroken streak of "clearly calm" samples began, or null if the most recent sample wasn't calm. Only meaningful while engaged — see updateAttentionState
+let attentionLastIdleSampleMs = null; // performance.now() of the last frame that actually ran detection while idle — renderLoop throttles against this, not a frame counter, so the pacing is real elapsed time regardless of the device's actual frame rate
+let attentionLastEvalMs = null; // performance.now() of the last sample actually fed to attentionIsClearlyCalm (engaged frame or idle sample alike) — the basis for the body-stillness speed calculation below, which needs real elapsed time between two ACTUAL samples, not between two rAF ticks (most of which are skipped while idle)
+let attentionPrevRef = null; // bodyReferencePoint() from the last actual sample — compared against this frame's own to judge "not walking", same hysteresis-free instantaneous-speed approach isAtFullDraw already uses for wrist stillness
+// Transparency counters — the owner can't watch this decision happen live any more than any of
+// the other automatic decisions in this file, so what it did has to be readable afterwards, in
+// its own words, distinguishable from rejectedAttemptCount/unsettledAttemptCount (see
+// renderShotLog): those two are about attempts that WERE tracked and then judged; these two are
+// about the attention layer's own behaviour, never reset mid-session, same treatment as every
+// other running total in this file.
+let attentionIdlePeriods = 0; // how many times this session the app allowed itself to idle between shots
+let attentionLateWakeCount = 0; // how many of those idle periods ended on a sample where hand separation was ALREADY past DRAW_ATTEMPT_MIN_SEP — meaning the real start of that movement happened sometime during the idle gap just slept through, not on the exact frame that noticed it. See its own comment at the increment site below for what this does and doesn't mean
+
+// Two wrists' separation, scaled by torso length — the same "how far apart are the hands" signal
+// isAtFullDraw uses internally (see FULL_DRAW_HAND_SEP_MIN/DRAW_ATTEMPT_MIN_SEP above), but kept
+// as its own small function here rather than reaching into isAtFullDraw's own computation, which
+// is being reworked by a different engineer in parallel right now (the geometry-maths fix) — this
+// stays deliberately independent so the two changes land on different lines and merge cleanly.
+// Same "never guess" convention as the rest of the file: null if either wrist isn't confidently
+// visible, or there's no usable torso-length scale reference.
+function handSeparationForAttention(landmarks) {
+  const bowWrist = rightHanded ? L_WRIST : R_WRIST;
+  const drawWrist = rightHanded ? R_WRIST : L_WRIST;
+  if (!visible(landmarks, bowWrist) || !visible(landmarks, drawWrist)) return null;
+  const scale = attentionScale(landmarks);
+  if (!scale) return null;
+  const a = landmarks[bowWrist];
+  const b = landmarks[drawWrist];
+  return Math.hypot(a.x - b.x, a.y - b.y) / scale;
+}
+
+// Shared torso-length scale reference for this block — draw side preferred, bow side as
+// fallback, the same convention used everywhere else in this file (isAtFullDraw, shoulderDropOf).
+function attentionScale(landmarks) {
+  const drawShoulder = rightHanded ? R_SHOULDER : L_SHOULDER;
+  const drawHip = rightHanded ? R_HIP : L_HIP;
+  const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
+  const bowHip = rightHanded ? L_HIP : R_HIP;
+  return torsoLength(landmarks, drawShoulder, drawHip) ?? torsoLength(landmarks, bowShoulder, bowHip);
+}
+
+// The midpoint between the two hips — a stable whole-body reference point that isn't a hand and
+// doesn't itself move as part of a normal draw, used to tell "standing settled" apart from
+// "walking/stepping" (see ATTENTION_REST_MOVE_MAX_PER_SEC). Null if either hip isn't confidently
+// visible — same "never guess" convention as the rest of the file.
+function bodyReferencePoint(landmarks) {
+  if (!visible(landmarks, L_HIP) || !visible(landmarks, R_HIP)) return null;
+  return {
+    x: (landmarks[L_HIP].x + landmarks[R_HIP].x) / 2,
+    y: (landmarks[L_HIP].y + landmarks[R_HIP].y) / 2,
+  };
+}
+
+// THE core signal, and the one function both directions of the state machine below share (see
+// the constants block's own comment for why sharing it is the whole point). Pure — no module
+// state read or written — so selfTest can drive it directly with fixture landmarks. Returns
+// whether THIS ONE sample looks clearly calm: no landmarks at all (nobody there to be shooting —
+// unambiguous), or landmarks present with both hands confidently relaxed together AND (when
+// there's a previous sample to compare against) the body not stepping/walking. Anything else —
+// a wrist not visible, no usable scale, hands apart, or the body moving — returns false. This is
+// deliberately NOT symmetric with "is a draw happening": it only ever answers "is there positive
+// proof of calm", which is exactly the bar fail-toward-recording needs on both ends (see
+// updateAttentionState): allowing idle requires this to be true; staying idle requires it to
+// keep being true; anything else, on either end, defaults toward engaged.
+function attentionIsClearlyCalm(landmarks, prevRef, dtSec) {
+  if (!landmarks) return true;
+  const handSep = handSeparationForAttention(landmarks);
+  if (handSep === null || handSep > ATTENTION_REST_HAND_SEP_MAX) return false;
+  const ref = bodyReferencePoint(landmarks);
+  if (ref && prevRef && dtSec > 0) {
+    const scale = attentionScale(landmarks);
+    if (!scale) return false;
+    const speed = Math.hypot(ref.x - prevRef.x, ref.y - prevRef.y) / scale / dtSec;
+    if (speed > ATTENTION_REST_MOVE_MAX_PER_SEC) return false;
+  }
+  return true;
+}
+
+// Runs once per sample (every engaged frame, or one idle-rate sample while idle — see
+// renderLoop) and updates attentionEngaged for the FRAMES THAT FOLLOW. Deliberately called with
+// RAW (crop-mapped, pre-smoothing) landmarks, never the smoothed ones — this decision needs to
+// react as fast as possible, and One Euro's whole job is adding a little lag in exchange for
+// steadiness, which is exactly what this must NOT have.
+//
+// `gatingEnabled` and `modelReady` default to the module constant/flag they mirror, but are
+// threaded through explicitly (like `nowMs`/`frameEligible` already are elsewhere in this file)
+// so selfTest can prove the master-switch and warm-up-guard behaviour directly, without needing
+// a mutable module-level constant or having to actually run the pose-model warm-up first.
+//
+// PIPELINE SETTLING, worked through as the brief asked: the moment this function decides to
+// re-engage (idle -> engaged), it resets landmarkSmoother, the settling counter, and the ROI crop
+// box — the exact same three things every other recovery point in this file resets (session
+// start, tracking lost, camera switched; see PIPELINE SETTLING above) — and it does so BEFORE
+// returning, so the render loop's own smoothing/settling/isAtFullDraw calls for THIS SAME frame
+// run against the fresh state, not the frame after. That ordering matters: if the reset happened
+// one frame later, this frame's own advanceSettling() call could read a settledFrames count left
+// over from a streak that ended seconds ago (whatever it was before the app went idle), letting a
+// frame right after a long idle gap read as "already settled" — exactly the bias the PIPELINE
+// SETTLING work already fixed once, in a new shape. Going idle itself does NOT reset anything:
+// there is nothing worth resetting FOR while idle (attempt is null by construction the entire
+// time — see the hard rule below — so nothing idle samples see ever reaches the shot log), and
+// resetting on the way in would just mean paying the same reset twice for one idle stretch.
+function updateAttentionState(nowMs, landmarks, gatingEnabled = ATTENTION_GATING_ENABLED, modelReady = modelDecisionMade) {
+  if (!gatingEnabled) {
+    attentionEngaged = true;
+    return;
+  }
+  // The one-time pose-model warm-up measurement (see POSE MODEL above) needs every one of its
+  // frames spaced at the pipeline's real full-rate cadence to mean anything — an idle throttle
+  // landing mid-measurement would stretch the window's wall-clock length without changing the
+  // frame count, quietly deflating the reported "rendered fps" without that being a real
+  // slowdown. The owner is very likely standing calmly at exactly this moment (still setting the
+  // phone up), which makes this a real, not just theoretical, collision. So: no idling at all
+  // until that one-time decision has been made.
+  if (!modelReady) {
+    attentionEngaged = true;
+    return;
+  }
+
+  const dtSec = attentionLastEvalMs === null ? 0 : (nowMs - attentionLastEvalMs) / 1000;
+  const calm = attentionIsClearlyCalm(landmarks, attentionPrevRef, dtSec);
+  attentionPrevRef = landmarks ? bodyReferencePoint(landmarks) : null;
+  attentionLastEvalMs = nowMs;
+
+  // Hard rule, checked first, that nothing below is allowed to override: an attempt in progress
+  // must never see the pipeline idle out from under it. In practice this can never actually fire
+  // — ATTENTION_REST_HAND_SEP_MAX sits below DRAW_ATTEMPT_MIN_SEP by construction (see that
+  // constant's own comment and the invariant selfTest checks), so hands cannot be "calm" by this
+  // function's own standard while an attempt is open — but it stays here, explicit, as a second
+  // independent guarantee that doesn't rely on remembering that numeric relationship correctly
+  // forever, and it also documents the intent directly rather than leaving it implicit.
+  if (attempt) {
+    attentionCalmSinceMs = null;
+    attentionEngaged = true;
+    return;
+  }
+
+  if (attentionEngaged) {
+    if (!calm) {
+      attentionCalmSinceMs = null;
+      return; // stays engaged
+    }
+    if (attentionCalmSinceMs === null) attentionCalmSinceMs = nowMs;
+    if (nowMs - attentionCalmSinceMs >= ATTENTION_IDLE_AFTER_MS) {
+      attentionEngaged = false;
+      attentionIdlePeriods++;
+    }
+    return;
+  }
+
+  // Currently idle. Fail-toward-recording in its most literal form: the instant this sample is
+  // NOT clearly calm any more, engage — no second confirming sample, no cooldown, nothing else
+  // has to also be true. A landmarks-null sample (still nobody there) or a relaxed-and-still
+  // sample keeps it idle; anything else at all wakes it up.
+  if (!calm) {
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    // If hands are ALREADY past the attempt-start floor on the very sample that woke this up,
+    // the real start of the movement happened sometime during the idle gap just slept through,
+    // not on this exact sample — the ATTENTION_IDLE_SAMPLE_INTERVAL_MS worst case made real. This
+    // does NOT mean the shot was missed: trackShotAttempt still starts a fresh attempt this same
+    // frame and measures forward from here exactly as it always does; it means the small window
+    // documented above (see the constants block's GEOMETRY-FIX note and ATTENTION_IDLE_SAMPLE_
+    // INTERVAL_MS's own comment) applied this time, so this attempt's very first instant, and any
+    // clip recording it, may start a beat later than the real movement did. Counted separately
+    // from rejectedAttemptCount/unsettledAttemptCount on purpose — this is neither "that wasn't a
+    // real draw" nor "the pipeline wasn't settled"; it's "the attention layer noticed a moment
+    // later than an always-on pipeline would have."
+    const wokeHandSep = landmarks ? handSeparationForAttention(landmarks) : null;
+    if (wokeHandSep !== null && wokeHandSep >= DRAW_ATTEMPT_MIN_SEP) attentionLateWakeCount++;
+    // Re-engaging is exactly like every other recovery point in PIPELINE SETTLING (session
+    // start, tracking lost, camera switched) — see this function's own top comment for why the
+    // reset happens HERE, synchronously, before this same frame's landmarks get smoothed/settled.
+    landmarkSmoother.reset();
+    resetSettling();
+    currentCropBox = null;
+  }
 }
 // ===========================================================================
 
@@ -2065,9 +2290,25 @@ function renderShotLog() {
     unsettledAttemptCount > 0
       ? `<div class="shotlog-rejected">${unsettledAttemptCount} arrow${unsettledAttemptCount === 1 ? "" : "s"} drawn before the app finished settling weren't recorded — give it a few seconds after starting before your first shot.</div>`
       : "";
+  // ROUTINE-START ATTENTION GATING transparency — see that block's own comment for why this
+  // exists at all: the owner can't watch the app decide to pause between shots any more than he
+  // can watch anything else in this file happen live. Shown only once it's actually done
+  // something (idled at least once), same >0 gating as the two lines above, and worded
+  // differently from both on purpose: this isn't a claim about whether a movement was a real
+  // draw (rejectedBit) or whether the pipeline was ready to measure one (unsettledBit) — it's a
+  // plain statement that the app throttled itself to save battery between shots, and always came
+  // back before anything was lost.
+  const attentionBit =
+    ATTENTION_GATING_ENABLED && attentionIdlePeriods > 0
+      ? `<div class="shotlog-rejected">Paused full tracking between shots ${attentionIdlePeriods} time${attentionIdlePeriods === 1 ? "" : "s"} to save battery, checking every ${ATTENTION_IDLE_SAMPLE_INTERVAL_MS}ms for movement.${
+          attentionLateWakeCount > 0
+            ? ` ${attentionLateWakeCount} of those ${attentionLateWakeCount === 1 ? "time" : "times"} noticed the next movement only after it had already started — that shot (and its clip, if it has one) may be missing its very first instant.`
+            : ""
+        }</div>`
+      : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -2103,7 +2344,7 @@ function renderShotLog() {
   const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -2197,6 +2438,24 @@ function renderLoop() {
 
   if (!poseLandmarker || video.readyState < 2) return;
 
+  // ROUTINE-START ATTENTION GATING: while idle, pose detection (the expensive step) only runs
+  // every ATTENTION_IDLE_SAMPLE_INTERVAL_MS — everything below this point in renderLoop is
+  // skipped on the frames in between. This is the ONLY thing idle changes: detection still runs,
+  // just less often, so there is no state in which the app has stopped watching for the owner to
+  // start (see ATTENTION_GATING_ENABLED's own comment for why that's structural, not a promise).
+  // While engaged, this never skips anything — every frame behaves exactly as it did before this
+  // feature existed.
+  if (ATTENTION_GATING_ENABLED && !attentionEngaged) {
+    const dueForIdleSample =
+      attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
+    if (!dueForIdleSample) {
+      withMirror(drawVideoFrame); // keep the on-screen view (and a clip, if one were somehow recording) alive even on a skipped frame
+      syncDebugOverlay();
+      return;
+    }
+    attentionLastIdleSampleMs = now; // this frame IS the idle sample — the next one is due no sooner than a full interval from now
+  }
+
   const frameWidth = video.videoWidth;
   const frameHeight = video.videoHeight;
 
@@ -2232,6 +2491,13 @@ function renderLoop() {
   if (rawLandmarks && usedCropBox) {
     rawLandmarks = rawLandmarks.map((lm) => mapCropLandmarkToFullFrame(lm, usedCropBox, frameWidth, frameHeight));
   }
+
+  // Decide whether the app should be engaged (full rate) or idle for the frames that follow —
+  // see updateAttentionState's own comment for why this runs on the RAW, pre-smoothing landmarks
+  // and BEFORE the smoothing/settling below, not after: if this call is about to re-engage from
+  // idle, it resets landmarkSmoother/settledFrames/currentCropBox synchronously, so everything
+  // from here to the end of this same frame already runs against the fresh, reset state.
+  updateAttentionState(now, rawLandmarks);
 
   if (!rawLandmarks) {
     withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
@@ -2530,6 +2796,13 @@ function selfTest() {
   const savedUnsettledAttemptCount = unsettledAttemptCount;
   const savedSettledFrames = settledFrames;
   const savedPrevUsedCropBox = prevUsedCropBox;
+  const savedAttentionEngaged = attentionEngaged;
+  const savedAttentionCalmSinceMs = attentionCalmSinceMs;
+  const savedAttentionLastIdleSampleMs = attentionLastIdleSampleMs;
+  const savedAttentionLastEvalMs = attentionLastEvalMs;
+  const savedAttentionPrevRef = attentionPrevRef;
+  const savedAttentionIdlePeriods = attentionIdlePeriods;
+  const savedAttentionLateWakeCount = attentionLateWakeCount;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   // Every fixture below except the dedicated ASPECT-RATIO CORRECTNESS section further down was
@@ -4043,6 +4316,190 @@ function selfTest() {
     "front camera, toggle on, should flip to unmirrored (away from its mirrored default)"
   );
 
+  // --- ROUTINE-START ATTENTION GATING: attentionIsClearlyCalm first, as a pure function, then
+  // updateAttentionState as the state machine built on top of it. Reuses mkLandmarks/base from
+  // above — same shared skeleton scale (torso length 0.3), same rightHanded === true.
+  {
+    const restLandmarks = mkLandmarks({
+      ...base,
+      15: { x: 0.4, y: 0.3 }, // bow wrist
+      16: { x: 0.42, y: 0.3 }, // draw wrist, right next to it — hands relaxed together
+    });
+    console.assert(
+      attentionIsClearlyCalm(null, null, 0) === true,
+      "no landmarks at all (nobody in frame) should read as clearly calm — nothing to be shooting"
+    );
+    console.assert(
+      attentionIsClearlyCalm(restLandmarks, null, 0) === true,
+      "relaxed hands, with no previous reference point to judge stillness against yet, should read as clearly calm"
+    );
+
+    const drawnLandmarks = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
+    console.assert(
+      attentionIsClearlyCalm(drawnLandmarks, null, 0) === false,
+      "hands far apart (a real draw) must never read as clearly calm"
+    );
+
+    const noWristLandmarks = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3, visibility: 0 }, 16: { x: 0.42, y: 0.3 } });
+    console.assert(
+      attentionIsClearlyCalm(noWristLandmarks, null, 0) === false,
+      "an invisible wrist can't confirm the hands are relaxed — must not read as clearly calm"
+    );
+
+    const calmRef = bodyReferencePoint(restLandmarks);
+    console.assert(
+      attentionIsClearlyCalm(restLandmarks, calmRef, 1) === true,
+      "an unmoved body reference point over a full second should still read as clearly calm"
+    );
+    const farRef = { x: calmRef.x + 1, y: calmRef.y }; // ~3+ torso-lengths of drift in one second — unmistakably walking
+    console.assert(
+      attentionIsClearlyCalm(restLandmarks, farRef, 1) === false,
+      "a body reference point that moved far in one second (walking) must not read as clearly calm, even with relaxed hands"
+    );
+
+    // Numeric invariants the state machine's hard rule and structural safety depend on — see
+    // updateAttentionState's own comments for what each protects.
+    console.assert(
+      ATTENTION_REST_HAND_SEP_MAX < DRAW_ATTEMPT_MIN_SEP,
+      "ATTENTION_REST_HAND_SEP_MAX must stay below DRAW_ATTEMPT_MIN_SEP, or a real in-progress attempt could read as 'calm' and be allowed to idle"
+    );
+    console.assert(
+      ATTENTION_IDLE_SAMPLE_INTERVAL_MS < SHOT_MIN_DURATION_MS,
+      "ATTENTION_IDLE_SAMPLE_INTERVAL_MS must stay below SHOT_MIN_DURATION_MS — otherwise a genuine draw could start and finish entirely inside a single blind idle-sampling gap and never be noticed by any sample at all"
+    );
+
+    // --- updateAttentionState: the state machine. Fresh, isolated state for this block; restored
+    // (like everything else in this file's selfTest) from the outer save/restore at the very end.
+    attempt = null;
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    attentionLastIdleSampleMs = null;
+    attentionLastEvalMs = null;
+    attentionPrevRef = null;
+    attentionIdlePeriods = 0;
+    attentionLateWakeCount = 0;
+    settledFrames = SETTLE_FRAMES_REQUIRED; // pretend already settled, so the reset-on-re-engage effect below is actually observable
+    currentCropBox = { x: 10, y: 10, size: 50 };
+    prevUsedCropBox = { x: 10, y: 10, size: 50 };
+
+    const calmLm = restLandmarks;
+    const drawLm = drawnLandmarks;
+    // Thin wrapper so the state-machine tests below don't have to pass `true` for `modelReady`
+    // on every call — this whole block is about the idle/engage logic itself, not the pose-model
+    // warm-up guard (covered separately: production renderLoop always defaults modelReady to the
+    // real modelDecisionMade flag). gatingEnabled still defaults to true and can be overridden
+    // per call, same as updateAttentionState's own default.
+    const callAttention = (nowMs, lm, gatingEnabled = true) => updateAttentionState(nowMs, lm, gatingEnabled, true);
+
+    let t = 0;
+    callAttention(t, calmLm);
+    console.assert(attentionEngaged === true, "a single calm sample must not idle immediately — ATTENTION_IDLE_AFTER_MS hasn't elapsed yet");
+
+    t += ATTENTION_IDLE_AFTER_MS - 1;
+    callAttention(t, calmLm);
+    console.assert(attentionEngaged === true, "calm held for just under the idle threshold must still be engaged");
+
+    t += 2;
+    callAttention(t, calmLm);
+    console.assert(attentionEngaged === false, "calm held continuously past ATTENTION_IDLE_AFTER_MS should allow the app to idle");
+    console.assert(attentionIdlePeriods === 1, "going idle should count as exactly one idle period");
+
+    // --- Recovery ("it recovers from every idle state"): the very next sample that isn't clearly
+    // calm must engage immediately, with no extra delay beyond this one sample.
+    callAttention(t + 50, drawLm);
+    console.assert(attentionEngaged === true, "a not-calm sample while idle must engage on that very sample — the routine-start case");
+
+    // --- PIPELINE SETTLING interaction, worked through as the brief asked: re-engaging must
+    // reset settling/smoothing/crop state, so a frame right after a long idle stretch is treated
+    // exactly like a fresh reset — not as already settled just because it happened to be settled
+    // before the app went idle.
+    console.assert(settledFrames === 0, "re-engaging from idle should reset the settling counter, same as any other PIPELINE SETTLING recovery point");
+    console.assert(currentCropBox === null, "re-engaging from idle should drop the crop box, same as any other recovery point");
+    console.assert(prevUsedCropBox === null, "re-engaging from idle should clear prevUsedCropBox too — resetSettling's own job, reused here");
+
+    // --- Cannot latch off: drive several idle/wake cycles back to back and confirm engaged is
+    // ALWAYS true the instant a not-calm sample arrives, regardless of how many cycles came
+    // before — no counter or cooldown anywhere in this function can make a wake-up "reluctant".
+    let tt = t + 1000;
+    for (let cycle = 0; cycle < 5; cycle++) {
+      for (let i = 0; i < 5; i++) {
+        tt += 400;
+        callAttention(tt, calmLm);
+      }
+      tt += ATTENTION_IDLE_AFTER_MS + 100;
+      callAttention(tt, calmLm);
+      console.assert(attentionEngaged === false, `cycle ${cycle}: sustained calm should reach idle`);
+      tt += 10;
+      callAttention(tt, drawLm);
+      console.assert(attentionEngaged === true, `cycle ${cycle}: the very next not-calm sample must engage — no latch-off, ever`);
+    }
+
+    // --- Fail toward recording: a genuinely AMBIGUOUS movement — hands apart enough not to be
+    // relaxed, but nowhere near a real draw attempt (DRAW_ATTEMPT_MIN_SEP) — is exactly the kind
+    // of thing nocking, adjusting a release aid, or turning partway could look like. It must
+    // still engage, never idle through it: "treated as shooting, not discarded."
+    const ambiguousLm = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3 }, 16: { x: 0.48, y: 0.32 } });
+    const ambigScale = torsoLength(ambiguousLm, R_SHOULDER, R_HIP);
+    const ambigHandSep = Math.hypot(ambiguousLm[16].x - ambiguousLm[15].x, ambiguousLm[16].y - ambiguousLm[15].y) / ambigScale;
+    console.assert(
+      ambigHandSep > ATTENTION_REST_HAND_SEP_MAX && ambigHandSep < DRAW_ATTEMPT_MIN_SEP,
+      "the ambiguous fixture should sit strictly between 'clearly relaxed' and 'a real draw attempt', or this isn't testing the ambiguous case at all"
+    );
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    attentionLateWakeCount = 0; // the "cannot latch off" cycles above woke on drawLm repeatedly, each a late wake on its own terms — reset so this check is about THIS wake only
+    let t2 = tt + 1000;
+    callAttention(t2, calmLm);
+    t2 += ATTENTION_IDLE_AFTER_MS + 50;
+    callAttention(t2, calmLm);
+    console.assert(attentionEngaged === false, "setup: should be idle before the ambiguous sample");
+    callAttention(t2 + 10, ambiguousLm);
+    console.assert(
+      attentionEngaged === true,
+      "an ambiguous movement — neither clearly relaxed nor a clean full draw — must engage, not stay idle: fail toward recording"
+    );
+    console.assert(attentionLateWakeCount === 0, "the ambiguous fixture is below DRAW_ATTEMPT_MIN_SEP, so waking on it must not count as a late wake");
+
+    // --- Late-wake counting: a sample that wakes the app up with hands ALREADY past
+    // DRAW_ATTEMPT_MIN_SEP means the real start of that movement happened sometime during the
+    // idle gap just slept through — counted separately from rejectedAttemptCount/
+    // unsettledAttemptCount (see the constant's own comment), so it must go up here.
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    attentionLateWakeCount = 0; // isolate this specific wake's contribution from the ambiguous-wake check just above
+    let t3 = t2 + 1000;
+    callAttention(t3, calmLm);
+    t3 += ATTENTION_IDLE_AFTER_MS + 50;
+    callAttention(t3, calmLm);
+    console.assert(attentionEngaged === false, "setup: should be idle again before the late-wake sample");
+    callAttention(t3 + 10, drawLm);
+    console.assert(attentionEngaged === true, "waking on an already-past-floor sample should still engage");
+    console.assert(attentionLateWakeCount === 1, "waking up on a sample where hands are already past DRAW_ATTEMPT_MIN_SEP should count as exactly one late wake");
+
+    // --- Hard rule: an attempt in progress must never be allowed to idle, no matter what a
+    // single sample looks like. Can't actually happen given the ATTENTION_REST_HAND_SEP_MAX <
+    // DRAW_ATTEMPT_MIN_SEP invariant above, but this is the explicit, defensive guarantee, not
+    // one relying on remembering that numeric relationship forever.
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    attempt = { startMs: 0, peakHandSep: 0.5, eligibleFrames: [], eligibleSeen: 0, reachedFullDraw: false };
+    let t4 = t3 + 1000;
+    for (let i = 0; i < 20; i++) {
+      t4 += ATTENTION_IDLE_AFTER_MS / 4;
+      callAttention(t4, calmLm); // feeding CALM landmarks on purpose — the hard rule must win regardless of the sample
+      console.assert(attentionEngaged === true, "an attempt in progress must never be allowed to idle, no matter what the sample looks like");
+    }
+    attempt = null;
+
+    // --- Master switch: gatingEnabled=false must force full-rate engagement unconditionally,
+    // even starting from idle — proven directly via the explicit parameter (see
+    // updateAttentionState's own comment on why it's threaded through rather than read from the
+    // module constant, the same convention nowMs/frameEligible already use elsewhere).
+    attentionEngaged = false;
+    callAttention(t4 + 100, calmLm, false);
+    console.assert(attentionEngaged === true, "gatingEnabled=false must force engaged, even starting from idle");
+  }
+
   selfTestInProgress = false;
   rightHanded = savedHanded;
   lastDrawWrist = savedLastWrist;
@@ -4053,9 +4510,45 @@ function selfTest() {
   unsettledAttemptCount = savedUnsettledAttemptCount;
   settledFrames = savedSettledFrames;
   prevUsedCropBox = savedPrevUsedCropBox;
+  attentionEngaged = savedAttentionEngaged;
+  attentionCalmSinceMs = savedAttentionCalmSinceMs;
+  attentionLastIdleSampleMs = savedAttentionLastIdleSampleMs;
+  attentionLastEvalMs = savedAttentionLastEvalMs;
+  attentionPrevRef = savedAttentionPrevRef;
+  attentionIdlePeriods = savedAttentionIdlePeriods;
+  attentionLateWakeCount = savedAttentionLateWakeCount;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
+
+// ===== TEST HOOKS — read-only introspection for automated (Playwright) verification of the
+// ROUTINE-START ATTENTION GATING feature, behind an explicit URL flag so this never activates in
+// normal use and never ships anything extra to the owner's phone in practice. Exposes exactly the
+// module state an outside test needs to read — nothing this file doesn't already track for
+// itself — and nothing to WRITE with: no setters, no way for a test to drive the app any
+// differently than a real session would. window.__testHooks.getState() is a plain snapshot,
+// safe to call as often as a test likes (e.g. to poll for a state transition).
+const TEST_HOOKS = location.search.includes("testhooks");
+if (TEST_HOOKS) {
+  window.__testHooks = {
+    getState: () => ({
+      shotCount,
+      logLength: log.length,
+      log: log.map((e) => ({ shotNum: e.shotNum, handSep: e.handSep, reachedFullDraw: e.reachedFullDraw, hasClip: !!e.clipUrl })),
+      rejectedAttemptCount,
+      unsettledAttemptCount,
+      attemptInProgress: attempt !== null,
+      attentionEngaged,
+      attentionIdlePeriods,
+      attentionLateWakeCount,
+      settledFrames,
+      hasCropBox: currentCropBox !== null,
+      attemptEligibleFrames: attempt ? attempt.eligibleFrames.length : null,
+      attemptPeakHandSep: attempt ? attempt.peakHandSep : null,
+    }),
+  };
+}
+// ===========================================================================
 
 if (location.search.includes("selftest")) selfTest();
 
