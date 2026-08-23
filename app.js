@@ -1268,9 +1268,8 @@ function medianSampleOf(frames) {
 // Two gates first, both against the attempt's own peak (ALL frames, eligible or not — see
 // trackShotAttempt above) — see SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS above for
 // why these two specifically. An attempt that fails either one gets thrown away, not logged:
-// counted in rejectedAttemptCount, and any clip recording still running for it gets finalised
-// (and therefore its capture track stopped) right now rather than left to expire on its own —
-// see finalizeRecording, and CLAUDE.md on why a clip must never outlive the shot it belongs to.
+// counted in rejectedAttemptCount, and any clip recording still running for it gets DISCARDED
+// (see discardRecording) right now rather than left to expire on its own.
 //
 // A THIRD, separate case, checked only once the attempt has cleared both gates above: a real
 // draw attempt whose every single frame happened to be unsettled (see PIPELINE SETTLING above)
@@ -1278,7 +1277,18 @@ function medianSampleOf(frames) {
 // rejectedAttemptCount (noise that was never plausibly a draw at all): the owner really did draw
 // the bow here, the app just never got a settled enough look at it to log a number. Counted and
 // reported separately — unsettledAttemptCount, its own line in the log — so the two can never be
-// confused for each other; see renderShotLog.
+// confused for each other; see renderShotLog. Its recording is discarded the same way as the
+// rejected case above — no shot ever gets logged for this attempt either.
+//
+// Both of these throw the ATTEMPT away, not just its recording — no shot ever gets logged for
+// it, so its clip (if any) must never raise the "at least one clip failed" banner or explain
+// itself on some unrelated later row (see discardRecording / resolveClipOutcome's own discarded
+// check). A field bug caught this the hard way: a single landmark-noise blip lasting one or two
+// frames is easily long enough to cross DRAW_ATTEMPT_MIN_SEP and start a real recording, but far
+// too short for canvas.captureStream/MediaRecorder to ever encode a single frame of video before
+// it's thrown away here — that recording resolving with zero chunks used to read as a genuine
+// recording FAILURE and raise the banner, even in a session where the one real shot recorded
+// perfectly.
 function endAttempt(nowMs) {
   if (!attempt) return;
   const a = attempt;
@@ -1289,14 +1299,14 @@ function endAttempt(nowMs) {
 
   if (!gotDeepEnough || !lastedLongEnough) {
     rejectedAttemptCount++;
-    finalizeRecording(activeRecording); // this attempt's clip (if any) never gets a shot number — drop it and stop its capture track now, not later
+    discardRecording(activeRecording); // this attempt's clip (if any) never gets a shot number, AND must never be reported as a clip failure — see discardRecording
     renderShotLog(); // the "N movements ignored" line needs to move even when nothing gets logged
     return;
   }
 
   if (a.eligibleFrames.length === 0) {
     unsettledAttemptCount++;
-    finalizeRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to
+    discardRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to, and never report it as a failure either
     renderShotLog();
     return;
   }
@@ -1386,7 +1396,7 @@ function startClipRecording() {
     // than one of those can end up racing to call it for the same rec.
     const rec = {
       recorder, clipStream, chunks: [], shotNum: null,
-      finished: false, settled: false, failReason: null,
+      finished: false, settled: false, failReason: null, discarded: false,
       capTimer: null, tailTimer: null, stopWatchdog: null,
     };
     recorder.ondataavailable = (ev) => {
@@ -1515,6 +1525,31 @@ function finalizeRecording(rec) {
   if (activeRecording === rec) activeRecording = null;
 }
 
+// Marks a recording as belonging to an attempt the app has just decided to THROW AWAY (failed
+// SHOT_MIN_PEAK_SEP_FRACTION/SHOT_MIN_DURATION_MS, or never produced a single settled frame) —
+// see endAttempt's two early-return branches, the only callers. This is a genuinely different
+// claim from a recording that failed: the app is not reporting "this clip broke", it's reporting
+// "there was never going to be a shot here to have a clip at all." Set BEFORE finalizeRecording
+// runs, so that whichever path eventually resolves this recording's outcome (a real onstop, or
+// the stop-watchdog) can see it via resolveClipOutcome's own discarded check below and skip every
+// bit of owner-facing reporting for it — no banner, no per-row reason, no pendingClipNote left
+// for some later, unrelated shot to inherit.
+//
+// Why this needs its own flag rather than just leaving shotNum null (which resolveClipOutcome
+// already treated as "not a failure" for the CLIP_MAX_MS case): a discarded attempt's recording
+// can genuinely have FAILED too (chunks.length === 0) — most commonly because the discarded
+// attempt itself was too brief for canvas.captureStream/MediaRecorder to ever encode a single
+// frame before it got thrown away, which is not a malfunction, just an attempt that never
+// deserved a recording in the first place. Without distinguishing this from a real failure, that
+// empty-chunks outcome used to fall straight into resolveClipOutcome's generic "recording came
+// out empty" branch and raise the "at least one clip failed" banner — a false positive even in a
+// session where the one real, logged shot recorded perfectly. Found and fixed after a false
+// "clips failed" banner surfaced on a run with exactly one successful, fully-attached clip.
+function discardRecording(rec) {
+  if (rec) rec.discarded = true;
+  finalizeRecording(rec);
+}
+
 // Runs once a recording's outcome is actually known — either the real onstop fired, or the
 // stop-watchdog above gave up waiting for one. Guarded by rec.settled so whichever of those two
 // gets here first is the one that counts; the other is a harmless no-op (both can legitimately
@@ -1527,9 +1562,16 @@ function finalizeRecording(rec) {
 // apart from "the clip arrived after its row was already gone". Those are different claims (see
 // CLAUDE.md on why clipsUnavailableReason's own two messages stay distinct) and now say so:
 // explainClipFailure writes a specific reason onto the row itself rather than a bare "no clip".
+//
+// EXCEPT for a recording marked `discarded` (see discardRecording above): the app itself threw
+// that attempt away, so there is no shot for a clip to have been owed to. Whatever this recording
+// did or didn't produce is simply not a story the owner needs told — bail out before any of the
+// chunk/blob inspection below, so a discarded attempt's recording can never raise the banner,
+// write a per-row reason, or leave a pendingClipNote for some unrelated later shot to inherit.
 function resolveClipOutcome(rec) {
   if (rec.settled) return;
   rec.settled = true;
+  if (rec.discarded) return; // the attempt itself was thrown away -- see discardRecording; nothing here is ever a failure worth reporting
   try {
     if (rec.chunks.length > 0) {
       const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || "video/webm" });
@@ -3357,6 +3399,61 @@ function selfTest() {
       "a pending note left by an earlier-resolved recording should attach to the next shot logged"
     );
     console.assert(pendingClipNote === null, "a pending note should be consumed, not reused, once it's attached to a shot");
+  }
+
+  // --- Clip false-positive lock-down: a discarded (thrown-away) attempt's recording must NEVER
+  // look like a clip failure. Written after a real false positive was caught in review: a single
+  // clean, successful shot raised the "at least one clip failed" banner anyway. Root cause: a
+  // landmark-noise blip lasting one or two frames is easily long enough to cross
+  // DRAW_ATTEMPT_MIN_SEP and start a real recording, but far too short for
+  // canvas.captureStream/MediaRecorder to ever encode a single frame before endAttempt's own
+  // gates threw the attempt away — and that empty-chunks outcome used to read as a genuine
+  // recording failure. These two cases are exactly what the coordinator asked this fix be locked
+  // down against, so a regression here fails loudly instead of quietly shipping the same bug
+  // back to the owner's phone.
+  {
+    // Case 1: one clean, successful shot, nothing else in the session. Must produce no failure
+    // text anywhere -- no banner, no per-row reason.
+    log = [{ shotNum: 60 }];
+    const savedReason1 = clipsUnavailableReason;
+    clipsUnavailableReason = null;
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [new Blob(["a"], { type: "video/webm" })], shotNum: 60,
+      settled: false, failReason: null, discarded: false,
+    });
+    const row60 = log.find((e) => e.shotNum === 60);
+    console.assert(row60.clipUrl && !row60.clipFailReason, "a single successful shot must attach a clip with no failure reason on its row");
+    console.assert(clipsUnavailableReason === null, "a single successful shot must never raise the clips-unavailable banner");
+    URL.revokeObjectURL(row60.clipUrl);
+    clipsUnavailableReason = savedReason1;
+
+    // Case 2: a rejected movement (its recording resolves with EMPTY chunks -- the realistic
+    // shape, since a movement too brief/shallow to count as a shot is also too brief for the
+    // recorder to have encoded anything) alongside a real, successful shot in the same session.
+    // Neither the discarded recording NOR the real one may show any failure text, and the real
+    // shot's clip must attach exactly as if the discarded one never existed.
+    log = [{ shotNum: 61 }];
+    const savedReason2 = clipsUnavailableReason;
+    clipsUnavailableReason = null;
+    pendingClipNote = null;
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [], shotNum: null,
+      settled: false, failReason: null, discarded: true, // marked by discardRecording -- see endAttempt's rejected/unsettled branches
+    });
+    console.assert(clipsUnavailableReason === null, "a discarded (thrown-away) attempt's empty recording must never raise the clips-unavailable banner");
+    console.assert(pendingClipNote === null, "a discarded attempt's recording must never leave a pending note behind for a later, unrelated shot to inherit");
+    resolveClipOutcome({
+      recorder: { mimeType: "video/webm" }, chunks: [new Blob(["b"], { type: "video/webm" })], shotNum: 61,
+      settled: false, failReason: null, discarded: false,
+    });
+    const row61 = log.find((e) => e.shotNum === 61);
+    console.assert(
+      row61.clipUrl && !row61.clipFailReason,
+      "a real shot's clip must attach normally even when a rejected movement's recording resolved earlier in the same session"
+    );
+    console.assert(clipsUnavailableReason === null, "a session with one rejected movement and one real, successful shot must show no clips-unavailable banner");
+    URL.revokeObjectURL(row61.clipUrl);
+    clipsUnavailableReason = savedReason2;
   }
 
   // --- One Euro filter: pure logic, no DOM/MediaPipe involved, so these run straight against
