@@ -966,16 +966,33 @@ Built so far, all working:
   cap each range response — returning a whole 127MB file in one write stalls
   Chrome indefinitely.
 
-**Where it is blocked:** Chrome would not decode the video at all — direct URL,
-blob URL, and re-typed blob all sat at `readyState 0`, `networkState 2`, with no
-`error` event, after 12s. Ruled out by direct test: the container (transcoded
-`.mov`→`.mp4`), HEVC (transcoded to H.264 via macOS `avconvert`, no `ffmpeg`
-here), the H.264 profile (verified Main 3.1 and High 4.0 by reading `avcC` out
-of the file), the MIME type (`video/mp4` on both the response and the blob), and
-the server (127MB in 51ms by curl; range requests return 206). It stalls
-identically for every variant, which points at the browser instance rather than
-the media. **Next step is to try a different browser or a plain `file://` page
-before touching the harness again — the harness itself is probably fine.**
+**Where it is blocked, and the diagnosis — A HIDDEN TAB IS THE WHOLE PROBLEM.**
+Two different browsers each fail in a different half, and both failures trace to
+the same cause: the tab never being visible.
+
+- **Automated Chrome (via the extension):** will not decode the video at all —
+  direct URL, blob URL and re-typed blob all sit at `readyState 0`,
+  `networkState 2`, no `error` event, indefinitely. Ruled out by direct test:
+  the container (transcoded `.mov`→`.mp4`), HEVC (transcoded to H.264 with
+  macOS `avconvert`; there is no `ffmpeg` here), the H.264 profile (Main 3.1 and
+  High 4.0, read straight out of the file's `avcC` box), the MIME type
+  (`video/mp4` on both response and blob), and the server (127MB in 51ms by
+  curl, range requests return 206). The tab reports
+  `visibilityState: "hidden"`, `hasFocus: false` — it lives in a background tab
+  group, and Chrome does not decode media in a hidden tab.
+- **The in-app Browser pane:** decodes the file perfectly (720x1280 portrait,
+  95.2s, `#video` receives the stream, startup completes, the pipeline reports
+  "no pose seen" rather than erroring). But this pane reports
+  `visibilityState: "hidden"` permanently — even after `tabs_select` fronts it —
+  so `requestAnimationFrame` never ticks and `renderLoop` never runs. The same
+  trap independently cost the debug-panel engineer their live verification.
+
+So: one browser decodes but cannot run the render loop; the other could run the
+loop but will not decode. **Neither is a harness bug.** The next attempt should
+use a genuinely focused, foreground browser window — the simplest route is for
+the owner to click the tab to the front, or to open the harness URL manually —
+at which point both halves should work at once. Do not spend more time on
+transcoding, MIME types or the server; all three are proven fine.
 
 Once it works, the permanent version is a small `?video=` option inside `app.js`
 gated behind `?debug`, which removes the generated-harness step entirely.
