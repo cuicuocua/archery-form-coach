@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code when working in this project.
 
+> **Picking this up in a new session?** Read [HANDOVER.md](HANDOVER.md) first — current state, the staged plan, and the mistakes not to repeat.
+
 ## Project Purpose
 
 A browser-based archery form coach prototype: opens in iPhone Safari, uses the

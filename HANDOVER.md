@@ -144,9 +144,11 @@ Three uses, in order of value:
 3. **A framing check before he walks away** — "you are fully in frame" or "your
    legs are cut off" — at the one moment he can act on it.
 
-**Open decision for the owner**: the app deliberately persists nothing across
-reloads. A calibration redone every session is a ten-second annoyance; storing
-it breaks that rule for the first time. PM's recommendation was to store it.
+**Decided**: store it, and re-measure each session to check against the stored
+value rather than trusting it blindly (see "Answered by the owner" below). This
+is the first thing the app persists across reloads — a deliberate exception to
+the no-persistence rule, not an erosion of it. Nothing else should follow it
+across without the same explicit decision.
 
 Belongs inside setup mode, so build it with or after Stage 3 rather than twice.
 
@@ -183,13 +185,21 @@ Stage 1 can run in parallel with anything. Stages 2–4 are best done in order;
 
 ---
 
-## Questions for the owner
+## Answered by the owner (2026-08-23)
 
-1. When he glances over mid-end, is it only *"is it seeing me"* and *"did that
-   arrow count"*, or is there a third thing? If two is the whole list, the
-   shooting mode can be almost empty.
-2. Should the calibration persist across reloads (breaking the no-persistence
-   rule) or be redone each session?
+1. **Mid-end, he needs exactly two things**: *"it can see me"* and *"that arrow
+   counted"*. He explicitly ruled out a running arrow count and anything else.
+   **The shooting mode can therefore be almost empty** — two indicators, large,
+   and nothing else. Stage 3 should not try to keep the readout panels alive in
+   some reduced form; they belong to review.
+2. **Calibration should persist, AND be re-measured every session and checked
+   against the stored value.** His words: "remember it but recheck it everytime
+   against remembered data." This is better than either option offered — it
+   keeps the reference stable across reloads while removing the risk a stale
+   measurement is silently in use. Treat a disagreement between the fresh
+   measurement and the stored one as something to surface, not to resolve
+   silently: it means either the calibration was bad or the framing has changed,
+   and both are worth telling him at the one moment he is standing at the phone.
 
 ---
 
