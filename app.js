@@ -25,6 +25,18 @@ const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far
 const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one
 const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
 
+// Shot-log ATTEMPT GATING — decide whether a draw attempt plausibly happened at all, before it's
+// allowed to become a row. Added after a field report: with only DRAW_ATTEMPT_MIN_SEP as a floor
+// (15cm of hand separation), every hand movement past that — nocking an arrow, lowering the bow,
+// adjusting a release aid, standing with arms slightly apart — was getting logged as a shot, and
+// those phantom rows were dragging the session average around (see CLAUDE.md and README). These
+// two are separate from DRAW_ATTEMPT_MIN_SEP above, which only decides when an in-progress
+// attempt STARTS and ENDS, and separate from FULL_DRAW_HAND_SEP_MIN, which a shot still does NOT
+// need to reach to be logged (see endAttempt) — a draw that fell short of full draw is still
+// worth seeing, on purpose. These just rule out things that were never plausibly a draw at all.
+const SHOT_MIN_PEAK_SEP_FRACTION = 0.8; // the attempt's peak hand separation must reach at least this fraction of FULL_DRAW_HAND_SEP_MIN (0.8 x 0.75 = 0.6 torso-lengths apart) to count as a real draw attempt — comfortably above the ~0.3-0.5 range nocking/lowering the bow produces, comfortably below the 0.75 that counts as full draw itself
+const SHOT_MIN_DURATION_MS = 600; // an attempt must last at least this long, from when hands first cross DRAW_ATTEMPT_MIN_SEP to when they drop back below it, to count as a real draw rather than a brief noise spike (a hand passing near the body, a tracking glitch) — a real compound draw, even a rushed one, takes real time to raise, draw and settle
+
 // Shot log display-only cutoffs — NOT form targets like the numbers above. These decide when a
 // shot's own DEVIATION FROM THE OWNER'S OWN SESSION AVERAGE (see summarizeShots) gets coloured
 // as "close to your average" vs "worth a look", nothing more. No coaching authority behind
@@ -164,9 +176,16 @@ let debugInfo = null;
 // entries never expire or get overwritten just because time passed, only because a newer
 // attempt bumps an old one out of the last SHOT_LOG_MAX.
 const SHOT_LOG_MAX = 10;
-let shotCount = 0; // total attempts this session, keeps counting even once the log above fills up
+let shotCount = 0; // total LOGGED attempts this session (see endAttempt) — keeps counting even once the log above fills up
 let log = []; // newest first
 let attempt = null; // the attempt currently in progress, if any — see trackShotAttempt below
+
+// How many draw attempts got discarded by the gates in endAttempt below — too short, or never
+// got anywhere near full draw. The owner can't watch this filtering happen, so if the app is
+// quietly discarding movement it has to say so every time the log is read, not just once: see
+// the persistent line built from this in renderShotLog. Never reset mid-session, same treatment
+// as shotCount above.
+let rejectedAttemptCount = 0;
 
 // The clip recording currently in progress or in its post-shot tail, if any — see
 // startClipRecording below. Only ever one of these at a time; a new attempt starting while the
@@ -818,21 +837,28 @@ function isAtFullDraw(landmarks, nowMs) {
 
   if (DEBUG) debugInfo = { anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
 
+  const atFullDraw = anchorOk && armOk && sepOk && stillOk;
+
   // Feed the shot log regardless of ?debug — the owner needs shot numbers/form readouts
   // whether or not the diagnostic overlay is on; only the display of the extra fields below
-  // is debug-gated (see renderShotLog).
-  trackShotAttempt({
-    handSep,
-    bowArmAngle,
-    shoulderDrop: shoulderDropSampleOf(landmarks),
-    elbowAlign: drawElbowAlignmentOf(landmarks),
-    anchorOk,
-    armOk,
-    sepOk,
-    stillOk,
-  });
+  // is debug-gated (see renderShotLog). nowMs is threaded through rather than calling
+  // performance.now() again in here, so selfTest can drive the shot-log timing deterministically.
+  trackShotAttempt(
+    {
+      handSep,
+      bowArmAngle,
+      shoulderDrop: shoulderDropSampleOf(landmarks),
+      elbowAlign: drawElbowAlignmentOf(landmarks),
+      anchorOk,
+      armOk,
+      sepOk,
+      stillOk,
+      atFullDraw,
+    },
+    nowMs
+  );
 
-  return anchorOk && armOk && sepOk && stillOk;
+  return atFullDraw;
 }
 
 // Attempt-boundary rule for the shot log: a draw attempt is "in progress" for as long as hand
@@ -841,27 +867,60 @@ function isAtFullDraw(landmarks, nowMs) {
 // below that floor (hands back together at rest). This is the simplest rule that both (a)
 // doesn't split one long hold into several rows and (b) doesn't merge two separate shots taken
 // back-to-back into one. No timer involved: nothing here expires on its own, ever.
-function trackShotAttempt(sample) {
+// nowMs threads through from isAtFullDraw's own nowMs parameter (renderLoop's `now`) — never
+// performance.now() called fresh in here, so selfTest can drive attempt timing deterministically
+// (see SHOT_MIN_DURATION_MS above and endAttempt below, which is what actually uses it).
+function trackShotAttempt(sample, nowMs) {
   if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
     const isNewAttempt = !attempt; // hands just left the resting position — a fresh attempt, not a continuation
+    // startMs (when this attempt began) and reachedFullDraw (whether ANY frame in it was a true
+    // full draw, not just its best-hand-separation frame) both have to survive being carried
+    // forward across frames even on frames that DON'T beat the current best — see below.
+    const startMs = isNewAttempt ? nowMs : attempt.startMs;
+    const reachedFullDraw = (isNewAttempt ? false : attempt.reachedFullDraw) || !!sample.atFullDraw;
     if (isNewAttempt || sample.handSep >= attempt.handSep) {
-      attempt = { ...sample };
+      attempt = { ...sample, startMs, reachedFullDraw };
+    } else {
+      attempt.startMs = startMs;
+      attempt.reachedFullDraw = reachedFullDraw;
     }
     // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
     // the time endAttempt fires the good part is already over.
     if (isNewAttempt) startClipRecording();
   } else {
-    endAttempt();
+    endAttempt(nowMs);
   }
 }
 
-// Ends whatever attempt is in progress (if any) and logs it. Called when hand separation drops
-// back to resting (from trackShotAttempt above) or when the pose is lost entirely mid-attempt
-// (from renderLoop) — either way, whatever was going on has stopped.
-function endAttempt() {
+// Ends whatever attempt is in progress (if any). Called when hand separation drops back to
+// resting (from trackShotAttempt above, with the current timestamp) or when the pose is lost
+// entirely mid-attempt (from renderLoop, with ITS current timestamp) — either way, whatever was
+// going on has stopped, and it's judged the same way regardless of which of those two things
+// ended it: tracking loss must not manufacture a shot that the same movement, ending normally,
+// wouldn't have earned.
+//
+// Two gates, both against the attempt's own best frame — see SHOT_MIN_PEAK_SEP_FRACTION and
+// SHOT_MIN_DURATION_MS above for why these two specifically. An attempt that fails either one
+// gets thrown away, not logged: counted in rejectedAttemptCount instead, and any clip recording
+// still running for it gets finalised (and therefore its capture track stopped) right now rather
+// than left to expire on its own — see finalizeRecording, and CLAUDE.md on why a clip must never
+// outlive the shot it belongs to.
+function endAttempt(nowMs) {
   if (!attempt) return;
-  const shotNum = logShot(attempt);
-  attempt = null;
+  const a = attempt;
+  attempt = null; // clear first — logShot/finalizeRecording below must never see a stale in-progress attempt
+
+  const gotDeepEnough = a.handSep >= SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN;
+  const lastedLongEnough = typeof nowMs === "number" && typeof a.startMs === "number" && nowMs - a.startMs >= SHOT_MIN_DURATION_MS;
+
+  if (!gotDeepEnough || !lastedLongEnough) {
+    rejectedAttemptCount++;
+    finalizeRecording(activeRecording); // this attempt's clip (if any) never gets a shot number — drop it and stop its capture track now, not later
+    renderShotLog(); // the "N movements ignored" line needs to move even when nothing gets logged
+    return;
+  }
+
+  const shotNum = logShot(a);
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
@@ -1093,26 +1152,112 @@ function summarizeShots(entries) {
   };
 }
 
-// Plain degrees, e.g. "168". Default average formatter for summaryLine below.
-function fmtSignedDeg(v) {
-  const r = Math.round(v);
-  return r === 0 ? "in line" : `${Math.abs(r)}° ${r > 0 ? "high" : "low"}`;
+// ===== SHOT LOG — plain-language consistency wording. The app has no idea what good archery
+// form looks like: every target range in the CALIBRATE WITH COACH block at the top of this file
+// is an explicitly labelled placeholder the owner hasn't tuned with a coach yet. So the log must
+// never say anything that implies a judgement it can't back up — no "your bow arm is too bent",
+// no scores, no pass/fail against an invented ideal. The one thing it CAN say honestly, needing
+// no calibration at all, is whether the owner did the same thing twice — repeatability, measured
+// only against his own other shots this session. See narrateMeasure below for exactly how.
+//
+// These two numbers are not target ranges like CALIBRATE WITH COACH above — there's no "correct"
+// value here, only "how big a gap counts as worth mentioning", and that's answered relative to
+// the session's OWN scatter, not a fixed number of degrees or percent. Tune by eye once there's
+// real session wording to read against real shots.
+const OUTLIER_SCATTER_FACTOR = 2.5; // a shot's own gap from the average must be more than this many times the OTHER shots' typical gap from average before it gets called out by name
+const DRIFT_GAP_FACTOR = 1.5; // the gap between the first-half and second-half averages must be more than this many times the whole session's typical gap from average before it counts as drift rather than ordinary shot-to-shot wobble
+// ===========================================================================
+
+// Turns one measure's own numbers, across the shots in the log, into ONE plain-English headline
+// sentence — or null if there's nothing honest to say. Priority order, checked in this order:
+//   1. One shot sits clearly apart from the rest of them — name it, and say which way.
+//   2. No single shot stands out, but there's a real trend from the early shots to the late ones
+//      (compares the first half of the session against the second half) — most likely the archer
+//      tiring or settling in over the end.
+//   3. Neither of the above: every shot landed close to the others — "steady".
+// Below three readings there's no honest consistency story to tell at all (a single point can't
+// have a "spread", and two points are just two points), so this says that plainly instead of
+// computing a spread from almost nothing. Below five, whatever it does say gets a short "early
+// days" qualifier — three or four shots is still a small sample to be confident about.
+//
+// `wordFor(sign)` supplies the one word (or short phrase) that describes what a HIGHER reading
+// of this particular measure means in plain terms — e.g. for bow-arm angle, higher = straighter;
+// for shoulder drop, higher = sat lower (see shoulderDropOf's own comment: bigger % = further
+// from the ear = more dropped). sign is +1 for a reading above the session average, -1 for below.
+//
+// Pure: entries (any order) + a value-getter + a label + a word function in, one result out —
+// { text, outlierShotNum, outlierWord } (outlierShotNum/outlierWord are null unless case 1 above
+// fired) or null. No DOM, no module state, so selfTest can drive it with plain fixture arrays.
+function narrateMeasure(entries, getValue, label, wordFor) {
+  const points = entries
+    .map((e) => ({ shotNum: e.shotNum, value: getValue(e) }))
+    .filter((p) => p.value != null)
+    .sort((a, b) => a.shotNum - b.shotNum); // oldest first — shotNum order IS chronological order, needed for the drift check below
+  const n = points.length;
+
+  if (n === 0) return null; // every reading for this measure was uncertain this session — nothing honest to say at all
+  if (n === 1) return { text: `${label} — only one shot logged, too early to say anything about consistency.`, outlierShotNum: null, outlierWord: null };
+  if (n === 2) return { text: `${label} — only two shots logged, too early to call it steady or drifting.`, outlierShotNum: null, outlierWord: null };
+
+  const average = points.reduce((sum, p) => sum + p.value, 0) / n;
+  const deviations = points.map((p) => ({ shotNum: p.shotNum, dev: p.value - average }));
+  const qualifier = n <= 4 ? ` Only ${n} shots so far — early days.` : "";
+
+  // --- 1. Does one shot sit clearly apart from the REST of them? "Clearly apart" is measured
+  // against how much the OTHER shots typically scatter, not a fixed number of degrees or
+  // percent — so a tight, repeatable session and a naturally noisy one each get judged by their
+  // own standard, instead of one arbitrary cutoff applied to every session forever.
+  let worst = deviations[0];
+  for (const d of deviations) if (Math.abs(d.dev) > Math.abs(worst.dev)) worst = d;
+  const others = deviations.filter((d) => d.shotNum !== worst.shotNum);
+  const othersScatter = others.reduce((sum, d) => sum + Math.abs(d.dev), 0) / others.length;
+  const worstDev = Math.abs(worst.dev);
+  // A real gap: either the other shots were essentially identical to each other and this one
+  // wasn't (othersScatter ~0 but worstDev isn't), or this shot sits meaningfully farther out
+  // than the others typically scatter (more than OUTLIER_SCATTER_FACTOR times their own average).
+  const isOutlier = worstDev > 1e-6 && (othersScatter < 1e-6 || worstDev > OUTLIER_SCATTER_FACTOR * othersScatter);
+  if (isOutlier) {
+    return {
+      text: `${label} — shot ${worst.shotNum} stands out: ${wordFor(Math.sign(worst.dev))} than your other ${others.length}.${qualifier}`,
+      outlierShotNum: worst.shotNum,
+      outlierWord: wordFor(Math.sign(worst.dev)),
+    };
+  }
+
+  // --- 2. No single shot stands out — is there a trend from the early shots to the late ones?
+  // Split chronologically in half (on an odd count, the middle shot sits out of both halves
+  // rather than being forced into either) and compare the two halves' own averages against how
+  // much this measure naturally varies overall, so a small, evenly-spread wobble doesn't read
+  // as "drift" just because the last shot happened to land a hair higher than the first.
+  const half = Math.floor(n / 2);
+  const firstHalf = points.slice(0, half);
+  const secondHalf = points.slice(n - half);
+  const avgFirst = firstHalf.reduce((sum, p) => sum + p.value, 0) / half;
+  const avgSecond = secondHalf.reduce((sum, p) => sum + p.value, 0) / half;
+  const gap = avgSecond - avgFirst;
+  const overallScatter = deviations.reduce((sum, d) => sum + Math.abs(d.dev), 0) / n;
+  const isDrift = Math.abs(gap) > 1e-6 && (overallScatter < 1e-6 || Math.abs(gap) > DRIFT_GAP_FACTOR * overallScatter);
+  if (isDrift) {
+    const sign = Math.sign(gap); // +1 means the second half's own average sits above the first half's
+    return {
+      text: `${label} — drifted: ${wordFor(-sign)} on your first ${half}, ${wordFor(sign)} by the last ${half}.${qualifier}`,
+      outlierShotNum: null,
+      outlierWord: null,
+    };
+  }
+
+  // --- 3. Neither: every shot landed close to the others.
+  return { text: `${label} — steady. Every shot within a hair of the others.${qualifier}`, outlierShotNum: null, outlierWord: null };
 }
 
-// The one-line, plain-language summary for one measure, shown at the top of the log. Leads with
-// the owner's own average and spread — nothing here is judged against a placeholder threshold —
-// and says plainly when a reading is missing rather than quietly averaging over a smaller
-// sample than the shot count suggests. `formatAvg` lets the elbow measure (signed, direction
-// based) reuse this instead of duplicating the sentence structure.
-function summaryLine(label, unit, s, formatAvg = (v) => `${Math.round(v)}${unit}`) {
-  if (s.n === 0) return `${label} — no readable shots yet.`;
-  const missing = s.n < s.total ? ` (based on ${s.n} of ${s.total} shots)` : "";
-  const body =
-    s.n === 1
-      ? `${label} — only one shot so far, ${formatAvg(s.average)}, not enough yet to see how consistent you are`
-      : `${label} — you averaged ${formatAvg(s.average)}, varying by ${Math.round(s.spread)}${unit}`;
-  return `${body}${missing}.`;
-}
+// One word (or short phrase) per measure, describing what a HIGHER reading of that measure means
+// in plain terms — shared between the outlier and drift sentences in narrateMeasure above, and
+// between the headline and the per-row highlight note in renderShotRow below, so the wording is
+// always consistent wherever a measure gets described. sign is +1 (above this session's own
+// average) or -1 (below it) — see narrateMeasure's own comment for the full explanation.
+const wordForBowArm = (sign) => (sign > 0 ? "straighter" : "more bent"); // bigger angle = straighter, see bowArmAngleOf
+const wordForShoulder = (sign) => (sign > 0 ? "sat lower" : "sat higher"); // bigger % = further from the ear = more dropped, see shoulderDropOf
+const wordForElbow = (sign) => (sign > 0 ? "higher" : "lower"); // positive signed deviation = high, see drawElbowAlignmentOf
 
 // One shot's number rendered as "raw value (signed deviation)" — bare, no repeated "vs your
 // average" text (that's said ONCE, under the summary block — see renderShotLog; saying it once
@@ -1141,7 +1286,10 @@ function shotValueHtml(rawText, value, unit, shotNum, stats, maxDeviation) {
   return { html: `<span class="value ${ok ? "ok" : "warn"}">${rawText} (${devText})</span>`, flagged };
 }
 
-function renderShotRow(e, stats) {
+// `outliers`/`words`: which shot number (if any) narrateMeasure named as standing out for each
+// measure this session, and the word it used — computed once in renderShotLog and passed in here
+// so all ten rows agree with the headline above them instead of each row re-deciding for itself.
+function renderShotRow(e, stats, outliers, words) {
   const armText = e.bowArmAngle == null ? "—" : `${Math.round(e.bowArmAngle)}°`;
   const arm = shotValueHtml(armText, e.bowArmAngle, "°", e.shotNum, stats.bowArm, BOW_ARM_CONSISTENCY_MAX_DEVIATION);
 
@@ -1160,13 +1308,30 @@ function renderShotRow(e, stats) {
       : `${Math.round(e.elbowAlign.deviation)}° ${e.elbowAlign.direction}`;
   const elbow = shotValueHtml(elbowText, e.elbowAlign?.signed ?? null, "°", e.shotNum, stats.elbow, ELBOW_ALIGN_CONSISTENCY_MAX_DEVIATION);
 
-  // At most one outlier mark for the whole row (not one per measure, per the brief) — the reader
-  // already knows from the summary note what a ⚠ means, so a bare mark next to the shot number
-  // is enough.
-  const outlierMark = [arm, bow, draw, elbow].some((v) => v.flagged) ? " ⚠" : "";
   const debugBit = DEBUG
     ? `<span class="shotlog-debug">hand sep ${e.handSep.toFixed(2)} — anchor ${e.anchorOk ? "ok" : "fail"} · arm-check ${e.armOk ? "ok" : "fail"} · sep-check ${e.sepOk ? "ok" : "fail"} · still ${e.stillOk ? "ok" : "fail"}</span>`
     : "";
+  // Every reading, in the same units as the live readouts, kept for whoever eventually tunes the
+  // CALIBRATE WITH COACH constants against a real session — but demoted to small print, not the
+  // headline: see the block comment above narrateMeasure for why the app can't put a judgement on
+  // these numbers itself.
+  const rawHtml = `<div class="shotlog-row-raw">bow arm ${arm.html} · bow shoulder ${bow.html} · draw shoulder ${draw.html} · elbow ${elbow.html}${debugBit}</div>`;
+
+  // What (if anything) THIS shot was named for — reusing the exact same outlier picked out by
+  // narrateMeasure for the headline above, so a row is only ever singled out here when the
+  // headline already said so somewhere. A shot can be named for more than one measure at once;
+  // list every one rather than picking just the first.
+  const notes = [];
+  if (outliers.bowArm === e.shotNum) notes.push(`bow arm ${words.bowArm} than your others`);
+  if (outliers.shoulderBow === e.shotNum) notes.push(`bow shoulder ${words.shoulderBow} than your others`);
+  if (outliers.shoulderDraw === e.shotNum) notes.push(`draw shoulder ${words.shoulderDraw} than your others`);
+  if (outliers.elbow === e.shotNum) notes.push(`draw elbow ${words.elbow} than your others`);
+  const highlightText = notes.length ? notes.join("; ") : "nothing stood out";
+
+  // A logged attempt that never reached full draw is still worth keeping (see CLAUDE.md/README —
+  // that's on purpose) but must read differently from one that did, at a glance, since it's the
+  // only thing separating "he drew short of full draw" from "he drew all the way".
+  const shortMark = e.reachedFullDraw === false ? ` <span class="shotlog-shortdraw">· short of full draw</span>` : "";
 
   // A big, obvious watch button when this shot has a clip; a plain "no clip" note when it
   // doesn't (recording unsupported, or it failed for just this one shot) — never nothing, so a
@@ -1176,15 +1341,15 @@ function renderShotRow(e, stats) {
     ? `<button type="button" class="shotlog-play" data-shot="${e.shotNum}">▶ Watch</button>`
     : `<span class="shotlog-noclip">no clip</span>`;
 
-  return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum}${outlierMark}<br>bow arm ${arm.html} · shoulders bow ${bow.html} / draw ${draw.html} · elbow ${elbow.html}${debugBit}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
+  return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum} — ${highlightText}${shortMark}${rawHtml}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
 }
 
 // Plain-language shot log — this is what the owner actually reads, standing at the phone after
-// their end, not mid-shot, so it can be a normal-sized list rather than the big blunt ?debug
-// overlay. A summary block (own average + own spread, per measure) sits above the per-shot
-// rows; a single note under it explains what the parenthesized numbers in every row below mean,
-// so the rows themselves can stay compact — bare signed numbers, no repeated phrase. Extra
-// per-shot detail (hand separation, the four trigger checks) only shows up when ?debug is on.
+// their end, not mid-shot, so it has to answer, in order: how many arrows did it see; was he
+// consistent, and in what; which shot was the odd one out, and how (so he knows which clip to
+// go watch). Nothing here judges his form against a target — see the block comment above
+// narrateMeasure for why not. Raw degrees/percent are still there for whoever eventually tunes
+// the CALIBRATE WITH COACH constants, just demoted to small print on each row, not the headline.
 function renderShotLog() {
   // A clip-recording failure has to still be visible whenever the owner walks over and looks —
   // not just at the moment it happened — so this goes at the very top, above everything else,
@@ -1195,26 +1360,53 @@ function renderShotLog() {
   // measurePoseModelPerf/setModelStatusLine), and shown on every render after that. Sits right
   // under the clip banner, same reasoning: the owner can't be watching when this gets decided.
   const modelBit = modelStatusLine ? `<div class="shotlog-modelinfo">${modelStatusLine}</div>` : "";
+  // How many draw attempts got thrown out as noise this session (see endAttempt) — shown
+  // whenever there's at least one, right alongside the two lines above, for the same reason:
+  // this is diagnostic information the owner can only ever read after the fact. A big number
+  // here next to a small arrow count is itself the useful signal — see CLAUDE.md.
+  const rejectedBit =
+    rejectedAttemptCount > 0
+      ? `<div class="shotlog-rejected">${rejectedAttemptCount} movement${rejectedAttemptCount === 1 ? "" : "s"} ignored (too short, or never near full draw) — not counted as shots.</div>`
+      : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${banner}${modelBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
-  const stats = summarizeShots(log);
-  const summaryLines = [
-    summaryLine("Bow arm", "°", stats.bowArm),
-    summaryLine("Bow shoulder", "%", stats.shoulderBow),
-    summaryLine("Draw shoulder", "%", stats.shoulderDraw),
-    summaryLine("Elbow", "°", stats.elbow, fmtSignedDeg),
-  ]
-    .map((line) => `<div class="shotlog-summary-row">${line}</div>`)
+  const arrowWord = shotCount === 1 ? "arrow" : "arrows";
+  const shownNote = log.length < shotCount ? ` The consistency lines below are based on your most recent ${log.length}.` : "";
+  const countLine = `<div class="shotlog-count">${shotCount} ${arrowWord} this session.${shownNote}</div>`;
+
+  const bowArm = narrateMeasure(log, (e) => e.bowArmAngle, "Bow arm", wordForBowArm);
+  const shoulderBow = narrateMeasure(log, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder);
+  const shoulderDraw = narrateMeasure(log, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder);
+  const elbow = narrateMeasure(log, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow);
+
+  const narrativeHtml = [bowArm, shoulderBow, shoulderDraw, elbow]
+    .filter((r) => r) // a measure with every reading uncertain this session says nothing at all — see narrateMeasure
+    .map((r) => `<div class="shotlog-narrative-row">${r.text}</div>`)
     .join("");
-  const note = `<div class="shotlog-summary-note">Numbers in parentheses below = that shot vs your session average above.</div>`;
 
-  const rowsHtml = log.map((e) => renderShotRow(e, stats)).join("");
+  // Which shot (if any) each measure named as standing out, and the word it used — shared with
+  // every row below so each one can point back at exactly what the headline just said about it.
+  const outliers = {
+    bowArm: bowArm?.outlierShotNum ?? null,
+    shoulderBow: shoulderBow?.outlierShotNum ?? null,
+    shoulderDraw: shoulderDraw?.outlierShotNum ?? null,
+    elbow: elbow?.outlierShotNum ?? null,
+  };
+  const words = {
+    bowArm: bowArm?.outlierWord ?? null,
+    shoulderBow: shoulderBow?.outlierWord ?? null,
+    shoulderDraw: shoulderDraw?.outlierWord ?? null,
+    elbow: elbow?.outlierWord ?? null,
+  };
 
-  shotLogEl.innerHTML = `${banner}${modelBit}<div class="shotlog-summary">${summaryLines}${note}</div>${rowsHtml}`;
+  const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
+  const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
+
+  shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -1361,7 +1553,7 @@ function renderLoop() {
     // may no longer have anyone in it — a crop that can never find its way back would be exactly
     // the kind of hang the owner has no way to recover from (see CLAUDE.md).
     currentCropBox = null;
-    endAttempt(); // pose lost mid-attempt counts as the attempt ending, same as hands relaxing
+    endAttempt(now); // pose lost mid-attempt counts as the attempt ending, same as hands relaxing
   } else {
     // Smoothed landmarks feed everything downstream — the skeleton drawing, all three readouts,
     // and the full-draw/shot-log sampling inside isAtFullDraw — so a shaky raw detection can't
@@ -1507,6 +1699,7 @@ function selfTest() {
   const savedAttempt = attempt;
   const savedLog = log;
   const savedShotCount = shotCount;
+  const savedRejectedAttemptCount = rejectedAttemptCount;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   const mkLandmarks = (overrides) => {
@@ -1620,62 +1813,107 @@ function selfTest() {
 
   // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand
   // separation stays at/above DRAW_ATTEMPT_MIN_SEP, tracking its best (highest-separation)
-  // frame; it ends and gets logged the moment separation drops back below that floor. Reset to
-  // a clean slate here — the outer save/restore above puts it all back afterwards regardless.
+  // frame; it ends when separation drops back below that floor OR the pose is lost — but only
+  // gets LOGGED if it also cleared the SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS gates
+  // in endAttempt (added after the field report: without these, nocking an arrow or lowering
+  // the bow was logging as a phantom shot). Reset to a clean slate here — the outer save/restore
+  // above puts it all back afterwards regardless.
   attempt = null;
   log = [];
   shotCount = 0;
-  const sample = (handSep, extra = {}) => ({
+  rejectedAttemptCount = 0;
+  const sample = (handSep, atFullDraw = false, extra = {}) => ({
     handSep,
     bowArmAngle: 178,
-    elbowHeight: 3,
+    atFullDraw,
     anchorOk: true,
     armOk: true,
     sepOk: handSep >= FULL_DRAW_HAND_SEP_MIN,
     stillOk: true,
     ...extra,
   });
+  // SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN = 0.8 * 0.75 = 0.6 — the peak-separation
+  // gate every fixture below is deliberately placed clearly above or clearly below.
 
-  trackShotAttempt(sample(0.1)); // resting, below the floor: no attempt yet
-  console.assert(log.length === 0, "resting below the floor should not start an attempt");
-  trackShotAttempt(sample(0.5)); // crosses the floor: attempt starts
-  trackShotAttempt(sample(0.8));
-  trackShotAttempt(sample(1.7)); // peak
-  trackShotAttempt(sample(1.7)); // held steady — several frames at/near the peak
-  trackShotAttempt(sample(1.6));
-  console.assert(log.length === 0, "a hold still in progress must not be logged yet");
+  trackShotAttempt(sample(0.1), 0); // resting, below the floor: no attempt yet
+  console.assert(log.length === 0 && attempt === null, "resting below the floor should not start an attempt");
+
+  // --- A short, shallow wiggle — nocking an arrow, lowering the bow, hands drifting apart for a
+  // moment — must NOT be logged: this is the exact field bug. It crosses DRAW_ATTEMPT_MIN_SEP
+  // (so it IS an "attempt" briefly), but its peak (0.45) never gets near the 0.6 gate, and it's
+  // over in 250ms, well under SHOT_MIN_DURATION_MS (600ms).
+  trackShotAttempt(sample(0.35), 1000); // crosses the floor
+  trackShotAttempt(sample(0.45), 1100); // peak — shallow
+  trackShotAttempt(sample(0.1), 1250); // hands back together 250ms after it started — ends the attempt
+  console.assert(log.length === 0, "a brief, shallow wiggle must not be logged as a shot");
+  console.assert(shotCount === 0, "shotCount must not advance for a rejected attempt");
+  console.assert(rejectedAttemptCount === 1, "the rejected wiggle should be counted");
+
+  // --- Long enough AND deep enough, but short of literal full draw: still logged, and marked as
+  // such — the deliberate behaviour CLAUDE.md/README call out on purpose (a draw that fell short
+  // of full draw is still worth seeing; only noise should be thrown away).
+  trackShotAttempt(sample(0.4), 2000); // crosses the floor
+  trackShotAttempt(sample(0.65), 2400); // peak: 0.65 clears the 0.6 gate, but never reaches FULL_DRAW_HAND_SEP_MIN (0.75)
+  trackShotAttempt(sample(0.6), 2800); // held near peak
+  trackShotAttempt(sample(0.05), 3200); // ends — 1200ms after it started, comfortably over SHOT_MIN_DURATION_MS
+  console.assert(log.length === 1, "a long, near-full-draw attempt should be logged");
   console.assert(
-    attempt && attempt.handSep === 1.7,
-    "in-progress attempt should track its best (highest hand-sep) frame, not its latest"
+    log[0].shotNum === 1,
+    "the first LOGGED attempt should be shot 1 — the rejected wiggle above must not have consumed a shot number"
   );
-  trackShotAttempt(sample(0.05)); // hands come back together: attempt ends
-  console.assert(log.length === 1, "one long hold must log exactly one row, not one per frame");
-  console.assert(log[0].handSep === 1.7, "logged row should be the attempt's peak frame, not its last");
-  console.assert(log[0].shotNum === 1, "first logged attempt should be shot 1");
+  console.assert(log[0].handSep === 0.65, "the logged row should carry the attempt's peak hand separation");
+  console.assert(log[0].reachedFullDraw === false, "an attempt that never reached full draw must be marked as such");
 
-  // A second, separate attempt must become its own row — including one that never gets close
-  // to full draw at all, which is the exact case the log exists to capture.
-  trackShotAttempt(sample(0.4));
-  trackShotAttempt(sample(0.5)); // never reaches FULL_DRAW_HAND_SEP_MIN this time
-  trackShotAttempt(sample(0.1)); // ends
-  console.assert(log.length === 2, "a second attempt must log as its own row, not merge into the first");
-  console.assert(
-    log[0].shotNum === 2 && log[0].handSep === 0.5,
-    "newest attempt should be first in the log, with its own (lower) peak — a near-miss is still recorded"
-  );
-  console.assert(log[1].shotNum === 1, "the earlier attempt should still be present, just not first");
+  // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, and
+  // NOT marked as short of full draw.
+  trackShotAttempt(sample(0.4), 4000);
+  trackShotAttempt(sample(0.8, true), 4400); // peak, and a genuine full draw (all four isAtFullDraw gates true)
+  trackShotAttempt(sample(0.78, true), 4800); // held at full draw
+  trackShotAttempt(sample(0.05), 5200); // ends
+  console.assert(log.length === 2, "a full-draw attempt should log as its own row");
+  console.assert(log[0].shotNum === 2, "second logged attempt should be shot 2");
+  console.assert(log[0].reachedFullDraw === true, "an attempt that reached full draw must not be marked as short of it");
 
-  // Losing the pose entirely also ends whatever attempt was in progress (endAttempt, called
-  // directly from renderLoop's !landmarks branch rather than through trackShotAttempt).
-  trackShotAttempt(sample(0.6));
-  endAttempt();
-  console.assert(log.length === 3, "pose loss mid-attempt should still log it");
-  console.assert(attempt === null, "ending an attempt must clear it so the next rise starts fresh");
+  // --- Pose loss on an UNQUALIFIED attempt (short, shallow) discards it, same as one that ends
+  // by hands relaxing — losing tracking must not manufacture a shot out of noise.
+  trackShotAttempt(sample(0.35), 6000); // crosses the floor, shallow
+  endAttempt(6100); // pose lost 100ms later — short AND shallow (renderLoop's !landmarks branch calls endAttempt directly)
+  console.assert(log.length === 2, "pose loss on an attempt that never qualified must not log a phantom row");
+  console.assert(rejectedAttemptCount === 2, "pose-loss discard should still count as a rejected attempt");
+  console.assert(attempt === null, "ending an attempt by any path must clear it so the next rise starts fresh");
 
-  // Cap: only the newest SHOT_LOG_MAX entries are kept, still newest-first.
+  // --- Pose loss on a QUALIFIED attempt (deep and long enough already) still logs it — losing
+  // tracking is what ENDS the attempt, it doesn't retroactively disqualify one that already
+  // earned its place.
+  trackShotAttempt(sample(0.4), 7000);
+  trackShotAttempt(sample(0.7), 7400); // deep enough (0.7 >= 0.6)
+  endAttempt(7700); // pose lost 700ms after the attempt started — long enough (>= 600ms)
+  console.assert(log.length === 3, "pose loss on a qualified attempt must still log it");
+  console.assert(log[0].shotNum === 3, "third logged attempt should be shot 3");
+  console.assert(log[0].handSep === 0.7, "the logged row should still carry the attempt's peak separation even though it ended via pose loss");
+
+  // --- A further, separate attempt becomes its own row, not merged into the previous one.
+  trackShotAttempt(sample(0.4), 8000);
+  trackShotAttempt(sample(0.9), 8400);
+  trackShotAttempt(sample(0.05), 9000); // 1000ms elapsed — ends
+  console.assert(log.length === 4, "a further attempt must log as its own row, not merge into the previous one");
+  console.assert(log[0].shotNum === 4 && log[1].shotNum === 3, "log should stay newest-first");
+
+  // shotCount must track LOGGED attempts only, so the shot numbers stay contiguous even with two
+  // rejections mixed in among them (checked incrementally above; restated here for the record).
+  console.assert(shotCount === 4, "shotCount should equal the number of LOGGED attempts, not the number of attempts started");
+  console.assert(rejectedAttemptCount === 2, "exactly the two discarded attempts (the wiggle and the short pose-loss) should be counted as rejected");
+
+  // Cap: only the newest SHOT_LOG_MAX entries are kept, still newest-first. Every iteration here
+  // is deep and long enough to qualify, so every one of them logs.
+  let capT = 10000;
   for (let i = 0; i < SHOT_LOG_MAX + 3; i++) {
-    trackShotAttempt(sample(0.5));
-    trackShotAttempt(sample(0.05));
+    trackShotAttempt(sample(0.4), capT);
+    capT += 400;
+    trackShotAttempt(sample(0.9), capT);
+    capT += 400;
+    trackShotAttempt(sample(0.05), capT); // ends — 800ms elapsed, over SHOT_MIN_DURATION_MS
+    capT += 1000;
   }
   console.assert(log.length === SHOT_LOG_MAX, `log should cap at ${SHOT_LOG_MAX} entries, has ${log.length}`);
   console.assert(
@@ -1898,6 +2136,106 @@ function selfTest() {
   const spreadShot3 = shotValueHtml("65%", 65, "%", 3, spreadStats.shoulderDraw, SHOULDER_DROP_CONSISTENCY_MAX_DEVIATION);
   console.assert(spreadShot3.flagged === true, "a reading that genuinely exceeds the display cutoff should still be flagged");
 
+  // --- Feature E: narrateMeasure — the plain-English consistency wording that leads the log.
+  // Pure: fixture arrays + a value-getter in, one sentence (or null) out. wordFor doesn't matter
+  // for most of these checks, so a fixed stand-in is used except where the actual word matters.
+  {
+    const upDown = (sign) => (sign > 0 ? "up" : "down");
+
+    // A tight cluster of shots must read as "steady" — never a fabricated drift or outlier claim
+    // over noise this small. Spread here is +/-1 around an average of 170; OUTLIER_SCATTER_FACTOR
+    // and DRIFT_GAP_FACTOR both need a MUCH bigger gap than this to fire.
+    const steadyFixture = [
+      { shotNum: 1, bowArmAngle: 170 },
+      { shotNum: 2, bowArmAngle: 171 },
+      { shotNum: 3, bowArmAngle: 169 },
+      { shotNum: 4, bowArmAngle: 170.5 },
+      { shotNum: 5, bowArmAngle: 169.5 },
+    ];
+    const steadyResult = narrateMeasure(steadyFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    console.assert(
+      steadyResult && steadyResult.text.startsWith("Bow arm — steady"),
+      `a tight cluster of shots should read as steady, got: ${steadyResult && steadyResult.text}`
+    );
+    console.assert(steadyResult.outlierShotNum === null, "a steady session must not name an outlier shot");
+
+    // One shot sitting clearly apart from an otherwise tight cluster must be named — and named
+    // by the RIGHT shot number. Shots 1-4 sit within +/-2 of each other; shot 5 (200) is wildly
+    // farther out than the other four's own scatter, which is exactly what OUTLIER_SCATTER_FACTOR
+    // is checking for.
+    const outlierNarrFixture = [
+      { shotNum: 1, bowArmAngle: 170 },
+      { shotNum: 2, bowArmAngle: 169 },
+      { shotNum: 3, bowArmAngle: 171 },
+      { shotNum: 4, bowArmAngle: 170 },
+      { shotNum: 5, bowArmAngle: 200 },
+    ];
+    const outlierNarrResult = narrateMeasure(outlierNarrFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    console.assert(
+      outlierNarrResult && outlierNarrResult.outlierShotNum === 5,
+      `shot 5 (200, wildly apart from the other four) should be named as the standout, got: ${outlierNarrResult && JSON.stringify(outlierNarrResult)}`
+    );
+    console.assert(
+      outlierNarrResult.text.includes("shot 5 stands out"),
+      `the sentence should name shot 5 by number, got: ${outlierNarrResult.text}`
+    );
+
+    // A real, monotonic trend across the end — values climbing steadily from the first shot to
+    // the last — must read as drift. Same five values, chronological order (shotNum ascending):
+    // 160, 163, 166, 169, 172.
+    const driftValues = [160, 163, 166, 169, 172];
+    const driftFixture = driftValues.map((v, i) => ({ shotNum: i + 1, bowArmAngle: v }));
+    const driftResult = narrateMeasure(driftFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    console.assert(
+      driftResult && driftResult.text.includes("drifted"),
+      `a steadily climbing session should read as drift, got: ${driftResult && driftResult.text}`
+    );
+    console.assert(driftResult.outlierShotNum === null, "a drift result must not also name a single outlier shot");
+
+    // The EXACT SAME five values, shuffled into an order where the trend disappears (first half
+    // and second half average out close together) must NOT read as drift — proving the drift
+    // check is genuinely order-sensitive, not just "the numbers happen to have this much spread".
+    const shuffledValues = [166, 160, 172, 163, 169]; // same 5 numbers as driftValues, different assignment to shotNum
+    const shuffledFixture = shuffledValues.map((v, i) => ({ shotNum: i + 1, bowArmAngle: v }));
+    const shuffledResult = narrateMeasure(shuffledFixture, (e) => e.bowArmAngle, "Bow arm", upDown);
+    console.assert(
+      shuffledResult && !shuffledResult.text.includes("drifted"),
+      `the same values in shuffled (non-trending) order must not read as drift, got: ${shuffledResult && shuffledResult.text}`
+    );
+
+    // One shot, or two shots: no honest consistency story to tell yet — must say so plainly and
+    // never compute a fabricated steady/drift/outlier claim from almost nothing.
+    const oneNarr = narrateMeasure([{ shotNum: 1, bowArmAngle: 170 }], (e) => e.bowArmAngle, "Bow arm", upDown);
+    console.assert(
+      oneNarr && oneNarr.text.includes("only one shot") && oneNarr.outlierShotNum === null,
+      `a single shot must produce the honest one-shot wording, not a fabricated claim, got: ${oneNarr && oneNarr.text}`
+    );
+    const twoNarr = narrateMeasure(
+      [{ shotNum: 1, bowArmAngle: 170 }, { shotNum: 2, bowArmAngle: 170 }],
+      (e) => e.bowArmAngle,
+      "Bow arm",
+      upDown
+    );
+    console.assert(
+      twoNarr && twoNarr.text.includes("only two shots") && twoNarr.outlierShotNum === null,
+      `two shots must produce the honest two-shot wording, not a fabricated steady/drift claim, got: ${twoNarr && twoNarr.text}`
+    );
+
+    // A measure whose readings were ALL uncertain this session (getValue returns null every
+    // time) must produce no statement at all — not an empty-string sentence, not a "no data"
+    // line, nothing to render.
+    const allUncertainFixture = [
+      { shotNum: 1, shoulderDrop: { draw: null } },
+      { shotNum: 2, shoulderDrop: { draw: null } },
+      { shotNum: 3, shoulderDrop: { draw: null } },
+    ];
+    const allUncertainResult = narrateMeasure(allUncertainFixture, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", upDown);
+    console.assert(
+      allUncertainResult === null,
+      `a measure with every reading uncertain must produce no statement at all, got: ${JSON.stringify(allUncertainResult)}`
+    );
+  }
+
   // --- Shot clips: MIME selection order, attaching a blob to the right shot number, discarding
   // one whose shot has fallen off the log, and revoking a clip when eviction removes its row.
   // These call the clip functions directly rather than through startClipRecording, which is
@@ -1952,15 +2290,19 @@ function selfTest() {
     URL.revokeObjectURL = (u) => revokedUrls.push(u);
     log = [];
     shotCount = 0;
+    let evictT = 50000; // a fresh, well-separated block of the fake clock so this loop's timing can't collide with the timeline above
     for (let i = 0; i < SHOT_LOG_MAX; i++) {
-      trackShotAttempt(sample(0.5));
-      trackShotAttempt(sample(0.05)); // ends the attempt, logs it
+      trackShotAttempt(sample(0.9), evictT); // deep enough to clear SHOT_MIN_PEAK_SEP_FRACTION
+      evictT += 800; // long enough to clear SHOT_MIN_DURATION_MS
+      trackShotAttempt(sample(0.05), evictT); // ends the attempt, logs it
+      evictT += 200;
     }
     console.assert(log.length === SHOT_LOG_MAX, "setup: log should be exactly full before the eviction check");
     const oldestUrl = "blob:fake-oldest-for-selftest";
     log[log.length - 1].clipUrl = oldestUrl; // pretend the row about to be evicted has a clip attached
-    trackShotAttempt(sample(0.5));
-    trackShotAttempt(sample(0.05)); // one more attempt: pushes the oldest row (the one just tagged) off the end
+    trackShotAttempt(sample(0.9), evictT);
+    evictT += 800;
+    trackShotAttempt(sample(0.05), evictT); // one more attempt: pushes the oldest row (the one just tagged) off the end
     console.assert(
       revokedUrls.includes(oldestUrl),
       "evicting a row that has a clip attached must revoke its object URL"
@@ -2281,6 +2623,7 @@ function selfTest() {
   attempt = savedAttempt;
   log = savedLog;
   shotCount = savedShotCount;
+  rejectedAttemptCount = savedRejectedAttemptCount;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
