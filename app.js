@@ -961,6 +961,7 @@ function updateAttentionState(nowMs, landmarks, frameWidth, frameHeight, gatingE
     if (nowMs - attentionCalmSinceMs >= ATTENTION_IDLE_AFTER_MS) {
       attentionEngaged = false;
       attentionIdlePeriods++;
+      saveSessionToStorage(); // this counter has its own line in the log/share text — see SESSION PERSISTENCE. Fires once per idle period, not per frame.
     }
     return;
   }
@@ -984,7 +985,10 @@ function updateAttentionState(nowMs, landmarks, frameWidth, frameHeight, gatingE
     // real draw" nor "the pipeline wasn't settled"; it's "the attention layer noticed a moment
     // later than an always-on pipeline would have."
     const wokeHandSep = landmarks ? handSeparationForAttention(landmarks, frameWidth, frameHeight) : null;
-    if (wokeHandSep !== null && wokeHandSep >= DRAW_ATTEMPT_MIN_SEP) attentionLateWakeCount++;
+    if (wokeHandSep !== null && wokeHandSep >= DRAW_ATTEMPT_MIN_SEP) {
+      attentionLateWakeCount++;
+      saveSessionToStorage(); // same reasoning as attentionIdlePeriods above — fires once per late wake, not per frame
+    }
     // Re-engaging is exactly like every other recovery point in PIPELINE SETTLING (session
     // start, tracking lost, camera switched) — see this function's own top comment for why the
     // reset happens HERE, synchronously, before this same frame's landmarks get smoothed/settled.
@@ -1693,6 +1697,7 @@ function endAttempt(nowMs) {
     rejectedAttemptCount++;
     discardRecording(activeRecording); // this attempt's clip (if any) never gets a shot number, AND must never be reported as a clip failure — see discardRecording
     renderShotLog(); // the "N movements ignored" line needs to move even when nothing gets logged
+    saveSessionToStorage(); // this counter has its own line in the log/share text — see SESSION PERSISTENCE
     signalOutcome(false); // "seen but rejected" — a draw was open a moment ago (see the watching cue), it just didn't earn a row
     return;
   }
@@ -1701,6 +1706,7 @@ function endAttempt(nowMs) {
     unsettledAttemptCount++;
     discardRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to, and never report it as a failure either
     renderShotLog();
+    saveSessionToStorage(); // same reasoning as the rejected branch above
     signalOutcome(false); // same cue as the rejected case above — the owner asked for "seen but not logged", not a separate state per reason why
     return;
   }
@@ -1764,6 +1770,7 @@ function markClipsUnavailable(reason) {
   if (clipsUnavailableReason) return;
   clipsUnavailableReason = reason;
   renderShotLog();
+  saveSessionToStorage(); // latches once per session — see SESSION PERSISTENCE
 }
 
 // Starts recording a new clip from the overlay canvas — called the instant an attempt begins.
@@ -2015,6 +2022,7 @@ function explainClipFailure(shotNum, reason) {
   if (!entry || entry.clipFailReason) return;
   entry.clipFailReason = reason;
   renderShotLog();
+  saveSessionToStorage(); // a row's clipFailReason is one of the small facts a restore keeps — see SESSION PERSISTENCE
 }
 
 // Attaches a finished clip to its shot's row in the log, by shot number — reuniting the two,
@@ -2049,8 +2057,160 @@ function logShot(entry) {
   log = log.slice(0, SHOT_LOG_MAX);
   evicted.forEach(revokeClip);
   renderShotLog();
+  saveSessionToStorage(); // a shot just got added — see SESSION PERSISTENCE below
   return shotNum;
 }
+
+// ===== SESSION PERSISTENCE — survives a reload, not a shutdown of the app for the day. =====
+// The shot log above lives in a plain in-memory array, and until now died the instant the page
+// reloaded — which iOS Safari does aggressively to a backgrounded tab (he locks the phone, takes
+// a call, switches apps to check something) or to this app relaunched from the Home Screen. He
+// can't watch for that and can't stop it; he'd just walk back to the phone and find an empty log,
+// with no way to tell "nothing happened" from "it happened and got lost." This is a deliberate,
+// narrow exception to CLAUDE.md's "no persistence across sessions" rule — the same kind the
+// calibration routine gets (see HANDOVER.md) — made to survive a crash/reload mid-session, not to
+// carry one range trip into the next.
+//
+// What gets saved: the log itself, plus the running counters the log and Share text actually
+// read (shotCount, rejectedAttemptCount, unsettledAttemptCount, the two attention counters,
+// clipsUnavailableReason). What never gets saved: video clips. A clip is a Blob living only in
+// this tab's memory, referenced by a blob: object URL created fresh each page load — there is no
+// way to put a Blob in localStorage that survives a reload, and CLAUDE.md rules out adding
+// anything heavy enough to try (e.g. IndexedDB video storage). So a restored row says its clip is
+// gone in plain language instead of offering a Watch button that would open a dead link.
+const SHOT_SESSION_STORAGE_KEY = "archery-form-coach:shot-session:v1";
+const SHOT_SESSION_FORMAT_VERSION = 1;
+
+// How stale a saved session may be before a reload starts fresh instead of restoring it — the
+// guard that keeps "survive a reload" from quietly becoming "remember forever" (CLAUDE.md's rule
+// still stands; this is a narrow, timestamped exception to it, not a repeal). Three hours
+// comfortably covers one sitting at the range — shooting an end, walking to pull arrows, a water
+// break, even a long lunch mid-session — while staying well short of "he put the phone down and
+// came back the next day," which is exactly the case this must NOT resurrect.
+const SESSION_RESTORE_MAX_AGE_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+// True for the rest of this page load once a saved session has actually been restored into the
+// live state below — drives the "session recovered" notice in renderShotLog/buildShareText. Set
+// in exactly one place (restoreSessionFromStorage) and never cleared: once he's seen the notice,
+// everything logged for the rest of this load is added on top of a recovered session, and the
+// share text should keep saying so.
+let sessionWasRestored = false;
+
+// Strips a log entry down to what a save/reload round trip can honestly keep. clipBlob and
+// clipUrl both die with the page (see this section's own top comment) and must never be written
+// to storage — but whether this row DID have a clip before the reload is a small, plain fact
+// worth keeping, so a restored row can say "clip lost" rather than looking like it never had one.
+// Pure — no DOM, no URL.* calls — safe to run on an entry still live in `log`.
+function entryForPersistence(e) {
+  const { clipBlob, clipUrl, ...rest } = e;
+  return { ...rest, hadClip: !!clipUrl };
+}
+
+// Builds the plain, JSON-safe object written to storage. Pure — takes the pieces of module state
+// it needs as arguments rather than reading globals itself — so selfTest can round-trip it
+// directly without touching the real log or localStorage.
+function serializeShotSession(state, nowMs) {
+  return {
+    v: SHOT_SESSION_FORMAT_VERSION,
+    savedAt: nowMs,
+    log: state.log.map(entryForPersistence),
+    shotCount: state.shotCount,
+    rejectedAttemptCount: state.rejectedAttemptCount,
+    unsettledAttemptCount: state.unsettledAttemptCount,
+    attentionIdlePeriods: state.attentionIdlePeriods,
+    attentionLateWakeCount: state.attentionLateWakeCount,
+    clipsUnavailableReason: state.clipsUnavailableReason,
+  };
+}
+
+// The other half of the round trip: takes whatever came back out of storage (already
+// JSON.parsed) and returns either a usable state object or null. Null covers every way this can
+// go wrong — nothing saved yet, a corrupt/partial/hand-edited payload, a future format version
+// this code doesn't know, or a payload that parsed fine but is simply too old (see
+// SESSION_RESTORE_MAX_AGE_MS) — so the caller never has to tell those cases apart, only "restore
+// this" or "start fresh," exactly like today's behaviour when nothing was ever saved at all. Pure
+// and defensive on purpose: this runs on whatever a previous (possibly different) version of this
+// file left behind, so it must never throw, no matter how mangled that is.
+function deserializeShotSession(raw, nowMs, maxAgeMs) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.v !== SHOT_SESSION_FORMAT_VERSION) return null;
+  if (typeof raw.savedAt !== "number" || !Number.isFinite(raw.savedAt)) return null;
+  if (raw.savedAt > nowMs || nowMs - raw.savedAt > maxAgeMs) return null; // too old, or a clock-skewed future timestamp — either way, don't trust it
+  if (!Array.isArray(raw.log)) return null;
+
+  // Each entry just needs a real shot number to be worth keeping — the four measures are already
+  // allowed to be null in a perfectly ordinary LIVE entry (an uncertain joint, see
+  // MIN_VISIBILITY), so a restored one can't be held to a stricter standard than a fresh one ever
+  // is. A clip that existed before the restart (hadClip) becomes clipLostOnRestore instead of a
+  // real clipUrl — see renderShotRow/shareLineForEntry — and clipBlob/clipUrl are never trusted
+  // out of storage even if a hand-edited payload somehow includes them.
+  const log = [];
+  for (const e of raw.log) {
+    if (!e || typeof e !== "object" || typeof e.shotNum !== "number" || !Number.isFinite(e.shotNum)) return null;
+    const { clipBlob, clipUrl, hadClip, ...rest } = e;
+    log.push({ ...rest, clipLostOnRestore: !!hadClip });
+  }
+
+  const num = (v, fallback) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
+  return {
+    log: log.slice(0, SHOT_LOG_MAX), // defensive re-cap — the live log is always already within this, but never trust a stored payload more than a fresh computation
+    shotCount: num(raw.shotCount, 0),
+    rejectedAttemptCount: num(raw.rejectedAttemptCount, 0),
+    unsettledAttemptCount: num(raw.unsettledAttemptCount, 0),
+    attentionIdlePeriods: num(raw.attentionIdlePeriods, 0),
+    attentionLateWakeCount: num(raw.attentionLateWakeCount, 0),
+    clipsUnavailableReason: typeof raw.clipsUnavailableReason === "string" ? raw.clipsUnavailableReason : null,
+  };
+}
+
+// Writes the current session to storage. Called only from the handful of places that actually
+// change something this restores (a shot logged, a movement rejected, an idle period, clip
+// recording found to be unavailable) — never from the render loop, which is performance-sensitive
+// (see the brief this shipped from) — so this runs at most a few times per shot, not per frame.
+// Wrapped end to end: Safari Private Browsing throws on setItem (it still has localStorage, just
+// a zero quota), and any other storage failure must degrade to exactly today's in-memory-only
+// behaviour, never break the very shot it exists to protect.
+function saveSessionToStorage() {
+  try {
+    const payload = serializeShotSession(
+      { log, shotCount, rejectedAttemptCount, unsettledAttemptCount, attentionIdlePeriods, attentionLateWakeCount, clipsUnavailableReason },
+      Date.now()
+    );
+    localStorage.setItem(SHOT_SESSION_STORAGE_KEY, JSON.stringify(payload));
+  } catch (err) {
+    // Silent on purpose — see this function's own comment. There's nothing the owner can act on
+    // mid-shot, and the app must carry on exactly as if persistence didn't exist.
+    console.error("archery-form-coach: could not save session", err);
+  }
+}
+
+// Reads whatever's in storage and, if it's usable, restores it into the live module state before
+// the first frame of this page load is ever rendered — see the call site near the bottom of this
+// file. Every failure mode (nothing saved, JSON.parse throwing on corrupt text, storage
+// unavailable at all) falls through to doing nothing, i.e. exactly today's behaviour: an empty
+// in-memory log.
+function restoreSessionFromStorage() {
+  let raw = null;
+  try {
+    const text = localStorage.getItem(SHOT_SESSION_STORAGE_KEY);
+    if (text) raw = JSON.parse(text);
+  } catch (err) {
+    console.error("archery-form-coach: could not read saved session", err);
+    return;
+  }
+  const restored = deserializeShotSession(raw, Date.now(), SESSION_RESTORE_MAX_AGE_MS);
+  if (!restored) return;
+
+  log = restored.log;
+  shotCount = restored.shotCount;
+  rejectedAttemptCount = restored.rejectedAttemptCount;
+  unsettledAttemptCount = restored.unsettledAttemptCount;
+  attentionIdlePeriods = restored.attentionIdlePeriods;
+  attentionLateWakeCount = restored.attentionLateWakeCount;
+  clipsUnavailableReason = restored.clipsUnavailableReason;
+  sessionWasRestored = true;
+}
+// ===========================================================================
 
 // One measure's stats across the shot log: the owner's own average, their spread (best-to-worst
 // gap — the number that matters most, since every target range in this file is a desk guess but
@@ -2347,11 +2507,15 @@ function renderShotRow(e, stats, outliers, words) {
   // about WHY (see explainClipFailure — a recorder error, an empty recording, one that arrived
   // too late, etc.), that reason is shown instead of the bare word "no clip", since a non-coder
   // owner standing at the phone is the only person who will ever see this and has no console to
-  // check instead. data-shot carries the shot number for the click handler on shotLogEl (see
-  // openClipPlayer wiring) to look the entry back up by.
+  // check instead. A row restored after a reload (clipLostOnRestore — see SESSION PERSISTENCE)
+  // gets its own honest wording too: it really did have a clip before the restart, so "no clip"
+  // would be a lie, but the clip itself is a Blob that died with the old page and cannot be
+  // brought back — never offer a Watch button whose URL is already dead. data-shot carries the
+  // shot number for the click handler on shotLogEl (see openClipPlayer wiring) to look the entry
+  // back up by.
   const clipBit = e.clipUrl
     ? `<button type="button" class="shotlog-play" data-shot="${e.shotNum}">▶ Watch</button>`
-    : `<span class="shotlog-noclip">${e.clipFailReason || "no clip"}</span>`;
+    : `<span class="shotlog-noclip">${e.clipLostOnRestore ? "clip lost — the app restarted" : e.clipFailReason || "no clip"}</span>`;
 
   return `<div class="shotlog-row"><div class="shotlog-row-main">Shot ${e.shotNum} — ${highlightText}${shortMark}${rawHtml}</div><div class="shotlog-row-clip">${clipBit}</div></div>`;
 }
@@ -2363,6 +2527,14 @@ function renderShotRow(e, stats, outliers, words) {
 // narrateMeasure for why not. Raw degrees/percent are still there for whoever eventually tunes
 // the CALIBRATE WITH COACH constants, just demoted to small print on each row, not the headline.
 function renderShotLog() {
+  // The very first thing on the page whenever a reload recovered a session (see
+  // sessionWasRestored / SESSION PERSISTENCE) — he needs to be able to tell "the app restarted
+  // and kept my shots" apart from "the app restarted and lost them" the moment he looks, not
+  // after reading everything else first. Set once, at startup, and never cleared for the rest of
+  // this page load — everything logged from here on is added on top of a recovered session.
+  const restoredBit = sessionWasRestored
+    ? `<div class="shotlog-restored">Session recovered after the app restarted. Shots below may include some from before that — their video clips didn't survive, but their numbers did.</div>`
+    : "";
   // A startup failure outranks every other banner below — if this is set, tracking may never
   // have properly run this session at all, which makes even the clip-availability banner beside
   // it secondary. See recordStartupProblem/clearStartupProblem for when this is set and cleared.
@@ -2409,7 +2581,7 @@ function renderShotLog() {
       : "";
 
   if (log.length === 0) {
-    shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -2445,7 +2617,7 @@ function renderShotLog() {
   const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // ===== SHARE — the owner's only route to a full session's numbers. He can't remember to add
@@ -2474,10 +2646,18 @@ function buildShareText(entries, counters) {
     mirrored,
     cameraWidth,
     cameraHeight,
+    sessionWasRestored,
   } = counters;
 
   const lines = [];
   lines.push("Archery form coach — session share");
+  // A restored session is a slightly different animal from a clean one — whoever reads this
+  // needs to know some of the shots below may predate an app restart, and that any of them could
+  // be missing a clip that genuinely existed once (see SESSION PERSISTENCE / clipLostOnRestore
+  // below). Right under the title, same "first thing read" placement as the on-screen notice.
+  if (sessionWasRestored) {
+    lines.push("NOTE: recovered after the app restarted mid-session — some shots below are from before that, and their video clips did not survive the restart.");
+  }
   // Context that changes how every number below should be read: which arm is "bow", whether the
   // picture (and therefore the clips) are mirrored, and the actual capture resolution — geometry
   // fixes in this app have already been sensitive to exactly these settings (see CLAUDE.md).
@@ -2547,7 +2727,7 @@ function sharePassFail(v) { return v == null ? "unknown" : v ? "pass" : "fail"; 
 // Always includes everything a ?debug row shows, regardless of whether ?debug is set — that gate
 // only applies to the LIVE on-screen row (see renderShotRow's debugBit); it never applies here.
 function shareLineForEntry(e) {
-  const recorded = e.clipUrl ? "yes" : "no";
+  const recorded = e.clipUrl ? "yes" : e.clipLostOnRestore ? "lost-on-restart" : "no";
   const failBit = e.clipFailReason ? ` clipFailReason="${e.clipFailReason}"` : "";
   return (
     `shot=${e.shotNum} bowArm=${shareDeg(e.bowArmAngle)} shoulderBow=${sharePct(e.shoulderDrop?.bow ?? null)} ` +
@@ -3025,6 +3205,7 @@ shotLogShareBtn.addEventListener("click", () => {
     mirrored: effectiveMirror(facingMode, mirrorToggled),
     cameraWidth: video.videoWidth || null,
     cameraHeight: video.videoHeight || null,
+    sessionWasRestored,
   });
   shareSessionText(text);
 });
@@ -3088,10 +3269,15 @@ clipPlayerRateBtns.forEach((btn) => {
   });
 });
 
+// Must run before anything below that can call saveSessionToStorage (markClipsUnavailable
+// included) — otherwise this session's own empty starting state would overwrite the very save
+// being restored, before it was ever read. See SESSION PERSISTENCE above.
+restoreSessionFromStorage();
+
 if (!CLIP_SUPPORTED) {
   markClipsUnavailable("Clips unavailable in this browser — everything else still works, just no shot videos.");
 }
-renderShotLog(); // shows the "no shots yet" placeholder (and the banner above, if set) before the first shot comes in
+renderShotLog(); // shows the "no shots yet" placeholder (and the banner above, if set) before the first shot comes in — or the restored log, if one was found
 
 // Plain-English description of whatever startupStep hasn't finished yet — the one place that
 // wording lives, shared by the transient status message and the persistent shot-log record below
@@ -5184,6 +5370,139 @@ function selfTest() {
   cueLastLost = savedCueLastLost;
   cueLastWatching = savedCueLastWatching;
   cueEl.className = savedCueClassName;
+
+  // ===== SESSION PERSISTENCE — serialize/deserialize round trip, and what a restored row looks
+  // like. Deliberately tests only the PURE functions (serializeShotSession/deserializeShotSession/
+  // entryForPersistence) rather than the real saveSessionToStorage/restoreSessionFromStorage —
+  // those two touch the real localStorage key a real session on this page might already be using,
+  // and a diagnostic run must never clobber or read that (same "leaves the live app exactly as it
+  // found it" rule as everything else in selfTest). No savedX/restore bookkeeping needed here for
+  // that reason: nothing below reads or writes actual module state (log, shotCount, etc.).
+  {
+    const now = 1_000_000_000;
+    const fixtureEntry = {
+      shotNum: 1,
+      bowArmAngle: 171,
+      shoulderDrop: { bow: 40, draw: 45 },
+      elbowAlign: { deviation: 3, direction: "high", signed: 3 },
+      handSep: 0.8,
+      anchorOk: true, armOk: true, sepOk: true, stillOk: true,
+      startMs: 500,
+      reachedFullDraw: true,
+      clipFailReason: null,
+      clipUrl: "blob:fake-had-a-clip", // simulates a shot that DID record a clip before the reload
+      clipBlob: { fake: true },
+    };
+    const state = {
+      log: [fixtureEntry],
+      shotCount: 1,
+      rejectedAttemptCount: 2,
+      unsettledAttemptCount: 1,
+      attentionIdlePeriods: 3,
+      attentionLateWakeCount: 1,
+      clipsUnavailableReason: "Some shots couldn't be recorded — at least one clip failed this session.",
+    };
+
+    // Round trip preserves every field. Goes through an actual JSON.stringify/parse, not just the
+    // plain object serializeShotSession returns, because that's what a real save/load does (see
+    // saveSessionToStorage/restoreSessionFromStorage) and JSON silently drops things a plain object
+    // copy wouldn't (undefined values, for one).
+    const payload = serializeShotSession(state, now);
+    console.assert(payload.v === SHOT_SESSION_FORMAT_VERSION, "serializeShotSession should stamp the current format version");
+    console.assert(payload.log[0].hadClip === true, "serializeShotSession should record that a clipped entry HAD a clip");
+    console.assert(payload.log[0].clipUrl === undefined && payload.log[0].clipBlob === undefined, "serializeShotSession must never write clipUrl/clipBlob — see this section's own top comment");
+
+    const roundTripped = JSON.parse(JSON.stringify(payload));
+    const restored = deserializeShotSession(roundTripped, now + 1000, SESSION_RESTORE_MAX_AGE_MS);
+    console.assert(restored !== null, "a fresh, well-formed payload must be accepted");
+    if (restored) {
+      const r = restored.log[0];
+      console.assert(r.shotNum === 1 && r.bowArmAngle === 171 && r.handSep === 0.8 && r.startMs === 500 && r.reachedFullDraw === true, "every plain field on a restored entry must match what was saved");
+      console.assert(r.shoulderDrop.bow === 40 && r.shoulderDrop.draw === 45, "restored shoulderDrop must round-trip both sides");
+      console.assert(r.elbowAlign.signed === 3 && r.elbowAlign.direction === "high", "restored elbowAlign must round-trip");
+      console.assert(r.anchorOk === true && r.armOk === true && r.sepOk === true && r.stillOk === true, "restored debug-flag fields must round-trip");
+      console.assert(r.clipUrl === undefined && r.clipBlob === undefined, "a restored entry must never carry a clipUrl/clipBlob — both died with the old page");
+      console.assert(r.clipLostOnRestore === true, "an entry that HAD a clip before the reload must come back marked clipLostOnRestore, so its row can say so honestly");
+      console.assert(
+        restored.shotCount === 1 && restored.rejectedAttemptCount === 2 && restored.unsettledAttemptCount === 1 &&
+        restored.attentionIdlePeriods === 3 && restored.attentionLateWakeCount === 1 && restored.clipsUnavailableReason === state.clipsUnavailableReason,
+        "every session counter must round-trip alongside the log"
+      );
+
+      // A restored entry with a dead clip must render and share without throwing — the whole
+      // point of clipLostOnRestore is that a restored row degrades honestly instead of offering a
+      // Watch button whose blob: URL is already dead (see renderShotRow's clipBit).
+      let rowHtml = null;
+      try {
+        rowHtml = renderShotRow(r, summarizeShots([r]), { bowArm: null, shoulderBow: null, shoulderDraw: null, elbow: null }, { bowArm: null, shoulderBow: null, shoulderDraw: null, elbow: null });
+      } catch (err) {
+        console.assert(false, `renderShotRow must not throw on a restored entry with a dead clip (threw: ${err.message})`);
+      }
+      if (rowHtml !== null) {
+        console.assert(rowHtml.includes("clip lost"), "a restored row with a dead clip should say the clip is gone, in plain language");
+        console.assert(!rowHtml.includes("shotlog-play"), "a restored row must never offer a Watch button for a clip that can't possibly play");
+      }
+
+      let shareText = null;
+      try {
+        shareText = buildShareText([r], {
+          shotCount: restored.shotCount,
+          rejectedAttemptCount: restored.rejectedAttemptCount,
+          unsettledAttemptCount: restored.unsettledAttemptCount,
+          attentionIdlePeriods: restored.attentionIdlePeriods,
+          attentionLateWakeCount: restored.attentionLateWakeCount,
+          clipsUnavailableReason: restored.clipsUnavailableReason,
+          modelStatusLine: null,
+          rightHanded: true,
+          mirrored: false,
+          cameraWidth: 720,
+          cameraHeight: 1280,
+          sessionWasRestored: true,
+        });
+      } catch (err) {
+        console.assert(false, `buildShareText must not throw on a restored entry with a dead clip (threw: ${err.message})`);
+      }
+      if (shareText !== null) {
+        console.assert(shareText.includes("recovered after the app restarted"), "shared text must say the session was recovered, same fact the on-screen notice shows");
+        console.assert(shareText.includes("recorded=lost-on-restart"), "a restored entry's share line must say its clip was lost on restart, not the plain recorded=no a shot that simply never had one would get");
+      }
+    }
+
+    // A stale payload must be rejected — this is the whole guard against resurrecting an old
+    // session (see SESSION_RESTORE_MAX_AGE_MS's own comment). "Now" here is moved past the
+    // cutoff instead of shrinking the cutoff itself, so this exercises the real constant.
+    const stalePayload = serializeShotSession(state, now);
+    const staleResult = deserializeShotSession(stalePayload, now + SESSION_RESTORE_MAX_AGE_MS + 1, SESSION_RESTORE_MAX_AGE_MS);
+    console.assert(staleResult === null, "a payload older than SESSION_RESTORE_MAX_AGE_MS must be rejected, not restored");
+
+    // Corrupt/partial/hand-edited payloads must be rejected WITHOUT throwing — this runs on
+    // whatever a previous, possibly different version of this file left behind (see
+    // deserializeShotSession's own comment), so it has to survive being handed garbage.
+    const garbagePayloads = [
+      null,
+      undefined,
+      "just a string, not an object",
+      {}, // missing everything
+      { v: SHOT_SESSION_FORMAT_VERSION }, // missing savedAt/log
+      { v: SHOT_SESSION_FORMAT_VERSION + 1, savedAt: now, log: [] }, // a future format version
+      { v: SHOT_SESSION_FORMAT_VERSION, savedAt: "not a number", log: [] },
+      { v: SHOT_SESSION_FORMAT_VERSION, savedAt: now, log: "not an array" },
+      { v: SHOT_SESSION_FORMAT_VERSION, savedAt: now, log: [{ bowArmAngle: 171 }] }, // entry with no shotNum
+      { v: SHOT_SESSION_FORMAT_VERSION, savedAt: now, log: [null] },
+    ];
+    garbagePayloads.forEach((g, i) => {
+      let result = "not called";
+      let threw = false;
+      try {
+        result = deserializeShotSession(g, now, SESSION_RESTORE_MAX_AGE_MS);
+      } catch (err) {
+        threw = true;
+      }
+      console.assert(!threw, `deserializeShotSession must never throw on garbage payload #${i}`);
+      console.assert(result === null, `deserializeShotSession must reject garbage payload #${i} (got ${JSON.stringify(result)})`);
+    });
+  }
+  // ===========================================================================
 
   // Lock-down: after the restore above, every borrowed variable must read back EXACTLY as it was
   // saved at the top of this function — a diagnostic mode that quietly leaves the live app
