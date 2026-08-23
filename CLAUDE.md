@@ -505,6 +505,63 @@ Rules the PM follows:
   print under the plain-English sentence, and — unlike the watchdog case —
   is never cleared, since `main()` has given up for the rest of the session.
 
+- **Every distance and angle used to be measured in a coordinate space that
+  quietly stretched the picture, and it took a real shot log to notice.**
+  Field report: two arrows, hand separation reading 2.31 and 2.32 — a real
+  archer's wrists at full draw are well under one torso-length apart, so this
+  was roughly three times what's physically possible, and the bow-shoulder
+  reading swung from 24% to 38% between the two shots. Root cause: MediaPipe
+  hands back `x` and `y` normalised INDEPENDENTLY — `x` as a fraction of the
+  video frame's width, `y` as a fraction of its height. Those two fractions
+  are only the same physical distance when the frame is square, and a
+  phone's camera frame never is (an iPhone held upright records portrait
+  video, roughly 720 pixels wide by 1280 tall). Every distance and angle in
+  this file — `angleAt`, `torsoLength`, hand separation, the anchor-distance
+  check, the stillness/speed check, both shoulder-drop measures — did plain
+  `Math.hypot`/vector maths directly on those raw `x`/`y` values, which
+  silently stretched every measurement along whichever axis the frame
+  happened to be narrower on. On this owner's portrait phone that meant a
+  mostly-horizontal measurement (wrist-to-wrist at full draw) got inflated
+  relative to a mostly-vertical one (the shoulder-to-hip torso scale) —
+  exactly the shape of the field numbers. Fix: `toPixelSpace(lm, frameWidth,
+  frameHeight)` converts a landmark from MediaPipe's normalised space into
+  one where a unit means the same physical distance on both axes, by
+  multiplying `x` by the video's actual pixel width and `y` by its actual
+  pixel height, BEFORE any distance or angle touches it. Applied consistently
+  everywhere geometry happens — both angle measures, both shoulder-drop
+  measures, the torso-length scale reference, hand separation, the
+  anchor-distance check, and the stillness/speed check — a partial fix that
+  corrected some measures but not others would have left a subtler version of
+  the exact same bug. **Two things this deliberately does NOT touch**: the
+  ROI crop box (`currentCropBox`/`squareAndClampCropBox`/`nextCropBox`) was
+  already tracked and forced square in real VIDEO PIXEL space, never in
+  normalised coordinates — see its own comment — so it was correct before
+  this fix and untouched by it; and `mapCropLandmarkToFullFrame` still
+  returns full-frame NORMALISED coordinates exactly as before, because
+  skeleton drawing (via `DrawingUtils`, and therefore every recorded clip)
+  and the One Euro smoothing filter both still work in that space — only the
+  geometry FUNCTIONS were changed to convert internally before measuring,
+  never the coordinate system everything downstream agrees on. Bow-arm angle
+  and draw-elbow alignment numbers move as a direct result of this fix (they
+  were being measured on a distorted picture before) — the owner has been
+  reading these numbers, so know that the specific degrees/percentages he's
+  seen before this fix will not match what he sees after it, even for an
+  identical shot; that's the bug being corrected, not a regression. Confirmed
+  with a real running comparison (pre-fix vs. post-fix code, same synthetic
+  full-draw body, real portrait 720x1280 pipeline): hand separation read 1.34
+  before this fix and 0.78 after it — and, on the exact same body, the
+  pre-fix code additionally read 0.48 in a LANDSCAPE 1280x720 frame, meaning
+  the same real archer would have read as "not even at full draw" (below
+  `FULL_DRAW_HAND_SEP_MIN`) in one orientation and comfortably past it in the
+  other, purely from which way the phone was held — the orientation-
+  dependence this fix removes. Every ratio-based calibration constant in this
+  file (`FULL_DRAW_HAND_SEP_MIN`, `DRAW_ATTEMPT_MIN_SEP`,
+  `FULL_DRAW_ANCHOR_MAX`, `FULL_DRAW_STILL_MAX`, `SHOT_MIN_PEAK_SEP_FRACTION`,
+  `SHOULDER_DROP_MIN_PCT`) was chosen or observed under the OLD, distorted
+  geometry and may no longer mean what it did — **left untouched on purpose**;
+  these are the owner's calibration constants, and re-tuning them needs a
+  real session under the corrected geometry, not a desk guess.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.
