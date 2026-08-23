@@ -354,6 +354,43 @@ Rules the PM follows:
   degree or two for the two angle measures, a few percentage points for
   shoulder drop, matching the actual field numbers this bug was found from.
 
+- **The first shot of a session (or of any tracking dropout) was being measured
+  through a colder pipeline than the rest, and that turned out to be most of
+  what the floors above were papering over.** Investigated after the floor fix:
+  the same static-body test kept naming shot 1 specifically, not spread evenly
+  across shots the way ordinary noise would. Root cause, confirmed by
+  comparing shot 1's readings against later shots' with and without a
+  deliberate settle pause first: `OneEuroFilter` returns its very first
+  sample completely unsmoothed and takes several frames to converge, and (see
+  region-of-interest cropping above) `currentCropBox` runs whole-frame,
+  lower-resolution detection until a box is first acquired. Both reset at the
+  same three points — session start, tracking lost, camera switched — so a
+  shot logged from any of those windows was measured differently from every
+  other shot, a real difference in the numbers, not a wording problem. Fix:
+  `SETTLE_FRAMES_REQUIRED` (a new PIPELINE SETTLING constant, same
+  performance-knob family as `SMOOTH_*`/`ROI_*` — not calibration, no coach
+  needed) counts consecutive good-tracking frames since the last reset;
+  `trackShotAttempt`/`endAttempt` now track an attempt's true peak hand
+  separation (all frames, for the existing gates — untouched) separately from
+  its best ELIGIBLE frame (settled frames only — see `advanceSettling` /
+  `resetSettling`), and only ever log the latter. An attempt that's real
+  (clears the existing gates) but has no eligible frame at all is neither
+  logged nor silently dropped: it's counted in `unsettledAttemptCount`, its
+  own persistent line, worded differently on purpose from the
+  `rejectedAttemptCount` "movements ignored" line — one means "that wasn't a
+  real draw", the other means "that was a real draw, the app just wasn't
+  ready to measure it yet", and the owner needs to be able to tell them
+  apart. In practice this gate is invisible in normal use — the owner has
+  many seconds walking to the line before his first real shot — and only
+  bites right after a mid-session tracking dropout, exactly the case where an
+  unsettled reading would otherwise have been the risky one to log.
+  Re-measured after this fix, at the same jitter level the bug was found at:
+  shot 1 vs. later shots' readings converged to a sub-half-degree gap
+  (previously several degrees), and the false-claim rate on a static body
+  dropped from roughly 3 claims in 16 measure-lines to 0 in 200 — with the
+  floor constants above left untouched, since nothing survived to need them
+  raised further.
+
 ## Not built / explicitly out of scope for this prototype
 
 - No build tooling, no bundler, no TypeScript.

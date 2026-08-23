@@ -108,6 +108,39 @@ const ROI_MIN_VISIBLE_LANDMARKS = 4; // fewer confidently-visible landmarks than
 const ROI_SMOOTHING = 0.35; // how much the crop box itself resists moving, frame to frame — 0 means it jumps straight to chase wherever the body was JUST seen (can flicker/re-zoom on ordinary landmark noise); closer to 1 means it barely moves at all (steadier crop, but slower to follow a real step sideways). This is the hysteresis that stops the box — and therefore the zoom level and framing handed to the model — chasing noise every single frame
 // ===========================================================================
 
+// ===== PIPELINE SETTLING — performance/precision knob, not calibration; safe to change without
+// a coach, same family as SMOOTH_*/ROI_* above. Not about the archer at all: a statement about
+// how long THIS PIPELINE itself takes to settle after it starts fresh, before a frame's numbers
+// are trustworthy enough to become a shot's LOGGED sample.
+//
+// Right after landmarkSmoother resets (session start, tracking lost and re-found, camera
+// switched) and right after the ROI crop box is first (re)established, both mechanisms are still
+// catching up rather than reporting the archer's true position: One Euro's very first sample
+// comes back completely unsmoothed (see OneEuroFilter.filter's tPrev===null branch), and — with
+// cropping on — the very first frame(s) after a reset run whole-frame, at lower effective
+// resolution, until a box exists. A shot logged from one of those frames is measured through a
+// different pipeline than every later shot, corrupting exactly the shot-to-shot comparison the
+// log exists to make. Caught in testing: on a synthetic body that never moved at all, the very
+// first logged draw of a session read several degrees off from the rest of an otherwise
+// identical session, purely from this — nothing to do with the archer, everything to do with
+// measuring the first shot through a colder pipeline than the others.
+//
+// SETTLE_FRAMES_REQUIRED is sized off the SMOOTHING filter, the slower of the two mechanisms to
+// settle: One Euro's time constant at SMOOTH_MIN_CUTOFF (1.0Hz — the calmest case, used when a
+// joint is nearly still, exactly the condition here) is tau = 1/(2*pi*1.0) ~= 0.16s; three time
+// constants (~0.48s, ~95% converged) is a reasonable settle target. At a modest ~20fps (this
+// file already assumes a phone can run this slow — see MODEL_SLOW_FRAME_MS above), that target
+// is about 10 frames; this constant sits well above that for margin, since (see below) the cost
+// of waiting a little longer is nearly always zero.
+//
+// In practice this gate should almost never cost the owner a real arrow: he starts the app,
+// props the phone against something, and walks five metres to the shooting line before drawing
+// at all, so the pipeline has many seconds — far more than this threshold needs — to settle
+// before his first real shot. It only bites right after a tracking dropout mid-session, which is
+// exactly when a fresh, unsettled reading would otherwise have been the risky one to log.
+const SETTLE_FRAMES_REQUIRED = 30; // consecutive good-tracking frames needed after a reset before a frame's numbers are trusted enough to log. RAISE for more margin (safer, but the gate takes longer to clear after every reset — still normally invisible, see above); LOWER only with real measured convergence data in hand, not a guess
+// ===========================================================================
+
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
 // MediaPipe pose landmark indices (33-point model)
@@ -186,6 +219,14 @@ let attempt = null; // the attempt currently in progress, if any — see trackSh
 // the persistent line built from this in renderShotLog. Never reset mid-session, same treatment
 // as shotCount above.
 let rejectedAttemptCount = 0;
+
+// How many real draw attempts (deep and long enough — never counted in rejectedAttemptCount
+// above) had every single frame land before the pipeline had settled (see PIPELINE SETTLING and
+// endAttempt), so there was no honest reading to log. A DIFFERENT claim from rejectedAttemptCount
+// on purpose: that one means "this wasn't a real draw"; this one means "this really was a draw,
+// the app just couldn't get a settled enough look at it" — the owner needs to be able to tell the
+// two apart, not read one combined "something got lost" number. See its own line in renderShotLog.
+let unsettledAttemptCount = 0;
 
 // The clip recording currently in progress or in its post-shot tail, if any — see
 // startClipRecording below. Only ever one of these at a time; a new attempt starting while the
@@ -552,11 +593,35 @@ function mapFullFrameToCropLocal(lm, cropBox, frameWidth, frameHeight) {
 }
 // ===========================================================================
 
+// ===== PIPELINE SETTLING — runtime state and the two small functions that implement the
+// PIPELINE SETTLING constant above. See SETTLE_FRAMES_REQUIRED's own comment for the full
+// reasoning; this is just the bookkeeping.
+let settledFrames = 0; // consecutive good-tracking frames seen since landmarkSmoother last reset
+
+// Called once per frame that has valid landmarks (never on pose loss — a lost frame has no
+// numbers to be trustworthy about, and ends whatever attempt was in progress anyway). Advances
+// the settling counter and reports whether THIS frame's own numbers are trustworthy enough to
+// log: takes cropBoxUsedThisFrame as a plain boolean rather than reading module state directly,
+// so selfTest can drive it deterministically without a real camera or crop box.
+function advanceSettling(cropBoxUsedThisFrame) {
+  settledFrames++;
+  return settledFrames >= SETTLE_FRAMES_REQUIRED && (!ROI_CROPPING_ENABLED || cropBoxUsedThisFrame);
+}
+
+// Re-arms the gate. Called from every place landmarkSmoother.reset() is called (pose lost,
+// camera switched) — same reset points, same reasoning: a frame right after either of those is
+// exactly as untrustworthy as one right after startup, and must be re-gated the same way.
+function resetSettling() {
+  settledFrames = 0;
+}
+// ===========================================================================
+
 async function startCamera() {
   // A landmark position smoothed from BEFORE a camera switch (different framing, possibly a
   // mirrored front camera) must never blend into positions AFTER it — that would drag the
   // skeleton across the frame on the very first frames of the new camera. See LandmarkSmoother.
   landmarkSmoother.reset();
+  resetSettling(); // both mechanisms are starting fresh — the next frames are exactly as unsettled as at session start, see PIPELINE SETTLING above
   // Same reasoning for the ROI crop box: a box computed against the OLD camera's framing means
   // nothing once the video source has changed underneath it, and could even be the wrong shape
   // for the new frame's resolution. Detect on the whole frame again until a fresh box is found.
@@ -782,7 +847,10 @@ function updateDrawElbowReadout(landmarks) {
 // All distances are normalised by torso length so this works the same at any distance from
 // the camera, and doesn't care which way the archer (or the mirrored camera) is facing.
 // Returns false — never a guess — if a landmark it needs is uncertain.
-function isAtFullDraw(landmarks, nowMs) {
+// frameEligible: whether THIS frame's own reading is settled enough to become a shot's logged
+// sample (see PIPELINE SETTLING above) — required, not optional, so every caller has to make a
+// deliberate choice rather than accidentally defaulting to "trust everything".
+function isAtFullDraw(landmarks, nowMs, frameEligible) {
   const drawWrist = rightHanded ? R_WRIST : L_WRIST;
   const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
   const bowElbow = rightHanded ? L_ELBOW : R_ELBOW;
@@ -854,6 +922,7 @@ function isAtFullDraw(landmarks, nowMs) {
       sepOk,
       stillOk,
       atFullDraw,
+      eligible: frameEligible,
     },
     nowMs
   );
@@ -862,31 +931,44 @@ function isAtFullDraw(landmarks, nowMs) {
 }
 
 // Attempt-boundary rule for the shot log: a draw attempt is "in progress" for as long as hand
-// separation stays at/above DRAW_ATTEMPT_MIN_SEP, tracking whichever frame in it had the
-// highest separation so far. It ends — and gets logged — the moment separation drops back
-// below that floor (hands back together at rest). This is the simplest rule that both (a)
-// doesn't split one long hold into several rows and (b) doesn't merge two separate shots taken
-// back-to-back into one. No timer involved: nothing here expires on its own, ever.
+// separation stays at/above DRAW_ATTEMPT_MIN_SEP. It ends — and gets judged for logging — the
+// moment separation drops back below that floor (hands back together at rest). This is the
+// simplest rule that both (a) doesn't split one long hold into several rows and (b) doesn't
+// merge two separate shots taken back-to-back into one. No timer involved: nothing here expires
+// on its own, ever.
+//
+// An in-progress attempt tracks TWO separate things, deliberately kept apart:
+//   - peakHandSep: the best hand separation seen on ANY frame, eligible or not. This is what
+//     the SHOT_MIN_PEAK_SEP_FRACTION gate in endAttempt below judges — whether the archer really
+//     drew the bow is a fact about what his hands did, unaffected by whether the pipeline had
+//     finished settling yet.
+//   - sample: the best hand separation seen on an ELIGIBLE frame only (frameEligible, see
+//     PIPELINE SETTLING above and isAtFullDraw) — null until one comes along. THIS is what
+//     actually gets logged if the attempt qualifies: an unsettled frame's own numbers must never
+//     become the shot's displayed reading, even though the attempt around it is completely real.
+// startMs is tracked from the very first frame regardless of eligibility too, for the same
+// reason as peakHandSep — SHOT_MIN_DURATION_MS is about how long the draw actually took, not
+// about when the pipeline happened to finish settling.
+//
 // nowMs threads through from isAtFullDraw's own nowMs parameter (renderLoop's `now`) — never
 // performance.now() called fresh in here, so selfTest can drive attempt timing deterministically
 // (see SHOT_MIN_DURATION_MS above and endAttempt below, which is what actually uses it).
 function trackShotAttempt(sample, nowMs) {
   if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
     const isNewAttempt = !attempt; // hands just left the resting position — a fresh attempt, not a continuation
-    // startMs (when this attempt began) and reachedFullDraw (whether ANY frame in it was a true
-    // full draw, not just its best-hand-separation frame) both have to survive being carried
-    // forward across frames even on frames that DON'T beat the current best — see below.
-    const startMs = isNewAttempt ? nowMs : attempt.startMs;
-    const reachedFullDraw = (isNewAttempt ? false : attempt.reachedFullDraw) || !!sample.atFullDraw;
-    if (isNewAttempt || sample.handSep >= attempt.handSep) {
-      attempt = { ...sample, startMs, reachedFullDraw };
-    } else {
-      attempt.startMs = startMs;
-      attempt.reachedFullDraw = reachedFullDraw;
+    if (isNewAttempt) {
+      attempt = { startMs: nowMs, peakHandSep: sample.handSep, sample: null, reachedFullDraw: false };
+      // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
+      // the time endAttempt fires the good part is already over. Starts regardless of this
+      // frame's eligibility — the clip is a recording of what happened, not a measurement.
+      startClipRecording();
+    } else if (sample.handSep > attempt.peakHandSep) {
+      attempt.peakHandSep = sample.handSep;
     }
-    // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
-    // the time endAttempt fires the good part is already over.
-    if (isNewAttempt) startClipRecording();
+    if (sample.eligible && (!attempt.sample || sample.handSep >= attempt.sample.handSep)) {
+      attempt.sample = sample;
+      attempt.reachedFullDraw = attempt.reachedFullDraw || !!sample.atFullDraw;
+    }
   } else {
     endAttempt(nowMs);
   }
@@ -899,18 +981,26 @@ function trackShotAttempt(sample, nowMs) {
 // ended it: tracking loss must not manufacture a shot that the same movement, ending normally,
 // wouldn't have earned.
 //
-// Two gates, both against the attempt's own best frame — see SHOT_MIN_PEAK_SEP_FRACTION and
-// SHOT_MIN_DURATION_MS above for why these two specifically. An attempt that fails either one
-// gets thrown away, not logged: counted in rejectedAttemptCount instead, and any clip recording
-// still running for it gets finalised (and therefore its capture track stopped) right now rather
-// than left to expire on its own — see finalizeRecording, and CLAUDE.md on why a clip must never
-// outlive the shot it belongs to.
+// Two gates first, both against the attempt's own peak (ALL frames, eligible or not — see
+// trackShotAttempt above) — see SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS above for
+// why these two specifically. An attempt that fails either one gets thrown away, not logged:
+// counted in rejectedAttemptCount, and any clip recording still running for it gets finalised
+// (and therefore its capture track stopped) right now rather than left to expire on its own —
+// see finalizeRecording, and CLAUDE.md on why a clip must never outlive the shot it belongs to.
+//
+// A THIRD, separate case, checked only once the attempt has cleared both gates above: a real
+// draw attempt whose every single frame happened to be unsettled (see PIPELINE SETTLING above)
+// has no honest sample to log — attempt.sample is still null. This is NOT the same claim as
+// rejectedAttemptCount (noise that was never plausibly a draw at all): the owner really did draw
+// the bow here, the app just never got a settled enough look at it to log a number. Counted and
+// reported separately — unsettledAttemptCount, its own line in the log — so the two can never be
+// confused for each other; see renderShotLog.
 function endAttempt(nowMs) {
   if (!attempt) return;
   const a = attempt;
   attempt = null; // clear first — logShot/finalizeRecording below must never see a stale in-progress attempt
 
-  const gotDeepEnough = a.handSep >= SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN;
+  const gotDeepEnough = a.peakHandSep >= SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN;
   const lastedLongEnough = typeof nowMs === "number" && typeof a.startMs === "number" && nowMs - a.startMs >= SHOT_MIN_DURATION_MS;
 
   if (!gotDeepEnough || !lastedLongEnough) {
@@ -920,7 +1010,14 @@ function endAttempt(nowMs) {
     return;
   }
 
-  const shotNum = logShot(a);
+  if (!a.sample) {
+    unsettledAttemptCount++;
+    finalizeRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to
+    renderShotLog();
+    return;
+  }
+
+  const shotNum = logShot({ ...a.sample, startMs: a.startMs, reachedFullDraw: a.reachedFullDraw });
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
@@ -1427,9 +1524,16 @@ function renderShotLog() {
     rejectedAttemptCount > 0
       ? `<div class="shotlog-rejected">${rejectedAttemptCount} movement${rejectedAttemptCount === 1 ? "" : "s"} ignored (too short, or never near full draw) — not counted as shots.</div>`
       : "";
+  // A DIFFERENT claim from rejectedBit above, said in different words on purpose — see
+  // unsettledAttemptCount's own comment. This one means a real draw happened but the app hadn't
+  // finished getting ready yet, not that it decided the movement wasn't a shot.
+  const unsettledBit =
+    unsettledAttemptCount > 0
+      ? `<div class="shotlog-rejected">${unsettledAttemptCount} arrow${unsettledAttemptCount === 1 ? "" : "s"} drawn before the app finished settling weren't recorded — give it a few seconds after starting before your first shot.</div>`
+      : "";
 
   if (log.length === 0) {
-    shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
+    shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${unsettledBit}<div class="shotlog-empty">No shots recorded yet — draw once and this fills in.</div>`;
     return;
   }
 
@@ -1465,7 +1569,7 @@ function renderShotLog() {
   const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
-  shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
+  shotLogEl.innerHTML = `${banner}${modelBit}${rejectedBit}${unsettledBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
@@ -1606,6 +1710,7 @@ function renderLoop() {
     // stale. Reset so a fresh detection later starts clean rather than being dragged from
     // wherever the skeleton was last seen (see LandmarkSmoother).
     landmarkSmoother.reset();
+    resetSettling(); // the archer was just lost — whatever comes back next is exactly as unsettled as session start, see PIPELINE SETTLING above
     // Re-acquire on loss: whether this frame was cropped or not, no landmarks means whatever crop
     // box we had (if any) no longer contains the archer, or we never had one. Drop it so the very
     // next frame detects on the WHOLE frame again rather than continuing to stare into a box that
@@ -1631,7 +1736,13 @@ function renderLoop() {
     // side effect, calling trackShotAttempt (below) to feed the shot log. It used to also drive
     // the auto-freeze state machine, which read the true/false result; that machine is gone, but
     // the shot log still depends on this call happening every frame, so it stays.
-    isAtFullDraw(landmarks, now);
+    //
+    // frameEligible: is THIS frame's own reading settled enough to become a shot's logged sample
+    // (see PIPELINE SETTLING above)? Computed here, not inside isAtFullDraw, because only
+    // renderLoop knows whether THIS frame actually used an established crop box — threaded
+    // through as an explicit argument (like nowMs already is) so selfTest can drive it too.
+    const frameEligible = advanceSettling(!!usedCropBox);
+    isAtFullDraw(landmarks, now, frameEligible);
 
     // Pick the crop box for NEXT frame from what was actually seen this frame (full-frame
     // coordinates, already mapped above if this frame itself was cropped). Recomputed from
@@ -1759,6 +1870,8 @@ function selfTest() {
   const savedLog = log;
   const savedShotCount = shotCount;
   const savedRejectedAttemptCount = rejectedAttemptCount;
+  const savedUnsettledAttemptCount = unsettledAttemptCount;
+  const savedSettledFrames = settledFrames;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   const mkLandmarks = (overrides) => {
@@ -1812,9 +1925,9 @@ function selfTest() {
     raiseHandSep < FULL_DRAW_HAND_SEP_MIN,
     "raise fixture's hands should be too close together to pass hand separation — the one thing meant to reject it"
   );
-  console.assert(isAtFullDraw(raise, 0) === false, "raise (first frame) must not read as full draw");
+  console.assert(isAtFullDraw(raise, 0, true) === false, "raise (first frame) must not read as full draw");
   console.assert(
-    isAtFullDraw(raise, 500) === false,
+    isAtFullDraw(raise, 500, true) === false,
     "raise held steady for a second frame (passes stillness too, now) must still be rejected — by hand separation alone"
   );
 
@@ -1824,11 +1937,11 @@ function selfTest() {
   lastDrawWrist = null;
   const drawn = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
   console.assert(
-    isAtFullDraw(drawn, 0) === false,
+    isAtFullDraw(drawn, 0, true) === false,
     "first frame at full draw should read as still-moving (no prior position yet)"
   );
   console.assert(
-    isAtFullDraw(drawn, 500) === true,
+    isAtFullDraw(drawn, 500, true) === true,
     "same position 500ms later (zero speed) should read as full draw"
   );
 
@@ -1837,7 +1950,7 @@ function selfTest() {
   // must be rejected by stillness alone, not because it never got close enough.
   lastDrawWrist = null;
   const midDraw1 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.4, y: 0.31 } });
-  isAtFullDraw(midDraw1, 0); // seeds lastDrawWrist; this call's own result isn't the point
+  isAtFullDraw(midDraw1, 0, true); // seeds lastDrawWrist; this call's own result isn't the point
   const midDraw2 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.5, y: 0.32 } });
   const midScale = torsoLength(midDraw2, R_SHOULDER, R_HIP);
   const midAnchor = {
@@ -1854,7 +1967,7 @@ function selfTest() {
     "mid-draw fixture's hands should already be far enough apart on their own"
   );
   console.assert(
-    isAtFullDraw(midDraw2, 50) === false,
+    isAtFullDraw(midDraw2, 50, true) === false,
     "wrist still travelling fast toward anchor (50ms, big jump) must not read as full draw yet — only stillness should be stopping it"
   );
 
@@ -1863,10 +1976,10 @@ function selfTest() {
   // right before it settles at anchor.
   lastDrawWrist = null;
   const driftSeed = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
-  isAtFullDraw(driftSeed, 500); // seeds lastDrawWrist at the same position/time as `drawn` above
+  isAtFullDraw(driftSeed, 500, true); // seeds lastDrawWrist at the same position/time as `drawn` above
   const drifted = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.6, y: 0.31 } });
   console.assert(
-    isAtFullDraw(drifted, 600) === false,
+    isAtFullDraw(drifted, 600, true) === false,
     "wrist jumping far in 100ms (fast) should not read as holding still"
   );
 
@@ -1881,10 +1994,12 @@ function selfTest() {
   log = [];
   shotCount = 0;
   rejectedAttemptCount = 0;
-  const sample = (handSep, atFullDraw = false, extra = {}) => ({
+  unsettledAttemptCount = 0;
+  const sample = (handSep, atFullDraw = false, eligible = true, extra = {}) => ({
     handSep,
     bowArmAngle: 178,
     atFullDraw,
+    eligible,
     anchorOk: true,
     armOk: true,
     sepOk: handSep >= FULL_DRAW_HAND_SEP_MIN,
@@ -1979,6 +2094,85 @@ function selfTest() {
     log[0].shotNum > log[SHOT_LOG_MAX - 1].shotNum,
     "log should stay newest-first even once it's capped"
   );
+
+  // --- PIPELINE SETTLING: advanceSettling/resetSettling, the pure bookkeeping behind
+  // SETTLE_FRAMES_REQUIRED — see that constant's own comment for the reasoning. Reset first so
+  // this doesn't inherit settledFrames from whatever earlier fixtures left behind.
+  {
+    resetSettling();
+    // A frame before the threshold cannot become a logged sample: advanceSettling must read
+    // false for every one of the first SETTLE_FRAMES_REQUIRED - 1 frames, cropping satisfied on
+    // every one of them (cropBoxUsedThisFrame: true), so it's the FRAME COUNT specifically being
+    // tested here, not the crop condition.
+    let sawTrueEarly = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED - 1; i++) {
+      if (advanceSettling(true)) sawTrueEarly = true;
+    }
+    console.assert(!sawTrueEarly, "no frame before SETTLE_FRAMES_REQUIRED should ever read as settled");
+    // One after (the SETTLE_FRAMES_REQUIRED-th good-tracking frame) can: this is the frame that
+    // crosses the threshold.
+    console.assert(
+      advanceSettling(true) === true,
+      "the SETTLE_FRAMES_REQUIRED-th consecutive good-tracking frame should read as settled"
+    );
+    // Once settled, later frames stay settled (the counter doesn't wrap or reset on its own).
+    console.assert(advanceSettling(true) === true, "settling should stay settled on the next frame too, not flicker back off");
+
+    // The crop requirement is independent of frame count: even with far more than
+    // SETTLE_FRAMES_REQUIRED good-tracking frames, a frame that never actually used an
+    // established crop box must never read as settled while ROI_CROPPING_ENABLED is on.
+    resetSettling();
+    let sawTrueWithoutCrop = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED + 20; i++) {
+      if (advanceSettling(false)) sawTrueWithoutCrop = true;
+    }
+    console.assert(
+      !ROI_CROPPING_ENABLED || !sawTrueWithoutCrop,
+      "with cropping on, a frame that never used an established crop box must never read as settled, no matter how many frames have passed"
+    );
+
+    // A reset mid-session re-arms the gate: get to settled, reset, and confirm the very next
+    // frame goes back to reading unsettled — the counter doesn't remember where it was before.
+    resetSettling();
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED; i++) advanceSettling(true);
+    console.assert(advanceSettling(true) === true, "setup: should be settled before the reset");
+    resetSettling();
+    console.assert(advanceSettling(true) === false, "a reset mid-session must re-arm the gate — the very next frame should read as unsettled again");
+  }
+
+  // --- PIPELINE SETTLING, integration: trackShotAttempt/endAttempt must never log a frame's own
+  // numbers unless that frame was eligible (sample.eligible), even though the attempt boundary
+  // itself (start/end timing, the peak-separation gate) is judged from ALL frames regardless.
+  attempt = null;
+  log = [];
+  shotCount = 0;
+  rejectedAttemptCount = 0;
+  unsettledAttemptCount = 0;
+
+  // A real draw (deep and long enough) made ENTIRELY of unsettled frames: nothing here is noise
+  // — sample(0.9, false, false) clears both SHOT_MIN_PEAK_SEP_FRACTION and, given the timing
+  // below, SHOT_MIN_DURATION_MS — but every frame is ineligible, so there is no honest reading to
+  // log. Must be counted as unsettled, NOT rejected, and must not appear in the log.
+  trackShotAttempt(sample(0.4, false, false), 20000); // crosses the floor, unsettled
+  trackShotAttempt(sample(0.9, false, false), 20400); // peak, still unsettled
+  trackShotAttempt(sample(0.05, false, false), 20900); // ends — 900ms elapsed, well over SHOT_MIN_DURATION_MS
+  console.assert(log.length === 0, "an attempt made entirely of unsettled frames must not be logged");
+  console.assert(shotCount === 0, "shotCount must not advance for an unsettled attempt");
+  console.assert(rejectedAttemptCount === 0, "an unsettled-but-otherwise-real attempt must NOT be counted as rejected (noise) — those are different claims");
+  console.assert(unsettledAttemptCount === 1, "the unsettled attempt should be counted in unsettledAttemptCount specifically");
+
+  // A real draw where the app was STILL unsettled during the raise but settles partway through:
+  // the logged row must come from the eligible frame(s) only, never the higher-handSep
+  // ineligible one that came before settling finished.
+  trackShotAttempt(sample(0.4, false, false), 21000); // crosses the floor, unsettled
+  trackShotAttempt(sample(0.95, false, false), 21400); // higher handSep, but STILL unsettled — must never be logged
+  trackShotAttempt(sample(0.8, true, true, { bowArmAngle: 171 }), 21800); // settles now — lower handSep than the unsettled peak, but this is the one that must be used
+  trackShotAttempt(sample(0.05), 22400); // ends — 1400ms elapsed
+  console.assert(log.length === 1, "an attempt that settles partway through should still log, once it has an eligible frame");
+  console.assert(log[0].handSep === 0.8, "the logged reading must come from the eligible frame (0.8), not the higher-handSep unsettled one (0.95)");
+  console.assert(log[0].bowArmAngle === 171, "the logged reading's other fields must also come from the eligible frame, not an unsettled one");
+  console.assert(log[0].reachedFullDraw === true, "reachedFullDraw should reflect the eligible frame's own atFullDraw reading");
+  console.assert(unsettledAttemptCount === 1, "a settled-in-time attempt must not also be counted as unsettled");
 
   // --- Feature A: shoulder drop = ear-to-shoulder gap, normalised by torso length, as a %.
   // Same-side ear preferred, falling back to the other ear (or to null) when it's occluded —
@@ -2742,6 +2936,8 @@ function selfTest() {
   log = savedLog;
   shotCount = savedShotCount;
   rejectedAttemptCount = savedRejectedAttemptCount;
+  unsettledAttemptCount = savedUnsettledAttemptCount;
+  settledFrames = savedSettledFrames;
 
   console.log("selfTest done — check above for any failed console.assert");
 }
