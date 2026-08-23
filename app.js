@@ -34,8 +34,40 @@ const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much 
 // attempt STARTS and ENDS, and separate from FULL_DRAW_HAND_SEP_MIN, which a shot still does NOT
 // need to reach to be logged (see endAttempt) — a draw that fell short of full draw is still
 // worth seeing, on purpose. These just rule out things that were never plausibly a draw at all.
+//
+// KNOWN RESIDUAL CASE, left as-is on purpose: hand separation is measured assuming a side-on
+// framing, where the two arms genuinely overlap in the camera's view at rest. Someone standing
+// face-on or back-on to the camera (see the RAISE TRIGGER's own bow-arm-height signal below,
+// which doesn't have this problem) can read as "hands apart" from ordinary standing posture alone
+// — proven with a static, motionless test pose, see the diagnosis this shipped with. A long
+// enough pause in that orientation can still clear these two gates and open/log a row via hand
+// separation alone (the raise trigger's fallback path, kept deliberately — see its own comment:
+// a missed raise must still be able to log a real shot). Do NOT read that as license to tighten
+// SHOT_MIN_PEAK_SEP_FRACTION/DRAW_ATTEMPT_MIN_SEP against it — with the reachedFullDraw distinction
+// below (see fullDrawShotCount, endAttempt's signalOutcome call, and renderShotLog/buildShareText),
+// this case can no longer fake a green "arrow counted" flash or corrupt the consistency numbers:
+// anchorOk fails for it every time (nobody's hand is near their face while just standing there),
+// so it logs a marked, excluded, "seen but not confirmed" row — a correct, acceptable outcome for
+// a resting posture, not a bug to chase by making these two constants stricter.
 const SHOT_MIN_PEAK_SEP_FRACTION = 0.8; // the attempt's peak hand separation must reach at least this fraction of FULL_DRAW_HAND_SEP_MIN (0.8 x 0.75 = 0.6 torso-lengths apart) to count as a real draw attempt — comfortably above the ~0.3-0.5 range nocking/lowering the bow produces, comfortably below the 0.75 that counts as full draw itself
 const SHOT_MIN_DURATION_MS = 600; // an attempt must last at least this long, from when hands first cross DRAW_ATTEMPT_MIN_SEP to when they drop back below it, to count as a real draw rather than a brief noise spike (a hand passing near the body, a tracking glitch) — a real compound draw, even a rushed one, takes real time to raise, draw and settle
+
+// RAISE TRIGGER — owner's own proposal, field-tested reasoning: "every time i raise my left arm
+// at shoulder height trigger a record because the shooting routine has started." Raising the bow
+// arm is the first deliberate movement of every shot, happens once, and isn't affected by
+// occlusion the way the draw hand's anchor position can be. This is an EARLIER, ADDITIONAL way to
+// start watching a draw attempt — see trackShotAttempt — never a replacement for the existing
+// hand-separation trigger (DRAW_ATTEMPT_MIN_SEP above), which still opens an attempt on its own if
+// a raise is ever missed (occlusion, tracking blip): fail toward recording, per CLAUDE.md.
+// Deliberately does NOT change how a shot's numbers are measured — see bowArmRaiseHeight and
+// trackShotAttempt's own comments for how the raise is kept out of the median.
+const RAISE_TRIGGER_UP_FRACTION = 0; // bow wrist at or above bow-shoulder height — (shoulder.y - wrist.y)/torsoLength >= this — arms the "watching" state. 0 = exactly level with the shoulder; the first instant the bow arm reaches shoulder height on the way up
+const RAISE_TRIGGER_DOWN_FRACTION = -0.3; // the bow wrist must drop back down at least this far below shoulder height before a NEW raise can trigger again — well below RAISE_TRIGGER_UP_FRACTION (hysteresis), so ordinary landmark noise right at shoulder height can't chatter the trigger on and off every frame the arm happens to hover near it
+// Safety valve, not a coach knob (same family as CLIP_MAX_MS) — a raise that never turns into a
+// real draw (he lowers the bow, changes his mind, adjusts something with the arm still up) closes
+// on its own after this long, rejected like any other attempt that didn't earn a row, rather than
+// leaving the app "watching" for the rest of the session.
+const RAISE_ATTEMPT_TIMEOUT_MS = 12000;
 
 // A shot's logged numbers are the MEDIAN of each measure across every eligible (settled — see
 // PIPELINE SETTLING above) frame of the hold, computed independently per measure — not a single
@@ -361,7 +393,8 @@ let lastDebugRenderMs = -Infinity;
 // get overwritten just because time passed, only because a newer attempt bumps an old one out of
 // the last SHOT_LOG_MAX.
 const SHOT_LOG_MAX = 10;
-let shotCount = 0; // total LOGGED attempts this session (see endAttempt) — keeps counting even once the log above fills up
+let shotCount = 0; // total LOGGED attempts this session (see endAttempt) — keeps counting even once the log above fills up. Includes rows that never reached full draw (see fullDrawShotCount below) — this is "how many rows exist", not "how many arrows", and drives shotNum numbering, so it must never skip a value just because a row turned out short of full draw
+let fullDrawShotCount = 0; // of the LOGGED rows above, how many actually reached full draw (anchorOk/armOk/sepOk/stillOk all true on at least one eligible frame — see reachedFullDraw). THIS is "arrows" for the headline count and the green cue (see logShot/endAttempt) — a row can be logged, numbered and kept without ever incrementing this. Same "keeps counting past SHOT_LOG_MAX" treatment as shotCount, for the same reason: the headline arrow count must stay true to the whole session, not just whatever's still in the capped log
 let log = []; // newest first
 let attempt = null; // the attempt currently in progress, if any — see trackShotAttempt below
 
@@ -1255,6 +1288,52 @@ function torsoLength(landmarks, shoulderIdx, hipIdx, frameWidth, frameHeight) {
   return Math.hypot(s.x - h.x, s.y - h.y);
 }
 
+// ===== RAISE TRIGGER — see the RAISE_TRIGGER_UP_FRACTION/RAISE_TRIGGER_DOWN_FRACTION constants
+// above for the full reasoning. How far the BOW wrist sits above (positive) or below (negative)
+// the BOW shoulder, in torso-lengths — the one signal the raise trigger watches. Own-side torso
+// scale only (no draw-side fallback, unlike isAtFullDraw's hand-separation scale): this measures
+// the bow arm specifically, so the bow arm's own shoulder/hip is the physically correct reference,
+// not a borrowed one from the other side of the body. Image y grows downward, so a wrist ABOVE the
+// shoulder has a SMALLER y — hence shoulder.y - wrist.y, not the other way round. Same "never
+// guess" convention as every other measure here: null if a needed landmark isn't confidently
+// visible or there's no usable torso-length scale. Follows the handedness toggle via rightHanded,
+// exactly like bowArmAngleOf/shoulderDropSampleOf — "bow arm", never "left arm".
+function bowArmRaiseHeight(landmarks, frameWidth, frameHeight) {
+  const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
+  const bowWrist = rightHanded ? L_WRIST : R_WRIST;
+  const bowHip = rightHanded ? L_HIP : R_HIP;
+  if (!visible(landmarks, bowShoulder) || !visible(landmarks, bowWrist)) return null;
+  const scale = torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight);
+  if (!scale) return null;
+  const shoulder = toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight);
+  const wrist = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
+  return (shoulder.y - wrist.y) / scale;
+}
+
+// true from the moment the bow wrist crosses RAISE_TRIGGER_UP_FRACTION going up until it drops
+// back through RAISE_TRIGGER_DOWN_FRACTION — latched with hysteresis (see those constants' own
+// comments) so noise right at shoulder height can't fire this every frame. Read by
+// trackShotAttempt below to decide whether a draw attempt should be open; never touched by the
+// four full-draw conditions or the median measures — the raise only decides WHEN to watch, never
+// what gets measured.
+let raiseArmed = false;
+
+// Updates raiseArmed for THIS frame from the bow wrist's current height. An unreadable frame
+// (bow shoulder/wrist not confidently visible, or no torso scale) can't fire OR clear the trigger
+// — never guess, same convention as every other signal in this file — so raiseArmed simply holds
+// whatever it was. Pure state transition only; trackShotAttempt below decides what a raise
+// actually DOES (open an attempt, start a clip recording).
+function updateRaiseTrigger(landmarks, frameWidth, frameHeight) {
+  const height = bowArmRaiseHeight(landmarks, frameWidth, frameHeight);
+  if (height === null) return;
+  if (!raiseArmed && height >= RAISE_TRIGGER_UP_FRACTION) {
+    raiseArmed = true;
+  } else if (raiseArmed && height <= RAISE_TRIGGER_DOWN_FRACTION) {
+    raiseArmed = false;
+  }
+}
+// ===========================================================================
+
 // Shoulder drop for one shoulder: the vertical gap between that shoulder and its ear,
 // normalised by torso length and given as a percentage — bigger number = shoulder sits
 // further from the ear = more dropped, which is what "dropping my shoulders more" means.
@@ -1410,7 +1489,15 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
 
   if (DEBUG) debugInfo = null; // cleared unless we make it all the way through below
 
+  // RAISE TRIGGER: independent of the stricter visibility this function's own full-draw checks
+  // need below — see bowArmRaiseHeight's own comment. Updated (and fed to trackShotAttempt via
+  // sample.raiseArmed, both here and below) on every frame this CAN be read at all, even one
+  // where the rest of this function can't proceed (e.g. the draw elbow is briefly occluded) — the
+  // raise must fire as easily as possible: fail toward recording.
+  updateRaiseTrigger(landmarks, frameWidth, frameHeight);
+
   if (![drawWrist, bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) {
+    trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
 
@@ -1423,6 +1510,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   } else if (visible(landmarks, NOSE)) {
     anchorNorm = landmarks[NOSE];
   } else {
+    trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
   // anchorNorm above is built by averaging two normalised points (still normalised, fine to mix
@@ -1434,7 +1522,10 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const scale =
     torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ??
     torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight);
-  if (!scale) return false;
+  if (!scale) {
+    trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
+    return false;
+  }
 
   const wrist = toPixelSpace(landmarks[drawWrist], frameWidth, frameHeight);
   const bowWristPos = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
@@ -1442,7 +1533,12 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const handSep = Math.hypot(wrist.x - bowWristPos.x, wrist.y - bowWristPos.y) / scale;
 
   const bowArmAngle = bowArmAngleOf(landmarks, frameWidth, frameHeight);
-  if (bowArmAngle === null) return false;
+  if (bowArmAngle === null) {
+    // handSep is already known at this point (computed above) even though the bow arm's own
+    // angle isn't — no reason to throw away a real reading here.
+    trackShotAttempt({ handSep, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
+    return false;
+  }
 
   // Stillness: compare to where the draw wrist was last frame. Speed (distance moved per
   // second), not raw distance, so it doesn't depend on how often this happens to get called.
@@ -1474,6 +1570,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   trackShotAttempt(
     {
       handSep,
+      raiseArmed,
       bowArmAngle,
       shoulderDrop: shoulderDropSampleOf(landmarks, frameWidth, frameHeight),
       elbowAlign: drawElbowAlignmentOf(landmarks, frameWidth, frameHeight),
@@ -1491,11 +1588,24 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
 }
 
 // Attempt-boundary rule for the shot log: a draw attempt is "in progress" for as long as hand
-// separation stays at/above DRAW_ATTEMPT_MIN_SEP. It ends — and gets judged for logging — the
-// moment separation drops back below that floor (hands back together at rest). This is the
-// simplest rule that both (a) doesn't split one long hold into several rows and (b) doesn't
-// merge two separate shots taken back-to-back into one. No timer involved: nothing here expires
-// on its own, ever.
+// separation stays at/above DRAW_ATTEMPT_MIN_SEP, OR the raise trigger is armed (see RAISE
+// TRIGGER above) — whichever comes first. It ends — and gets judged for logging — once BOTH are
+// false again (hands back together AND the bow arm back down). Two independent ways in, because
+// occlusion can take either one away on any given attempt (fail toward recording, per CLAUDE.md):
+// a raise that's missed still gets caught once hands separate for real; a full draw whose raise
+// was missed (bow arm never confidently visible, say) still gets caught by hand separation, same
+// as before this feature existed. This is the simplest rule that both (a) doesn't split one long
+// hold into several rows and (b) doesn't merge two separate shots taken back-to-back into one.
+// RAISE_ATTEMPT_TIMEOUT_MS is the one timer involved, and only for a raise that never turns into a
+// real draw (see below) — nothing else here expires on its own.
+//
+// The raise decides WHEN to watch; it must never change what gets MEASURED. So a fresh attempt
+// opened by the raise alone starts with startMs left null — "has the real draw actually started"
+// — and peakHandSep/eligibleFrames/reachedFullDraw stay untouched until hand separation itself
+// crosses DRAW_ATTEMPT_MIN_SEP, at which point startMs is set (once) and every existing gate,
+// median and duration check runs exactly as it did before the raise trigger existed. A raise-phase
+// frame (arm up, hands not yet apart) never contributes a sample to the median — see
+// medianSampleOf — because it's never added to eligibleFrames in the first place.
 //
 // An in-progress attempt tracks TWO separate things, deliberately kept apart:
 //   - peakHandSep: the best hand separation seen on ANY frame, eligible or not. This is what
@@ -1518,24 +1628,41 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
 // performance.now() called fresh in here, so selfTest can drive attempt timing deterministically
 // (see SHOT_MIN_DURATION_MS above and endAttempt below, which is what actually uses it).
 function trackShotAttempt(sample, nowMs) {
-  if (sample.handSep >= DRAW_ATTEMPT_MIN_SEP) {
-    const isNewAttempt = !attempt; // hands just left the resting position — a fresh attempt, not a continuation
+  const drawing = sample.handSep !== null && sample.handSep >= DRAW_ATTEMPT_MIN_SEP;
+  const inMotion = drawing || sample.raiseArmed;
+
+  if (inMotion) {
+    const isNewAttempt = !attempt; // the raise armed, or hands just left the resting position — a fresh attempt, not a continuation
     if (isNewAttempt) {
-      attempt = { startMs: nowMs, peakHandSep: sample.handSep, eligibleFrames: [], eligibleSeen: 0, reachedFullDraw: false };
+      attempt = {
+        startMs: null, // set below the first time `drawing` is actually true — a raise alone must never start the SHOT_MIN_DURATION_MS clock, see this function's own block comment
+        watchStartedAt: nowMs, // when THIS attempt object was created (raise or hand-separation, whichever fired first) — only used by RAISE_ATTEMPT_TIMEOUT_MS below
+        peakHandSep: 0,
+        eligibleFrames: [],
+        eligibleSeen: 0,
+        reachedFullDraw: false,
+      };
       // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
       // the time endAttempt fires the good part is already over. Starts regardless of this
       // frame's eligibility — the clip is a recording of what happened, not a measurement.
       startClipRecording();
-    } else if (sample.handSep > attempt.peakHandSep) {
-      attempt.peakHandSep = sample.handSep;
     }
-    if (sample.eligible) {
-      reservoirAdd(attempt, sample);
-      // "Did any settled frame reach true full draw" — a plain OR over every eligible frame this
-      // attempt has seen, independent of which frames the reservoir above happened to keep (a
-      // frame that gets evicted from the reservoir must not un-say that full draw was reached;
-      // the reservoir bounds MEMORY for the medians, it must never bound what this flag can see).
-      attempt.reachedFullDraw = attempt.reachedFullDraw || !!sample.atFullDraw;
+    if (drawing) {
+      if (attempt.startMs === null) attempt.startMs = nowMs; // the real draw has now started — see this function's own block comment
+      if (sample.handSep > attempt.peakHandSep) attempt.peakHandSep = sample.handSep;
+      if (sample.eligible) {
+        reservoirAdd(attempt, sample);
+        // "Did any settled frame reach true full draw" — a plain OR over every eligible frame this
+        // attempt has seen, independent of which frames the reservoir above happened to keep (a
+        // frame that gets evicted from the reservoir must not un-say that full draw was reached;
+        // the reservoir bounds MEMORY for the medians, it must never bound what this flag can see).
+        attempt.reachedFullDraw = attempt.reachedFullDraw || !!sample.atFullDraw;
+      }
+    } else if (attempt.startMs === null && nowMs - attempt.watchStartedAt >= RAISE_ATTEMPT_TIMEOUT_MS) {
+      // Armed by a raise that never turned into hands actually separating — closes cleanly as a
+      // rejected attempt (peakHandSep is still 0, so endAttempt's own gate throws it out) rather
+      // than leaving the app "watching" for the rest of the session. See RAISE_ATTEMPT_TIMEOUT_MS.
+      endAttempt(nowMs);
     }
   } else {
     endAttempt(nowMs);
@@ -1718,7 +1845,14 @@ function endAttempt(nowMs) {
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
-  signalOutcome(true); // "that arrow counted"
+  // Green means an arrow, not "a row got added". "Fail toward recording" says keep the evidence
+  // when unsure — it does not say call it an arrow: a logged draw that never reached full draw
+  // (anchorOk/armOk/stillOk never all true — see isAtFullDraw) is real, worth keeping, and marked
+  // as short of full draw right on its row (see renderShotRow's shortMark) — but flashing the
+  // "that arrow counted" cue for it would be a false statement delivered as reassurance to someone
+  // who cannot check it, at the one moment that distinction matters most. See a.reachedFullDraw
+  // (an OR over every eligible frame, set in trackShotAttempt) and signalOutcome's own comment.
+  signalOutcome(a.reachedFullDraw); // true only for a real arrow; a logged-but-short draw gets the same "seen, not confirmed" cue as a rejected one
 }
 
 // ===== SHOT CLIPS — recording. One clip per draw attempt, covering raise through
@@ -2052,6 +2186,7 @@ function revokeClip(entry) {
 function logShot(entry) {
   shotCount++;
   const shotNum = shotCount;
+  if (entry.reachedFullDraw) fullDrawShotCount++; // see that counter's own comment — a row that never reached full draw still gets a shotNum, just never counts as an arrow
   log.unshift({ ...entry, shotNum });
   const evicted = log.slice(SHOT_LOG_MAX);
   log = log.slice(0, SHOT_LOG_MAX);
@@ -2115,6 +2250,7 @@ function serializeShotSession(state, nowMs) {
     savedAt: nowMs,
     log: state.log.map(entryForPersistence),
     shotCount: state.shotCount,
+    fullDrawShotCount: state.fullDrawShotCount,
     rejectedAttemptCount: state.rejectedAttemptCount,
     unsettledAttemptCount: state.unsettledAttemptCount,
     attentionIdlePeriods: state.attentionIdlePeriods,
@@ -2155,6 +2291,10 @@ function deserializeShotSession(raw, nowMs, maxAgeMs) {
   return {
     log: log.slice(0, SHOT_LOG_MAX), // defensive re-cap — the live log is always already within this, but never trust a stored payload more than a fresh computation
     shotCount: num(raw.shotCount, 0),
+    // Fallback isn't a flat 0 like the others: a payload saved by an older build (before this
+    // counter existed) still has reachedFullDraw on every entry it kept, so counting those is a
+    // real answer, not a guess — better than silently undercounting a session already in progress.
+    fullDrawShotCount: num(raw.fullDrawShotCount, log.filter((e) => e.reachedFullDraw).length),
     rejectedAttemptCount: num(raw.rejectedAttemptCount, 0),
     unsettledAttemptCount: num(raw.unsettledAttemptCount, 0),
     attentionIdlePeriods: num(raw.attentionIdlePeriods, 0),
@@ -2173,7 +2313,7 @@ function deserializeShotSession(raw, nowMs, maxAgeMs) {
 function saveSessionToStorage() {
   try {
     const payload = serializeShotSession(
-      { log, shotCount, rejectedAttemptCount, unsettledAttemptCount, attentionIdlePeriods, attentionLateWakeCount, clipsUnavailableReason },
+      { log, shotCount, fullDrawShotCount, rejectedAttemptCount, unsettledAttemptCount, attentionIdlePeriods, attentionLateWakeCount, clipsUnavailableReason },
       Date.now()
     );
     localStorage.setItem(SHOT_SESSION_STORAGE_KEY, JSON.stringify(payload));
@@ -2203,6 +2343,7 @@ function restoreSessionFromStorage() {
 
   log = restored.log;
   shotCount = restored.shotCount;
+  fullDrawShotCount = restored.fullDrawShotCount;
   rejectedAttemptCount = restored.rejectedAttemptCount;
   unsettledAttemptCount = restored.unsettledAttemptCount;
   attentionIdlePeriods = restored.attentionIdlePeriods;
@@ -2585,14 +2726,27 @@ function renderShotLog() {
     return;
   }
 
-  const arrowWord = shotCount === 1 ? "arrow" : "arrows";
+  // "Arrows" means confirmed full draw — see fullDrawShotCount's own comment and endAttempt's
+  // signalOutcome call. A row that never reached full draw still exists (shotCount, shotNum,
+  // its own row below, still marked "short of full draw") but must never inflate this headline.
+  const arrowWord = fullDrawShotCount === 1 ? "arrow" : "arrows";
   const shownNote = log.length < shotCount ? ` The consistency lines below are based on your most recent ${log.length}.` : "";
-  const countLine = `<div class="shotlog-count">${shotCount} ${arrowWord} this session.${shownNote}</div>`;
+  // The consistency numbers (narrateMeasure/summarizeShots below) must be built ONLY from
+  // confirmed arrows — see the coordinator's own reasoning: a phantom's junk numbers averaged
+  // into "steady / drifted / stood out" would corrupt the one claim CLAUDE.md lets this app make,
+  // silently, which is worse than a visible phantom row. Said explicitly, same convention as
+  // shownNote above, rather than just quietly narrowing the population.
+  const fullDrawLog = log.filter((e) => e.reachedFullDraw);
+  const excludedNote =
+    fullDrawLog.length < log.length
+      ? ` ${log.length - fullDrawLog.length} shown row${log.length - fullDrawLog.length === 1 ? "" : "s"} never reached full draw and ${log.length - fullDrawLog.length === 1 ? "isn't" : "aren't"} included in the consistency numbers below.`
+      : "";
+  const countLine = `<div class="shotlog-count">${fullDrawShotCount} ${arrowWord} this session.${shownNote}${excludedNote}</div>`;
 
-  const bowArm = narrateMeasure(log, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
-  const shoulderBow = narrateMeasure(log, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT);
-  const shoulderDraw = narrateMeasure(log, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT);
-  const elbow = narrateMeasure(log, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG);
+  const bowArm = narrateMeasure(fullDrawLog, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+  const shoulderBow = narrateMeasure(fullDrawLog, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT);
+  const shoulderDraw = narrateMeasure(fullDrawLog, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT);
+  const elbow = narrateMeasure(fullDrawLog, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG);
 
   const narrativeHtml = [bowArm, shoulderBow, shoulderDraw, elbow]
     .filter((r) => r) // a measure with every reading uncertain this session says nothing at all — see narrateMeasure
@@ -2614,7 +2768,12 @@ function renderShotLog() {
     elbow: elbow?.outlierWord ?? null,
   };
 
-  const stats = summarizeShots(log); // still drives the demoted small-print numbers on each row, unchanged
+  // Built from fullDrawLog, same reasoning as narrateMeasure above — a short-draw row's own raw
+  // numbers still print (renderShotRow shows them regardless), but shotValueHtml only colours/
+  // compares a shotNum that's actually a key in stats.deviations; a shotNum excluded here simply
+  // renders as a plain, uncoloured number instead of a fake "(+N)" comparison against a
+  // population it was never part of.
+  const stats = summarizeShots(fullDrawLog);
   const rowsHtml = log.map((e) => renderShotRow(e, stats, outliers, words)).join("");
 
   shotLogContentEl.innerHTML = `${restoredBit}${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
@@ -2636,6 +2795,7 @@ function renderShotLog() {
 function buildShareText(entries, counters) {
   const {
     shotCount,
+    fullDrawShotCount,
     rejectedAttemptCount,
     unsettledAttemptCount,
     attentionIdlePeriods,
@@ -2665,7 +2825,12 @@ function buildShareText(entries, counters) {
   if (modelStatusLine) lines.push(modelStatusLine);
 
   lines.push("");
-  lines.push(`Arrows this session: ${shotCount}`);
+  // "Arrows" means confirmed full draw, same distinction as the on-screen count line — see
+  // fullDrawShotCount's own comment. shotCount (every logged row, short draws included) is still
+  // in here too, explicitly, rather than left for whoever reads this to infer from the per-draw
+  // fullDraw=yes/no field below.
+  lines.push(`Arrows this session: ${fullDrawShotCount}`);
+  lines.push(`Logged draws this session (arrows + short-of-full-draw): ${shotCount}`);
   // The log only ever keeps the newest SHOT_LOG_MAX entries — without this line, a 30-arrow
   // session sharing only its last 10 draws would silently look like a complete 10-arrow session,
   // and threshold retuning done against it would be working from a biased sample without knowing.
@@ -2681,14 +2846,20 @@ function buildShareText(entries, counters) {
 
   // Same consistency wording renderShotLog puts in the app itself (narrateMeasure) — reusing it
   // rather than re-deriving a second version keeps the shared text and the on-screen log always
-  // in agreement.
+  // in agreement. Built from fullDrawEntries only, same reasoning as renderShotLog: a short-draw
+  // row's junk numbers must never dilute the one claim this app is allowed to make.
   lines.push("");
+  const fullDrawEntries = entries.filter((e) => e.reachedFullDraw);
+  const shortCount = entries.length - fullDrawEntries.length;
   lines.push("Consistency:");
+  if (shortCount > 0) {
+    lines.push(`  (based on the ${fullDrawEntries.length} of ${entries.length} shown draws that reached full draw — ${shortCount} excluded as short of full draw)`);
+  }
   const measures = [
-    narrateMeasure(entries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG),
-    narrateMeasure(entries, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT),
-    narrateMeasure(entries, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT),
-    narrateMeasure(entries, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG),
+    narrateMeasure(fullDrawEntries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG),
+    narrateMeasure(fullDrawEntries, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(fullDrawEntries, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(fullDrawEntries, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG),
   ].filter(Boolean);
   if (measures.length === 0) lines.push("  Not enough shots yet for a consistency read.");
   else measures.forEach((m) => lines.push(`  ${m.text}`));
@@ -2843,15 +3014,20 @@ function revertCueToCurrent() {
   applyCueClass(cueLastLost ? "cue-lost" : cueLastWatching ? "cue-watching" : "cue-resting");
 }
 
-// Called from endAttempt the instant a draw's fate is decided — logged, or seen but rejected (the
-// owner explicitly asked these be told apart, separately from "watching this draw" above). A
-// brief, self-clearing flash, never something to dismiss (see CLAUDE.md) — CUE_OUTCOME_MS later
-// it hands back to whatever updateCue has most recently observed to be true, which may itself
-// have changed WHILE the flash was playing (tracking lost the instant after a draw is rejected,
-// say), so the cue always lands back on the truth, never a stale guess.
-function signalOutcome(logged) {
+// Called from endAttempt the instant a draw's fate is decided — a confirmed arrow, or seen but
+// not confirmed (the owner explicitly asked these be told apart, separately from "watching this
+// draw" above). `confirmed` is NOT "was a row logged": a draw that got a row but never reached
+// full draw (anchorOk/armOk/stillOk never all true) still gets the cue-rejected flash here, same
+// as a draw that earned no row at all — green is a claim that an arrow was actually shot, and
+// that claim needs to be true every time, not just usually, since the owner is five metres away
+// and cannot check it. See endAttempt's own comment at its call site. A brief, self-clearing
+// flash either way, never something to dismiss (see CLAUDE.md) — CUE_OUTCOME_MS later it hands
+// back to whatever updateCue has most recently observed to be true, which may itself have
+// changed WHILE the flash was playing (tracking lost the instant after a draw is rejected, say),
+// so the cue always lands back on the truth, never a stale guess.
+function signalOutcome(confirmed) {
   clearTimeout(cueOutcomeTimer);
-  applyCueClass(logged ? "cue-logged" : "cue-rejected");
+  applyCueClass(confirmed ? "cue-logged" : "cue-rejected");
   cueOutcomeTimer = setTimeout(revertCueToCurrent, CUE_OUTCOME_MS);
 }
 // ===========================================================================
@@ -3195,6 +3371,7 @@ shotLogCloseBtn.addEventListener("click", closeShotLog);
 shotLogShareBtn.addEventListener("click", () => {
   const text = buildShareText(log, {
     shotCount,
+    fullDrawShotCount,
     rejectedAttemptCount,
     unsettledAttemptCount,
     attentionIdlePeriods,
@@ -3429,6 +3606,7 @@ function selfTest() {
   const savedAttempt = attempt;
   const savedLog = log;
   const savedShotCount = shotCount;
+  const savedFullDrawShotCount = fullDrawShotCount;
   const savedRejectedAttemptCount = rejectedAttemptCount;
   const savedUnsettledAttemptCount = unsettledAttemptCount;
   const savedSettledFrames = settledFrames;
@@ -3580,6 +3758,7 @@ function selfTest() {
   attempt = null;
   log = [];
   shotCount = 0;
+  fullDrawShotCount = 0;
   rejectedAttemptCount = 0;
   unsettledAttemptCount = 0;
   const sample = (handSep, atFullDraw = false, eligible = true, extra = {}) => ({
@@ -3627,10 +3806,16 @@ function selfTest() {
   // three) is 0.6, not the peak (0.65, which only the SHOT_MIN_PEAK_SEP_FRACTION gate above uses).
   console.assert(log[0].handSep === 0.6, "the logged row should carry the median hand separation across eligible frames, not the peak");
   console.assert(log[0].reachedFullDraw === false, "an attempt that never reached full draw must be marked as such");
-  console.assert(cueEl.className === "cue-logged", "endAttempt's logged path should flash the cue-logged cue (HANDOVER.md Stage 2: that arrow counted), even for a shot short of full draw");
+  // Green means an arrow, not "a row got added" — see endAttempt's own comment at its
+  // signalOutcome call. A logged-but-short-of-full-draw row is real and stays in the log (see the
+  // two assertions above), but must never flash the confirmed-arrow cue: that would be telling the
+  // owner, at the one moment he can't check it, that an arrow was shot when the app never actually
+  // saw one.
+  console.assert(cueEl.className === "cue-rejected", "a logged row that never reached full draw must flash the same 'seen, not confirmed' cue as a rejected attempt, not the confirmed-arrow cue");
+  console.assert(fullDrawShotCount === 0, "a row short of full draw must not count toward fullDrawShotCount (the 'arrows' headline)");
 
-  // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, and
-  // NOT marked as short of full draw.
+  // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, NOT
+  // marked as short of full draw, DOES flash the confirmed-arrow cue, and DOES count as an arrow.
   trackShotAttempt(sample(0.4), 4000);
   trackShotAttempt(sample(0.8, true), 4400); // peak, and a genuine full draw (all four isAtFullDraw gates true)
   trackShotAttempt(sample(0.78, true), 4800); // held at full draw
@@ -3638,6 +3823,8 @@ function selfTest() {
   console.assert(log.length === 2, "a full-draw attempt should log as its own row");
   console.assert(log[0].shotNum === 2, "second logged attempt should be shot 2");
   console.assert(log[0].reachedFullDraw === true, "an attempt that reached full draw must not be marked as short of it");
+  console.assert(cueEl.className === "cue-logged", "a genuine full-draw attempt must still flash the confirmed-arrow cue");
+  console.assert(fullDrawShotCount === 1, "a genuine full draw must count toward fullDrawShotCount");
 
   // --- Pose loss on an UNQUALIFIED attempt (short, shallow) discards it, same as one that ends
   // by hands relaxing — losing tracking must not manufacture a shot out of noise.
@@ -3687,6 +3874,111 @@ function selfTest() {
     log[0].shotNum > log[SHOT_LOG_MAX - 1].shotNum,
     "log should stay newest-first even once it's capped"
   );
+
+  // --- RAISE TRIGGER: bowArmRaiseHeight (pure geometry) and updateRaiseTrigger's hysteresis.
+  // Reuses the `base` fixture's torso (bow shoulder (0.3,0.3), bow hip (0.3,0.6) — torso length
+  // 0.3) so a wrist AT shoulder height is y=0.3, and RAISE_TRIGGER_DOWN_FRACTION's -0.3 lands
+  // exactly at wrist y=0.39 (0.3 + 0.3*0.3).
+  {
+    const armLm = (wristY) => mkLandmarks({ ...base, 15: { x: 0.3, y: wristY } });
+    console.assert(
+      Math.abs(bowArmRaiseHeight(armLm(0.6), NOOP_W, NOOP_H) - -1) < 1e-9,
+      "wrist at hip level (arm hanging at rest) should read a full torso-length below the shoulder"
+    );
+    console.assert(
+      Math.abs(bowArmRaiseHeight(armLm(0.3), NOOP_W, NOOP_H) - 0) < 1e-9,
+      "wrist exactly at shoulder height should read 0 — RAISE_TRIGGER_UP_FRACTION's own boundary"
+    );
+    console.assert(bowArmRaiseHeight(armLm(0.2), NOOP_W, NOOP_H) > 0, "wrist above the shoulder should read positive");
+    console.assert(
+      bowArmRaiseHeight(mkLandmarks({ ...base, 15: { x: 0.3, y: 0.3, visibility: 0 } }), NOOP_W, NOOP_H) === null,
+      "an unreadable bow wrist must never guess a height"
+    );
+
+    raiseArmed = false;
+    updateRaiseTrigger(armLm(0.6), NOOP_W, NOOP_H); // arm hanging at rest, well below the trigger
+    console.assert(raiseArmed === false, "an arm hanging at rest must not arm the raise trigger");
+    updateRaiseTrigger(armLm(0.3), NOOP_W, NOOP_H); // crosses RAISE_TRIGGER_UP_FRACTION (0) going up
+    console.assert(raiseArmed === true, "the bow wrist reaching shoulder height should arm the raise trigger");
+    updateRaiseTrigger(armLm(0.36), NOOP_W, NOOP_H); // height -0.2 — below shoulder, but NOT past RAISE_TRIGGER_DOWN_FRACTION (-0.3)
+    console.assert(raiseArmed === true, "hysteresis: dipping below shoulder height without clearing RAISE_TRIGGER_DOWN_FRACTION must not disarm");
+    updateRaiseTrigger(armLm(0.39), NOOP_W, NOOP_H); // height exactly -0.3 — at the down threshold
+    console.assert(raiseArmed === false, "dropping to RAISE_TRIGGER_DOWN_FRACTION should disarm the trigger");
+    updateRaiseTrigger(mkLandmarks({ ...base, 15: { x: 0.3, y: 0.3, visibility: 0 } }), NOOP_W, NOOP_H); // unreadable
+    console.assert(raiseArmed === false, "an unreadable frame must hold the previous state, never guess a re-arm");
+  }
+
+  // --- RAISE TRIGGER, integration with trackShotAttempt/endAttempt. The owner's own proposal
+  // (see RAISE TRIGGER constants above): the raise opens an attempt EARLIER than hand separation
+  // alone would, but must never change what a logged shot's numbers are measured from.
+  {
+    attempt = null;
+    log = [];
+    shotCount = 0;
+    fullDrawShotCount = 0;
+    rejectedAttemptCount = 0;
+    unsettledAttemptCount = 0;
+    const raiseSample = (handSep, extra = {}) => sample(handSep, false, true, { raiseArmed: true, ...extra });
+
+    // The raise alone opens a "watching" attempt, before hands have separated at all — and must
+    // NOT start the SHOT_MIN_DURATION_MS clock (startMs stays null) until hands actually do.
+    trackShotAttempt(raiseSample(0.05), 0);
+    console.assert(attempt !== null, "the raise alone should open an attempt, before hand separation ever crosses DRAW_ATTEMPT_MIN_SEP");
+    console.assert(attempt.startMs === null, "a raise with hands still together must not start the real-draw duration clock");
+
+    // He changes his mind and lowers the bow without ever drawing: must close as a REJECTED row
+    // (peakHandSep never left 0), never a stuck "watching" state.
+    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 200);
+    console.assert(attempt === null, "a raise that never turns into a draw must close, not hang open");
+    console.assert(rejectedAttemptCount === 1, "an abandoned raise should be counted as a rejected attempt, same as any other non-draw");
+
+    // A real raise-then-draw: the raise-phase frames (hands still together, arm just going up)
+    // must never contribute to the shot's logged numbers — only once hand separation itself
+    // crosses DRAW_ATTEMPT_MIN_SEP should eligible frames start counting. Deliberately wrong
+    // bowArmAngle values on the raise-phase frames (20°, 25° — nowhere near a real 178° full
+    // draw) so contamination would be obvious if this regressed.
+    trackShotAttempt(raiseSample(0.05, { bowArmAngle: 20 }), 1000); // raised, hands together, mid-raise
+    trackShotAttempt(raiseSample(0.15, { bowArmAngle: 25 }), 1100); // still short of DRAW_ATTEMPT_MIN_SEP (0.3)
+    trackShotAttempt(raiseSample(0.8, { bowArmAngle: 178, atFullDraw: true }), 1700); // now genuinely drawing
+    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 2400); // ends — 700ms of real draw, over SHOT_MIN_DURATION_MS
+    console.assert(shotCount === 1, "a real raise-then-draw should log exactly one shot");
+    console.assert(
+      log[0].bowArmAngle === 178,
+      `the logged bow-arm angle must come only from the real full-draw frame (178), not the raise-phase frames (20/25) — got ${log[0]?.bowArmAngle}`
+    );
+    console.assert(log[0].startMs === 1700, "duration must be measured from when hands actually separated, not from the raise");
+
+    // A raise that's held indefinitely without ever drawing or lowering must not watch forever —
+    // RAISE_ATTEMPT_TIMEOUT_MS closes it as rejected.
+    attempt = null;
+    rejectedAttemptCount = 0;
+    trackShotAttempt(raiseSample(0.05), 5000);
+    console.assert(attempt !== null, "setup: the raise should still be open just before the timeout");
+    trackShotAttempt(raiseSample(0.05), 5000 + RAISE_ATTEMPT_TIMEOUT_MS - 100);
+    console.assert(attempt !== null, "an armed raise under RAISE_ATTEMPT_TIMEOUT_MS old must still be open");
+    trackShotAttempt(raiseSample(0.05), 5000 + RAISE_ATTEMPT_TIMEOUT_MS + 100);
+    console.assert(attempt === null, "an armed raise older than RAISE_ATTEMPT_TIMEOUT_MS that never drew must close on its own");
+    console.assert(rejectedAttemptCount === 1, "a timed-out raise should be counted as a rejected attempt");
+
+    // Fallback, unaffected: with the raise never armed (occlusion, say), hand separation alone
+    // must still open, measure and log an attempt exactly as it did before this feature existed.
+    attempt = null;
+    log = [];
+    shotCount = 0;
+    fullDrawShotCount = 0;
+    trackShotAttempt(sample(0.4, false, true, { raiseArmed: false, bowArmAngle: 179 }), 8000);
+    trackShotAttempt(sample(0.8, true, true, { raiseArmed: false, bowArmAngle: 179 }), 8400);
+    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 9000);
+    console.assert(shotCount === 1, "hand separation alone (raise missed) must still be able to open and log a shot, unchanged");
+    console.assert(log[0].bowArmAngle === 179, "a fallback-only shot's numbers must be exactly what the pre-raise-trigger logic would have produced");
+
+    attempt = null;
+    log = [];
+    shotCount = 0;
+    fullDrawShotCount = 0;
+    rejectedAttemptCount = 0;
+    unsettledAttemptCount = 0;
+  }
 
   // --- PIPELINE SETTLING: advanceSettling/resetSettling/cropBoxIsStable, the pure bookkeeping
   // behind SETTLE_FRAMES_REQUIRED and CROP_BOX_STABLE_MAX_DELTA — see those constants' own
@@ -3790,6 +4082,7 @@ function selfTest() {
   attempt = null;
   log = [];
   shotCount = 0;
+  fullDrawShotCount = 0;
   rejectedAttemptCount = 0;
   unsettledAttemptCount = 0;
 
@@ -4264,6 +4557,43 @@ function selfTest() {
       allUncertainResult === null,
       `a measure with every reading uncertain must produce no statement at all, got: ${JSON.stringify(allUncertainResult)}`
     );
+
+    // A row that never reached full draw must be invisible to the consistency machinery —
+    // renderShotLog/buildShareText both filter to reachedFullDraw entries (fullDrawLog/
+    // fullDrawEntries) before ever calling summarizeShots/narrateMeasure. Proven directly: a
+    // wildly different short-of-full-draw reading must neither move the average nor get named as
+    // the outlier once excluded — and the sanity check right after confirms it WOULD have done
+    // both if it hadn't been.
+    // Reuses the exact fixture shape already proven above to reliably trigger the outlier path
+    // (outlierNarrFixture: four consistent shots, one wildly apart) — shot 5's 200 becomes a
+    // short-of-full-draw row here instead of a real one.
+    const exclusionFixture = [
+      { shotNum: 1, bowArmAngle: 170, reachedFullDraw: true },
+      { shotNum: 2, bowArmAngle: 169, reachedFullDraw: true },
+      { shotNum: 3, bowArmAngle: 171, reachedFullDraw: true },
+      { shotNum: 4, bowArmAngle: 170, reachedFullDraw: true },
+      { shotNum: 5, bowArmAngle: 200, reachedFullDraw: false }, // a short draw, not a real reading of steady form
+    ];
+    const fullDrawOnly = exclusionFixture.filter((e) => e.reachedFullDraw);
+    const excludedStats = summarizeShots(fullDrawOnly);
+    console.assert(
+      !(5 in excludedStats.bowArm.deviations),
+      "a row excluded from the consistency population must not appear in stats.deviations — shotValueHtml relies on exactly this to render it as a plain, uncoloured number instead of a fake comparison"
+    );
+    console.assert(
+      Math.abs(excludedStats.bowArm.average - 170) < 1e-9,
+      `excluding the short-draw row (200) must leave the average computed from the four real full draws only (170), got ${excludedStats.bowArm.average}`
+    );
+    const excludedNarr = narrateMeasure(fullDrawOnly, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+    console.assert(
+      excludedNarr && excludedNarr.text.startsWith("Bow arm — steady") && excludedNarr.outlierShotNum === null,
+      `four consistent full draws, short-draw row excluded, should read steady with no outlier named, got: ${excludedNarr && JSON.stringify(excludedNarr)}`
+    );
+    const includedNarr = narrateMeasure(exclusionFixture, (e) => e.bowArmAngle, "Bow arm", upDown, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+    console.assert(
+      includedNarr && includedNarr.outlierShotNum === 5,
+      `sanity check failed: shot 5's 200° should stand out when included — got: ${includedNarr && JSON.stringify(includedNarr)}, so the exclusion test above isn't proving anything`
+    );
   }
 
   // --- Share text: buildShareText is the one pure function behind the Share button (see its own
@@ -4308,6 +4638,7 @@ function selfTest() {
     ];
     const shareCounters = {
       shotCount: 3,
+      fullDrawShotCount: 2, // shots 1 and 3 reached full draw; shot 2 (armOk: false) did not — see shareEntries above
       rejectedAttemptCount: 1,
       unsettledAttemptCount: 0,
       attentionIdlePeriods: 0,
@@ -4321,7 +4652,8 @@ function selfTest() {
     };
     const shareText = buildShareText(shareEntries, shareCounters);
 
-    console.assert(shareText.includes("Arrows this session: 3"), "share text must state the true session total, not just how many rows are included");
+    console.assert(shareText.includes("Arrows this session: 2"), "share text's arrow count must be confirmed full draws only (shots 1 and 3), not every logged row");
+    console.assert(shareText.includes("Logged draws this session (arrows + short-of-full-draw): 3"), "share text must still state the true total row count somewhere, separate from the arrow count");
     console.assert(shareText.includes("Movements ignored (not real draws): 1"), "share text must include rejectedAttemptCount even though a rejected movement never becomes its own row");
     console.assert(shareText.includes("Camera 720x1280"), "share text header must carry the camera resolution");
     console.assert(shareText.includes("right-handed") && shareText.includes("mirror off"), "share text header must carry handedness and mirror state");
@@ -4357,9 +4689,15 @@ function selfTest() {
     console.assert(shareText.includes('Shot 2: no clip — recording came out empty'), "a clip failure must also appear in the session-level Clip failures section");
 
     // Consistency lines must be present and must reuse narrateMeasure's own wording, not a
-    // second, possibly-diverging implementation.
+    // second, possibly-diverging implementation — computed from the SAME reachedFullDraw-only
+    // population buildShareText itself must use (see the excludedNote assertion right below).
     console.assert(shareText.includes("Consistency:"), "share text must include the consistency section");
-    const bowArmShareLine = narrateMeasure(shareEntries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+    console.assert(
+      shareText.includes("2 of 3 shown draws that reached full draw — 1 excluded as short of full draw"),
+      "share text must say how many shown draws were excluded from the consistency numbers, and why"
+    );
+    const fullDrawShareEntries = shareEntries.filter((e) => e.reachedFullDraw);
+    const bowArmShareLine = narrateMeasure(fullDrawShareEntries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
     console.assert(
       bowArmShareLine && shareText.includes(bowArmShareLine.text),
       "share text's consistency section must match narrateMeasure's own wording exactly, not a re-derived copy"
@@ -4381,7 +4719,7 @@ function selfTest() {
 
     // Empty session: no shots yet, must say so plainly rather than rendering an empty or broken
     // draws section.
-    const emptyShareText = buildShareText([], { ...shareCounters, shotCount: 0, rejectedAttemptCount: 0 });
+    const emptyShareText = buildShareText([], { ...shareCounters, shotCount: 0, fullDrawShotCount: 0, rejectedAttemptCount: 0 });
     console.assert(emptyShareText.includes("Arrows this session: 0"), "an empty session must still state the (zero) arrow count");
     console.assert(emptyShareText.includes("(none)"), "an empty session's draws section must say plainly that there are none, not render blank");
   }
@@ -4440,6 +4778,7 @@ function selfTest() {
     URL.revokeObjectURL = (u) => revokedUrls.push(u);
     log = [];
     shotCount = 0;
+    fullDrawShotCount = 0;
     let evictT = 50000; // a fresh, well-separated block of the fake clock so this loop's timing can't collide with the timeline above
     for (let i = 0; i < SHOT_LOG_MAX; i++) {
       trackShotAttempt(sample(0.9), evictT); // deep enough to clear SHOT_MIN_PEAK_SEP_FRACTION
@@ -5352,6 +5691,7 @@ function selfTest() {
   attempt = savedAttempt;
   log = savedLog;
   shotCount = savedShotCount;
+  fullDrawShotCount = savedFullDrawShotCount;
   rejectedAttemptCount = savedRejectedAttemptCount;
   unsettledAttemptCount = savedUnsettledAttemptCount;
   settledFrames = savedSettledFrames;
@@ -5396,6 +5736,7 @@ function selfTest() {
     const state = {
       log: [fixtureEntry],
       shotCount: 1,
+      fullDrawShotCount: 1,
       rejectedAttemptCount: 2,
       unsettledAttemptCount: 1,
       attentionIdlePeriods: 3,
@@ -5424,9 +5765,20 @@ function selfTest() {
       console.assert(r.clipUrl === undefined && r.clipBlob === undefined, "a restored entry must never carry a clipUrl/clipBlob — both died with the old page");
       console.assert(r.clipLostOnRestore === true, "an entry that HAD a clip before the reload must come back marked clipLostOnRestore, so its row can say so honestly");
       console.assert(
-        restored.shotCount === 1 && restored.rejectedAttemptCount === 2 && restored.unsettledAttemptCount === 1 &&
+        restored.shotCount === 1 && restored.fullDrawShotCount === 1 && restored.rejectedAttemptCount === 2 && restored.unsettledAttemptCount === 1 &&
         restored.attentionIdlePeriods === 3 && restored.attentionLateWakeCount === 1 && restored.clipsUnavailableReason === state.clipsUnavailableReason,
         "every session counter must round-trip alongside the log"
+      );
+
+      // A payload saved by an older build (before fullDrawShotCount existed) is missing the
+      // field entirely — must fall back to counting reachedFullDraw in the restored log itself,
+      // never a silent 0 that would undercount a session already in progress. See
+      // deserializeShotSession's own comment.
+      const { fullDrawShotCount: _drop, ...payloadWithoutFullDrawCount } = roundTripped;
+      const restoredOldFormat = deserializeShotSession(payloadWithoutFullDrawCount, now + 1000, SESSION_RESTORE_MAX_AGE_MS);
+      console.assert(
+        restoredOldFormat && restoredOldFormat.fullDrawShotCount === 1,
+        "a payload missing fullDrawShotCount (an older build's save) must fall back to counting reachedFullDraw entries in its own restored log, not default to 0"
       );
 
       // A restored entry with a dead clip must render and share without throwing — the whole
@@ -5447,6 +5799,7 @@ function selfTest() {
       try {
         shareText = buildShareText([r], {
           shotCount: restored.shotCount,
+          fullDrawShotCount: restored.fullDrawShotCount,
           rejectedAttemptCount: restored.rejectedAttemptCount,
           unsettledAttemptCount: restored.unsettledAttemptCount,
           attentionIdlePeriods: restored.attentionIdlePeriods,
@@ -5523,6 +5876,7 @@ function selfTest() {
   console.assert(attempt === savedAttempt, "selfTest leaked: attempt was not restored to its original value");
   console.assert(log === savedLog, "selfTest leaked: log was not restored to its original value");
   console.assert(shotCount === savedShotCount, "selfTest leaked: shotCount was not restored to its original value");
+  console.assert(fullDrawShotCount === savedFullDrawShotCount, "selfTest leaked: fullDrawShotCount was not restored to its original value");
   console.assert(rejectedAttemptCount === savedRejectedAttemptCount, "selfTest leaked: rejectedAttemptCount was not restored to its original value");
   console.assert(unsettledAttemptCount === savedUnsettledAttemptCount, "selfTest leaked: unsettledAttemptCount was not restored to its original value");
   console.assert(settledFrames === savedSettledFrames, "selfTest leaked: settledFrames was not restored to its original value");
