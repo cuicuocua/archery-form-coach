@@ -4567,35 +4567,6 @@ function selfTest() {
   console.log("selfTest done — check above for any failed console.assert");
 }
 
-// ===== TEST HOOKS — read-only introspection for automated (Playwright) verification of the
-// ROUTINE-START ATTENTION GATING feature, behind an explicit URL flag so this never activates in
-// normal use and never ships anything extra to the owner's phone in practice. Exposes exactly the
-// module state an outside test needs to read — nothing this file doesn't already track for
-// itself — and nothing to WRITE with: no setters, no way for a test to drive the app any
-// differently than a real session would. window.__testHooks.getState() is a plain snapshot,
-// safe to call as often as a test likes (e.g. to poll for a state transition).
-const TEST_HOOKS = location.search.includes("testhooks");
-if (TEST_HOOKS) {
-  window.__testHooks = {
-    getState: () => ({
-      shotCount,
-      logLength: log.length,
-      log: log.map((e) => ({ shotNum: e.shotNum, handSep: e.handSep, reachedFullDraw: e.reachedFullDraw, hasClip: !!e.clipUrl })),
-      rejectedAttemptCount,
-      unsettledAttemptCount,
-      attemptInProgress: attempt !== null,
-      attentionEngaged,
-      attentionIdlePeriods,
-      attentionLateWakeCount,
-      settledFrames,
-      hasCropBox: currentCropBox !== null,
-      attemptEligibleFrames: attempt ? attempt.eligibleFrames.length : null,
-      attemptPeakHandSep: attempt ? attempt.peakHandSep : null,
-    }),
-  };
-}
-// ===========================================================================
-
 if (location.search.includes("selftest")) selfTest();
 
 main();
