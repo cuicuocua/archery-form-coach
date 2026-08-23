@@ -71,6 +71,113 @@ html, body {
   pointer-events: none;
 }
 
+/* Shooting-mode status cue — HANDOVER.md Stage 2. He can't touch or read the phone while
+   shooting, so this is the only thing telling him the app is still working mid-end. Deliberately
+   a plain DOM element, not drawn on #overlay: #overlay's pixels are exactly what
+   canvas.captureStream() records into every clip (see startClipRecording in app.js), so anything
+   painted there would be baked into his saved footage and he'd have no way to know until he
+   watched one back. This sits on its own layer above it instead, and is pointer-events:none so it
+   can never sit between a finger and a real button.
+
+   A direct child of #stage (see index.html), sized to #stage's own full box — the physical
+   SCREEN edge, not #camerabox's edge. That was a deliberate change from an earlier version of
+   this cue, which anchored to #camerabox and pushed the border outward into the letterbox gutter
+   layoutCameraBox() (in app.js) leaves around the picture. That looked right on paper but broke
+   in testing: on whichever axis the camera and screen aspect ratios happen to agree (no gutter on
+   that axis), a border pushed OUTWARD past #camerabox's edge lands entirely at negative/overflow
+   coordinates with nothing left inside the viewport to clip flush against — it doesn't hug the
+   screen edge, it just disappears, on two of the cue's four sides whenever there's no gutter
+   there. Anchoring to #stage instead means the border always draws inward from the ACTUAL screen
+   edge, so it is always fully visible on all four sides regardless of the camera's aspect ratio.
+   When a letterbox gutter exists on some axis, the border legitimately sits in that dead black
+   space, same as before; when it doesn't, the border sits along the true edge of the live camera
+   picture instead, covering a thin strip of it — an honest, small tradeoff for a cue that must
+   never silently fail to appear, and one that can never show up in a recorded clip either way
+   (see above).
+
+   Four states, and only four (see HANDOVER.md "Answered by the owner" — he named exactly two
+   things unprompted, then confirmed a third when asked directly, and ruled out a fifth): not
+   seeing him, seeing him and calm, watching a live draw, and the one-shot outcome once a draw
+   ends. On purpose, no two of them are told apart by colour alone — brightness, thickness and
+   rhythm all differ too, since red/green colour-blindness is common and bright sun washes colour
+   out before anything else. z-index puts this above #readouts/#controls (both z-index 5) so the
+   cue itself is never the thing hidden behind other chrome — pointer-events:none means that
+   never costs a real tap. */
+#cue {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+  border-style: solid;
+  border-color: transparent;
+  border-width: 0;
+  transition: border-width 0.25s ease, border-color 0.25s ease, opacity 0.25s ease;
+}
+
+/* State 1 — "not seeing you" (tracking lost, or he's drifted out of frame). The single most
+   valuable of the four per the owner: unnoticed, he could shoot a whole end for nothing. Thick,
+   bright amber, and the only PERSISTENT state that moves — a slow, unmistakable pulse — so it
+   reads as different from calm even at a glance, in sunlight, without colour vision. Loops for as
+   long as tracking stays lost and clears itself the moment a body is seen again — nothing to
+   dismiss (see CLAUDE.md). */
+#cue.cue-lost {
+  border-width: 18px;
+  border-color: var(--amber);
+  animation: cue-pulse-lost 0.6s ease-in-out infinite;
+}
+
+@keyframes cue-pulse-lost {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.28; }
+}
+
+/* State 2 — "seeing you, nothing happening". The calm resting default between arrows: thin, dim,
+   perfectly still — deliberately the quietest of the four (glanceable, never nagging, per the
+   owner's own brief). */
+#cue.cue-resting {
+  border-width: 5px;
+  border-color: rgba(46, 204, 113, 0.5);
+}
+
+/* State 3 — "watching this draw": a draw attempt is open and a clip is recording (see `attempt`
+   in app.js). Steady and bright, no motion at all — clearly thicker and brighter than resting so
+   it's unmistakable, but calm (unlike the pulsing/flashing states) so it doesn't read as an
+   alarm. White rather than green or amber specifically so it can never be confused with the
+   resting or outcome colours even in grayscale/sun-washed vision. */
+#cue.cue-watching {
+  border-width: 13px;
+  border-color: rgba(255, 255, 255, 0.92);
+}
+
+/* State 4 — the outcome, once a draw ends. One-shot and self-clearing (see CUE_OUTCOME_MS in
+   app.js) — never something to respond to. "Logged" and "seen but rejected" have to be told apart
+   instantly (the owner asked for this explicitly): logged is ONE big flash that blooms once and
+   fades; rejected is TWO short, smaller blinks. That's a rhythm and area difference on top of the
+   colour difference (green vs. grey), so the two survive both colour-blindness and a
+   sunlight-washed screen even if the colour itself is hard to read. */
+#cue.cue-logged {
+  border-color: var(--green);
+  animation: cue-flash-logged 0.6s ease-out;
+}
+
+@keyframes cue-flash-logged {
+  0% { border-width: 5px; opacity: 0.4; }
+  25% { border-width: 26px; opacity: 1; }
+  100% { border-width: 26px; opacity: 0; }
+}
+
+#cue.cue-rejected {
+  border-color: var(--grey);
+  animation: cue-flash-rejected 0.9s ease-out;
+}
+
+@keyframes cue-flash-rejected {
+  0%, 100% { border-width: 5px; opacity: 0; }
+  12%, 38% { border-width: 18px; opacity: 1; }
+  25%, 50% { border-width: 5px; opacity: 0.15; }
+  70% { border-width: 5px; opacity: 0; }
+}
+
 #status {
   position: absolute;
   top: env(safe-area-inset-top, 12px);

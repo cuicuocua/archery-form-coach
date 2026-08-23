@@ -268,6 +268,7 @@ const clipPlayerEl = document.getElementById("clipplayer");
 const clipPlayerVideo = document.getElementById("clipplayer-video");
 const clipPlayerClose = document.getElementById("clipplayer-close");
 const clipPlayerRateBtns = document.querySelectorAll(".clipplayer-rate");
+const cueEl = document.getElementById("cue"); // see the SHOOTING CUES block further down, and its own comment in style.css
 
 // Whether this browser can record a clip at all. Checked once, up front, rather than
 // discovering it the first time an attempt starts — that way the "clips unavailable" banner
@@ -1675,6 +1676,7 @@ function endAttempt(nowMs) {
     rejectedAttemptCount++;
     discardRecording(activeRecording); // this attempt's clip (if any) never gets a shot number, AND must never be reported as a clip failure — see discardRecording
     renderShotLog(); // the "N movements ignored" line needs to move even when nothing gets logged
+    signalOutcome(false); // "seen but rejected" — a draw was open a moment ago (see the watching cue), it just didn't earn a row
     return;
   }
 
@@ -1682,6 +1684,7 @@ function endAttempt(nowMs) {
     unsettledAttemptCount++;
     discardRecording(activeRecording); // same reasoning as the rejected case above — never leave a clip with no shot to attach to, and never report it as a failure either
     renderShotLog();
+    signalOutcome(false); // same cue as the rejected case above — the owner asked for "seen but not logged", not a separate state per reason why
     return;
   }
 
@@ -1692,6 +1695,7 @@ function endAttempt(nowMs) {
   // The clip that's been recording since this attempt began now knows which shot it belongs to,
   // and can start counting down its post-release tail (see attachRecordingToShot).
   attachRecordingToShot(shotNum);
+  signalOutcome(true); // "that arrow counted"
 }
 
 // ===== SHOT CLIPS — recording. One clip per draw attempt, covering raise through
@@ -2446,6 +2450,72 @@ function renderShotLog() {
 // size). "Stretched into a differently-sized box" is not "gaps at the edges" — both elements
 // always cover their entire box, just at different effective scales, so there is no seam for the
 // unflipped video to leak through.
+// ===== SHOOTING CUES — HANDOVER.md Stage 2. He can't touch or read the phone while shooting, and
+// lost freeze meant he had no way to tell mid-end whether the app was even working. Four states,
+// exactly the four he asked for (see HANDOVER.md "Answered by the owner" — he named two things
+// unprompted, then confirmed a third when asked directly, and ruled out a fifth): not seeing him,
+// seeing him and calm, watching a live draw, and the one-shot outcome once a draw ends. No new
+// detection logic here — every state is read straight off state this file already tracks for
+// other reasons (tracking loss, the module-level `attempt`, and endAttempt's own verdict). Lives
+// on #cue, a plain DOM element layered over #camerabox (see index.html/style.css), never on
+// #overlay: #overlay is what canvas.captureStream() records into every clip (see
+// startClipRecording), so anything painted there would be baked into the owner's saved footage
+// without him ever finding out until he watched one back.
+const CUE_OUTCOME_MS = 900; // how long the one-shot logged/rejected flash shows before handing back to whatever's actually true right now (see revertCueToCurrent) — matches the longer of the two flash animations in style.css (cue-flash-rejected) so the class is never swapped mid-animation
+let cueOutcomeTimer = null; // non-null while a logged/rejected flash is playing; blocks updateCue from overwriting it early (see updateCue below)
+let cueLastLost = true; // last known "not seeing you" state, kept up to date even while a flash is covering the display, so the flash can hand back to the truth once it ends rather than to a stale guess. Starts true: before the camera/pose model are ready, nobody has been seen yet — the honest state to show
+let cueLastWatching = false; // same idea, for "a draw is currently open"
+cueEl.className = "cue-lost"; // match the DOM to cueLastLost's own initial value from the very first paint — before the camera/pose model are ready there is genuinely nobody being seen yet, so this is accurate, not just a placeholder
+
+// Sets #cue's class, with one wrinkle: cue-logged/cue-rejected are one-shot CSS animations, and
+// assigning a className the DOM already has is a no-op — so two rejected draws close together
+// (plausible: nocking, then lowering the bow, each briefly crossing the attempt-start floor) would
+// only flash once. Clearing the class and forcing a layout first (void .offsetWidth) makes the
+// browser treat the very next assignment as a fresh start every time. Cheap: this only runs once
+// per draw attempt, never per frame.
+function applyCueClass(cls) {
+  if (cls === "cue-logged" || cls === "cue-rejected") {
+    cueEl.className = "";
+    void cueEl.offsetWidth;
+  }
+  cueEl.className = cls;
+}
+
+// Called once per rendered frame (renderLoop) with what's true RIGHT NOW: is tracking lost, and
+// is a draw attempt currently open. Always remembers both (cueLastLost/cueLastWatching), even
+// while an outcome flash is covering the display, so revertCueToCurrent below can hand back to
+// the real current state rather than whatever was true when the flash started. If a flash IS
+// playing, the display itself is left alone here — it gets to finish on its own timer, never cut
+// short by the very next frame.
+function updateCue(lost, watching) {
+  cueLastLost = lost;
+  cueLastWatching = watching;
+  if (cueOutcomeTimer) return;
+  applyCueClass(lost ? "cue-lost" : watching ? "cue-watching" : "cue-resting");
+}
+
+// Hands the display back to whichever persistent state (lost/watching/resting) is actually true
+// right now, once an outcome flash has run its course. A separate, directly-callable function
+// (rather than inlined in the setTimeout below) purely so selfTest can drive this exact hand-back
+// logic deterministically, without waiting on a real timer.
+function revertCueToCurrent() {
+  cueOutcomeTimer = null;
+  applyCueClass(cueLastLost ? "cue-lost" : cueLastWatching ? "cue-watching" : "cue-resting");
+}
+
+// Called from endAttempt the instant a draw's fate is decided — logged, or seen but rejected (the
+// owner explicitly asked these be told apart, separately from "watching this draw" above). A
+// brief, self-clearing flash, never something to dismiss (see CLAUDE.md) — CUE_OUTCOME_MS later
+// it hands back to whatever updateCue has most recently observed to be true, which may itself
+// have changed WHILE the flash was playing (tracking lost the instant after a draw is rejected,
+// say), so the cue always lands back on the truth, never a stale guess.
+function signalOutcome(logged) {
+  clearTimeout(cueOutcomeTimer);
+  applyCueClass(logged ? "cue-logged" : "cue-rejected");
+  cueOutcomeTimer = setTimeout(revertCueToCurrent, CUE_OUTCOME_MS);
+}
+// ===========================================================================
+
 function drawVideoFrame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -2580,6 +2650,7 @@ function renderLoop() {
   updateAttentionState(now, rawLandmarks, frameWidth, frameHeight);
 
   if (!rawLandmarks) {
+    updateCue(true, false); // "not seeing you" — set before endAttempt below, so a rejected/logged flash this same frame knows to hand back to "lost", not "resting", once it clears
     withMirror(drawVideoFrame); // keep the clip (and the on-screen view) showing the camera even without a skeleton
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
@@ -2628,6 +2699,11 @@ function renderLoop() {
     prevUsedCropBox = usedCropBox;
     const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
     isAtFullDraw(landmarks, now, frameEligible, frameWidth, frameHeight);
+    // `attempt` (module-level, see trackShotAttempt) is already up to date for THIS frame — the
+    // isAtFullDraw call above just ran it. Read it straight rather than threading a return value
+    // through isAtFullDraw/trackShotAttempt purely for this: "watching this draw" IS "an attempt
+    // is open", the exact same fact the shot log and clip recording already key off.
+    updateCue(false, attempt !== null);
 
     // Pick the crop box for NEXT frame from what was actually seen this frame (full-frame
     // coordinates, already mapped above if this frame itself was cropped). Recomputed from
@@ -2923,6 +2999,10 @@ function selfTest() {
   // exists to double check.
   const savedClipsUnavailableReason = clipsUnavailableReason;
   const savedPendingClipNote = pendingClipNote;
+  const savedCueOutcomeTimer = cueOutcomeTimer;
+  const savedCueLastLost = cueLastLost;
+  const savedCueLastWatching = cueLastWatching;
+  const savedCueClassName = cueEl.className;
   selfTestInProgress = true; // see the flag's own comment — keeps trackShotAttempt below from spinning up real MediaRecorders
   rightHanded = true;
   // Every fixture below except the dedicated ASPECT-RATIO CORRECTNESS section further down was
@@ -3080,6 +3160,7 @@ function selfTest() {
   console.assert(log.length === 0, "a brief, shallow wiggle must not be logged as a shot");
   console.assert(shotCount === 0, "shotCount must not advance for a rejected attempt");
   console.assert(rejectedAttemptCount === 1, "the rejected wiggle should be counted");
+  console.assert(cueEl.className === "cue-rejected", "endAttempt's rejected path should flash the cue-rejected cue (HANDOVER.md Stage 2: seen but rejected)");
 
   // --- Long enough AND deep enough, but short of literal full draw: still logged, and marked as
   // such — the deliberate behaviour CLAUDE.md/README call out on purpose (a draw that fell short
@@ -3097,6 +3178,7 @@ function selfTest() {
   // three) is 0.6, not the peak (0.65, which only the SHOT_MIN_PEAK_SEP_FRACTION gate above uses).
   console.assert(log[0].handSep === 0.6, "the logged row should carry the median hand separation across eligible frames, not the peak");
   console.assert(log[0].reachedFullDraw === false, "an attempt that never reached full draw must be marked as such");
+  console.assert(cueEl.className === "cue-logged", "endAttempt's logged path should flash the cue-logged cue (HANDOVER.md Stage 2: that arrow counted), even for a shot short of full draw");
 
   // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, and
   // NOT marked as short of full draw.
@@ -3273,6 +3355,7 @@ function selfTest() {
   console.assert(shotCount === 0, "shotCount must not advance for an unsettled attempt");
   console.assert(rejectedAttemptCount === 0, "an unsettled-but-otherwise-real attempt must NOT be counted as rejected (noise) — those are different claims");
   console.assert(unsettledAttemptCount === 1, "the unsettled attempt should be counted in unsettledAttemptCount specifically");
+  console.assert(cueEl.className === "cue-rejected", "an unsettled attempt is still \"seen but rejected\" from the owner's point of view — same cue as a genuinely rejected one, not a fifth state");
 
   // A real draw where the app was STILL unsettled during the raise but settles partway through:
   // the logged row's median must be computed from the eligible frame(s) only — the two ineligible
@@ -4633,6 +4716,40 @@ function selfTest() {
     console.assert(attentionEngaged === true, "gatingEnabled=false must force engaged, even starting from idle");
   }
 
+  // --- SHOOTING CUES (HANDOVER.md Stage 2): updateCue must not let the very next frame cut a
+  // logged/rejected flash short, and once the flash ends it must hand back to whatever is
+  // ACTUALLY true at that moment, not whatever was true when the flash started — the exact
+  // sequence a real session can produce (a shot logs, and the very next instant tracking is
+  // lost because he's already lowering the bow and stepping out of frame).
+  {
+    clearTimeout(cueOutcomeTimer); // in case an earlier block in this run left one pending
+    cueOutcomeTimer = null;
+
+    updateCue(false, false);
+    console.assert(cueEl.className === "cue-resting", "updateCue(false, false) should show the calm resting cue");
+
+    updateCue(true, false);
+    console.assert(cueEl.className === "cue-lost", "updateCue(true, ...) should show the lost cue regardless of the watching flag");
+
+    updateCue(false, true);
+    console.assert(cueEl.className === "cue-watching", "updateCue(false, true) should show the watching cue");
+
+    signalOutcome(true);
+    console.assert(cueEl.className === "cue-logged", "signalOutcome(true) should flash the logged cue");
+    updateCue(true, false); // simulates tracking being lost the instant after a shot logs — a real sequence, not a contrived one
+    console.assert(cueEl.className === "cue-logged", "a live updateCue call during the flash window must not cut the flash short");
+    revertCueToCurrent();
+    console.assert(cueEl.className === "cue-lost", "once the flash ends it must hand back to what's ACTUALLY true now (lost), not what was true when the flash started (watching)");
+
+    signalOutcome(false);
+    console.assert(cueEl.className === "cue-rejected", "signalOutcome(false) should flash the rejected cue");
+    revertCueToCurrent();
+    console.assert(cueEl.className === "cue-lost", "still lost after the flash — a rejected draw must not accidentally imply tracking recovered");
+
+    clearTimeout(cueOutcomeTimer);
+    cueOutcomeTimer = null;
+  }
+
   // Every one of these was BORROWED for the run, on the promise that it comes back exactly as it
   // went in — most of them (log, shotCount, lastDrawWrist, settledFrames, unsettledAttemptCount,
   // attempt...) are deliberately left "dirty" by the test blocks above right up until this point,
@@ -4657,6 +4774,11 @@ function selfTest() {
   attentionLateWakeCount = savedAttentionLateWakeCount;
   clipsUnavailableReason = savedClipsUnavailableReason;
   pendingClipNote = savedPendingClipNote;
+  clearTimeout(cueOutcomeTimer); // never let a test's own outcome flash fire for real after this function has already handed module state back
+  cueOutcomeTimer = savedCueOutcomeTimer;
+  cueLastLost = savedCueLastLost;
+  cueLastWatching = savedCueLastWatching;
+  cueEl.className = savedCueClassName;
 
   // Lock-down: after the restore above, every borrowed variable must read back EXACTLY as it was
   // saved at the top of this function — a diagnostic mode that quietly leaves the live app
@@ -4686,6 +4808,9 @@ function selfTest() {
     `selfTest leaked: clipsUnavailableReason was not restored to its original value (left as ${JSON.stringify(clipsUnavailableReason)}) — a diagnostic run must never leave a false "clips failed" banner behind`
   );
   console.assert(pendingClipNote === savedPendingClipNote, "selfTest leaked: pendingClipNote was not restored to its original value");
+  console.assert(cueLastLost === savedCueLastLost, "selfTest leaked: cueLastLost was not restored to its original value");
+  console.assert(cueLastWatching === savedCueLastWatching, "selfTest leaked: cueLastWatching was not restored to its original value");
+  console.assert(cueEl.className === savedCueClassName, "selfTest leaked: #cue's class was not restored to its original value");
 
   console.log("selfTest done — check above for any failed console.assert");
 }
