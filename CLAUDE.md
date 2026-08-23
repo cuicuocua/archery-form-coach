@@ -2,8 +2,6 @@
 
 This file provides guidance to Claude Code when working in this project.
 
-> **Picking this up in a new session?** Read [HANDOVER.md](HANDOVER.md) first — current state, the staged plan, and the mistakes not to repeat.
-
 ## Project Purpose
 
 A browser-based archery form coach prototype: opens in iPhone Safari, uses the
@@ -716,6 +714,107 @@ Rules the PM follows:
   `FULL_DRAW_STILL_MAX`) specifically so that relationship survives the fix;
   whoever does that retuning should sanity-check these two alongside it, the
   same way `DRAW_ATTEMPT_MIN_SEP` itself needs revisiting.
+
+## Interface: three modes (designed, not yet built)
+
+**DESIGN SETTLED 2026-08-23** — proposal reviewed and approved by the owner. Decisions:
+
+- **One boolean, not a three-mode enum.** Review already exists: `#shotlog` is a
+  full-screen overlay with its own close control and tap-outside-to-dismiss.
+  Setup is the resting state, Review is the log open over it, Shooting is one
+  new `shootingMode` flag. Do NOT thread a `mode` value through `renderLoop`,
+  `updateCue`, or any measurement function — if a signature has to change for
+  this, the design has drifted from "purely presentational".
+- **Modes are presentational only.** Detection, `trackShotAttempt`, clip
+  recording and the cue state machine run identically in all three. No
+  detection/logging/recording path may ever branch on the current mode. This is
+  what makes a wrong mode cost a confusing screen rather than a lost arrow.
+- **`#cue` stays visible in every mode.** Not Shooting-only. If the owner props
+  the phone and forgets to tap "Start shooting", a Shooting-only cue would leave
+  him with no signal for a whole end — and its absence looks identical to the
+  calm state from five metres. Always-on deletes that failure class for free.
+- **`#readouts` move into Setup** as a pre-flight check (is the camera reading
+  me confidently, is handedness right), hidden while Shooting and while
+  reviewing. **The owner confirmed he shoots solo** — no coach watches the phone
+  mid-end, so there is no live-numbers-for-a-coach case to design for. If that
+  ever changes it is a separate scoped feature, not a tweak to Shooting mode.
+- **Entry/exit:** a "Start shooting" button in Setup; tap anywhere on the
+  Shooting screen to return to Setup. **The button must be inert until startup
+  completes** (same readiness signal `#status` uses) or an early tap drops him
+  into a Shooting screen with no live cue.
+- **Calibration is automatic** (owner's choice): measured passively while he is
+  stood in Setup, silent when it agrees with the stored value, speaking up only
+  on a mismatch. No "Calibrate now" button. It and the framing check live in
+  Setup as plain-English status lines, following the shot log's existing banner
+  pattern.
+
+## Open work
+
+- **Retune the detection thresholds.** `FULL_DRAW_HAND_SEP_MIN`,
+  `DRAW_ATTEMPT_MIN_SEP`, `FULL_DRAW_ANCHOR_MAX`, `FULL_DRAW_STILL_MAX`,
+  `SHOT_MIN_PEAK_SEP_FRACTION` and the two `ATTENTION_REST_*` constants were all
+  chosen against geometry that has since been corrected. **Do not guess at new
+  values** — get a real session's `hand sep` figures off the shot log first. A
+  field session on 2026-08-23 read 1.13, which is the plausible range; the 2.3
+  that exposed the original bug is gone.
+- **Do clips actually record on the owner's iPhone?** Unknown. Failures now name
+  themselves on the row. If every row reports the same failure, canvas-stream
+  recording is likely unviable on that Safari version, and the fallback —
+  recording the plain camera stream and losing the skeleton overlay — becomes a
+  real design decision for the owner, not an implementation detail.
+- **Build the three-mode interface** above. Design is approved; no code exists.
+- **Is the draw-elbow reading systematically offset?** A field session showed
+  19° low, consistently, across every shot. Consistency plus a large offset
+  usually means a measurement error rather than a form fault. Check the
+  calculation against a clip before retuning `DRAW_ELBOW_ALIGN_MAX_DEVIATION` —
+  moving the threshold to accept 19° would paper over a bug if it is one.
+
+## Hard-won lessons — do not repeat these
+
+**The test environment does not resemble the device.** The sandbox runs headless
+Chromium on a desktop viewport; the owner shoots on a **portrait** iPhone. Two
+serious bugs lived entirely in that gap: a startup hang on real Safari, and
+aspect-ratio distortion that was invisible to fixtures built in the same
+distorted space. Test in portrait. State plainly which claims are proven and
+which are reasoned. (The sandbox *can* reach `cdn.jsdelivr.net` and loads the
+real MediaPipe library — an earlier claim to the contrary was wrong. What is
+genuinely unavailable is the camera: `getUserMedia` is denied outright.)
+
+**A clean merge is not a correct merge.** The most expensive bug so far was
+written by nobody. A merge combined two individually-correct branches into a
+call site passing three arguments to `torsoLength`, which the other branch had
+changed to need five. The result was `NaN` — falsy — so a guard clause swallowed
+it and the whole attention-gating feature silently switched itself off for weeks
+with no error anywhere. Git reported no conflict. **After any merge touching
+`app.js`, re-run `?selftest` against the merged result and check the arity of
+every call to functions either branch changed.**
+
+**Verify which port your server actually bound.** Several servers run here. One
+that fails to bind leaves you testing another directory's files — this has
+produced impossible results more than once. Compare an md5 against the file on
+disk before trusting anything.
+
+**Never let a component cry wolf.** The owner restarted the app repeatedly
+because a watchdog told him it was broken when it was not. A false alarm costs
+more than a missing one: it destroys trust in every other line the log shows.
+Any new warning needs a test proving it stays *silent* when nothing is wrong.
+
+**No test hooks in `app.js`.** Verify from outside — hook browser prototypes,
+read the DOM, drive the real pipeline with a stub returning crop-relative
+coordinates (the app crops before inference). An earlier engineer's hooks were
+removed for breaking this.
+
+**An assertion that cannot fail is worse than no assertion.** Two have shipped
+here that passed against broken code. Prove every new assertion can fail by
+breaking the thing it tests.
+
+**The app must never claim to judge form.** Every target range under CALIBRATE
+WITH COACH is an unvalidated placeholder. The log may only report repeatability
+against the owner's own shots. No scores, no verdicts, no invented thresholds.
+
+**Fail toward recording.** A phantom row is visible and the owner can report it;
+a missed arrow is invisible and he never knows. Keep the ignored count visible.
+Do not quietly reverse this.
 
 ## Not built / explicitly out of scope for this prototype
 

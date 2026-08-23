@@ -1,7 +1,5 @@
 # Archery Form Coach
 
-> **Picking this up in a new session?** Read [HANDOVER.md](HANDOVER.md) first — current state, the staged plan, and the mistakes not to repeat.
-
 A web page that watches you shoot and tells you three things about your form.
 Point your phone at yourself, shoot as normal, and check the numbers afterwards.
 Nothing to install.
