@@ -125,6 +125,39 @@ The substantial piece. Do it once, deliberately.
 Everything currently shares one cluttered screen, which is why it reads as a
 prototype: each mode is compromised by the others' furniture.
 
+**DESIGN SETTLED 2026-08-23** — proposal reviewed and approved by the owner. Decisions:
+
+- **One boolean, not a three-mode enum.** Review already exists: `#shotlog` is a
+  full-screen overlay with its own close control and tap-outside-to-dismiss.
+  Setup is the resting state, Review is the log open over it, Shooting is one
+  new `shootingMode` flag. Do NOT thread a `mode` value through `renderLoop`,
+  `updateCue`, or any measurement function — if a signature has to change for
+  this, the design has drifted from "purely presentational".
+- **Modes are presentational only.** Detection, `trackShotAttempt`, clip
+  recording and the cue state machine run identically in all three. No
+  detection/logging/recording path may ever branch on the current mode. This is
+  what makes a wrong mode cost a confusing screen rather than a lost arrow.
+- **`#cue` stays visible in every mode.** Not Shooting-only. If the owner props
+  the phone and forgets to tap "Start shooting", a Shooting-only cue would leave
+  him with no signal for a whole end — and its absence looks identical to the
+  calm state from five metres. Always-on deletes that failure class for free.
+- **`#readouts` move into Setup** as a pre-flight check (is the camera reading
+  me confidently, is handedness right), hidden while Shooting and while
+  reviewing. **The owner confirmed he shoots solo** — no coach watches the phone
+  mid-end, so there is no live-numbers-for-a-coach case to design for. If that
+  ever changes it is a separate scoped feature, not a tweak to Shooting mode.
+- **Entry/exit:** a "Start shooting" button in Setup; tap anywhere on the
+  Shooting screen to return to Setup. **The button must be inert until startup
+  completes** (same readiness signal `#status` uses) or an early tap drops him
+  into a Shooting screen with no live cue.
+- **Calibration is automatic** (owner's choice): measured passively while he is
+  stood in Setup, silent when it agrees with the stored value, speaking up only
+  on a mismatch. No "Calibrate now" button. It and the framing check live in
+  Setup as plain-English status lines, following the shot log's existing banner
+  pattern.
+
+Original brief follows.
+
 **Deliverable: a design proposal first** — how modes are entered and left, what
 each shows, what happens to the readout panels — approved by the owner before
 any code is written.
