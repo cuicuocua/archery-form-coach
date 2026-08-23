@@ -264,6 +264,8 @@ const shotLogEl = document.getElementById("shotlog");
 // scroll it out of reach. See HANDOVER.md Stage 1a.
 const shotLogContentEl = document.getElementById("shotlog-content");
 const shotLogCloseBtn = document.getElementById("shotlog-close");
+const shotLogShareBtn = document.getElementById("shotlog-share");
+const shotLogShareTextEl = document.getElementById("shotlog-sharetext");
 const clipPlayerEl = document.getElementById("clipplayer");
 const clipPlayerVideo = document.getElementById("clipplayer-video");
 const clipPlayerClose = document.getElementById("clipplayer-close");
@@ -2427,6 +2429,165 @@ function renderShotLog() {
   shotLogContentEl.innerHTML = `${startupBit}${banner}${modelBit}${rejectedBit}${unsettledBit}${attentionBit}${countLine}<div class="shotlog-narrative">${narrativeHtml}</div>${rowsHtml}`;
 }
 
+// ===== SHARE — the owner's only route to a full session's numbers. He can't remember to add
+// ?debug before he starts shooting (he isn't even holding the phone by then), and a screenshot
+// loses whatever's off the bottom of the screen and isn't machine-readable at the other end. So
+// Share always includes everything ?debug shows on a row (hand sep, the four trigger booleans)
+// PLUS the session-level lines renderShotLog already computes — regardless of ?debug.
+//
+// buildShareText is the ONE pure function that does the actual text generation — entries (a
+// log-shaped array, any order) and a plain counters object in, one string out. No DOM, no
+// navigator, no module state read directly, so selfTest can assert on it exactly like
+// summarizeShots/narrateMeasure above. `entries` is deliberately just "whatever log currently
+// holds", the same SHOT_LOG_MAX-capped list renderShotLog reads — counters.shotCount is the true
+// session total, and the two can disagree (see the truncation notice below) whenever more than
+// SHOT_LOG_MAX arrows have been shot.
+function buildShareText(entries, counters) {
+  const {
+    shotCount,
+    rejectedAttemptCount,
+    unsettledAttemptCount,
+    attentionIdlePeriods,
+    attentionLateWakeCount,
+    clipsUnavailableReason,
+    modelStatusLine,
+    rightHanded,
+    mirrored,
+    cameraWidth,
+    cameraHeight,
+  } = counters;
+
+  const lines = [];
+  lines.push("Archery form coach — session share");
+  // Context that changes how every number below should be read: which arm is "bow", whether the
+  // picture (and therefore the clips) are mirrored, and the actual capture resolution — geometry
+  // fixes in this app have already been sensitive to exactly these settings (see CLAUDE.md).
+  lines.push(`Camera ${cameraWidth ?? "?"}x${cameraHeight ?? "?"} · ${rightHanded ? "right-handed" : "left-handed"} · mirror ${mirrored ? "on" : "off"}`);
+  if (modelStatusLine) lines.push(modelStatusLine);
+
+  lines.push("");
+  lines.push(`Arrows this session: ${shotCount}`);
+  // The log only ever keeps the newest SHOT_LOG_MAX entries — without this line, a 30-arrow
+  // session sharing only its last 10 draws would silently look like a complete 10-arrow session,
+  // and threshold retuning done against it would be working from a biased sample without knowing.
+  if (entries.length < shotCount) {
+    lines.push(`NOTE: only the most recent ${entries.length} of ${shotCount} draws are included below — the log only keeps the last ${entries.length}.`);
+  }
+  lines.push(`Movements ignored (not real draws): ${rejectedAttemptCount}`);
+  lines.push(`Arrows drawn before settling (not recorded): ${unsettledAttemptCount}`);
+  lines.push(
+    `Attention idle periods: ${attentionIdlePeriods}${attentionLateWakeCount ? ` (${attentionLateWakeCount} late wake${attentionLateWakeCount === 1 ? "" : "s"})` : ""}`
+  );
+  if (clipsUnavailableReason) lines.push(`Clip recording: ${clipsUnavailableReason}`);
+
+  // Same consistency wording renderShotLog puts in the app itself (narrateMeasure) — reusing it
+  // rather than re-deriving a second version keeps the shared text and the on-screen log always
+  // in agreement.
+  lines.push("");
+  lines.push("Consistency:");
+  const measures = [
+    narrateMeasure(entries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG),
+    narrateMeasure(entries, (e) => e.shoulderDrop?.bow ?? null, "Bow shoulder", wordForShoulder, SHOULDER_BOW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(entries, (e) => e.shoulderDrop?.draw ?? null, "Draw shoulder", wordForShoulder, SHOULDER_DRAW_CONSISTENCY_FLOOR_PCT),
+    narrateMeasure(entries, (e) => e.elbowAlign?.signed ?? null, "Draw elbow", wordForElbow, ELBOW_CONSISTENCY_FLOOR_DEG),
+  ].filter(Boolean);
+  if (measures.length === 0) lines.push("  Not enough shots yet for a consistency read.");
+  else measures.forEach((m) => lines.push(`  ${m.text}`));
+
+  // One draw per line, oldest first (entries itself is newest-first, same order the log/render
+  // read it in) — chronological reads naturally top-to-bottom for a session review, and matches
+  // shot numbering order.
+  lines.push("");
+  lines.push("Draws (oldest first):");
+  const chronological = [...entries].sort((a, b) => a.shotNum - b.shotNum);
+  if (chronological.length === 0) lines.push("  (none)");
+  else chronological.forEach((e) => lines.push(shareLineForEntry(e)));
+
+  const clipFailures = chronological.filter((e) => e.clipFailReason);
+  if (clipFailures.length) {
+    lines.push("");
+    lines.push("Clip failures:");
+    clipFailures.forEach((e) => lines.push(`  Shot ${e.shotNum}: ${e.clipFailReason}`));
+  }
+
+  return lines.join("\n");
+}
+
+// Formatters shared by shareLineForEntry below — each renders a measure's own null (uncertain,
+// below MIN_VISIBILITY — see shoulderDropOf/bowArmAngleOf/drawElbowAlignmentOf) as the honest word
+// "uncertain", never a fake 0/0%/pass, so a retuning session can't mistake "wasn't measured" for
+// "measured as zero".
+function shareDeg(v) { return v == null ? "uncertain" : `${Math.round(v)}deg`; }
+function shareSignedDeg(v) { return v == null ? "uncertain" : `${v >= 0 ? "+" : ""}${Math.round(v)}deg`; }
+function sharePct(v) { return v == null ? "uncertain" : `${Math.round(v)}%`; }
+function sharePassFail(v) { return v == null ? "unknown" : v ? "pass" : "fail"; }
+
+// One logged draw as one labelled line: shot number, all four form readouts, hand separation (the
+// key figure the threshold retune needs — see CLAUDE.md/HANDOVER.md), the pass/fail of each of the
+// four full-draw trigger conditions, whether it reached true full draw, and whether it has a clip.
+// Always includes everything a ?debug row shows, regardless of whether ?debug is set — that gate
+// only applies to the LIVE on-screen row (see renderShotRow's debugBit); it never applies here.
+function shareLineForEntry(e) {
+  const recorded = e.clipUrl ? "yes" : "no";
+  const failBit = e.clipFailReason ? ` clipFailReason="${e.clipFailReason}"` : "";
+  return (
+    `shot=${e.shotNum} bowArm=${shareDeg(e.bowArmAngle)} shoulderBow=${sharePct(e.shoulderDrop?.bow ?? null)} ` +
+    `shoulderDraw=${sharePct(e.shoulderDrop?.draw ?? null)} elbow=${shareSignedDeg(e.elbowAlign?.signed ?? null)} ` +
+    `handSep=${e.handSep == null ? "uncertain" : e.handSep.toFixed(3)} anchor=${sharePassFail(e.anchorOk)} arm=${sharePassFail(e.armOk)} ` +
+    `sep=${sharePassFail(e.sepOk)} still=${sharePassFail(e.stillOk)} fullDraw=${e.reachedFullDraw ? "yes" : "no"} recorded=${recorded}${failBit}`
+  );
+}
+
+// Gets buildShareText's string off the phone. Three steps, each only tried if the one before it
+// is unavailable or actually failed — the owner must never tap Share and get nothing with no idea
+// why. (1) The iOS share sheet — the natural route on his device: one tap, then AirDrop to his
+// Mac, or into Notes/Messages. Unsupported on desktop Safari and some contexts, and it throws if
+// not called from a genuine user gesture (which this always is — only ever called from the Share
+// button's own click handler). (2) The clipboard. (3) A selectable on-screen text block he can
+// copy by hand — the guaranteed-to-work last resort.
+async function shareSessionText(text) {
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: "Archery form coach — session share", text });
+      return;
+    } catch (err) {
+      // AbortError means the owner opened the share sheet and backed out himself — that's not a
+      // failure to fall back from, he just changed his mind. Anything else (unsupported context,
+      // not a real user gesture, a share target rejecting it) falls through to the clipboard.
+      if (err && err.name === "AbortError") return;
+    }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      flashShareButton("Copied!");
+      return;
+    } catch (err) {
+      // fall through to the manual copy block below
+    }
+  }
+  showShareFallbackText(text);
+}
+
+// Briefly relabels the Share button to confirm the clipboard copy actually happened — the owner
+// gets no OS-level confirmation for navigator.clipboard the way he does for the native share
+// sheet, so without this a silent success and a silent failure would look identical to him.
+function flashShareButton(label) {
+  const original = shotLogShareBtn.textContent;
+  shotLogShareBtn.textContent = label;
+  setTimeout(() => { shotLogShareBtn.textContent = original; }, 1500);
+}
+
+// Last resort: neither the share sheet nor the clipboard worked. A plain, pre-selected, readonly
+// textarea the owner can press-and-hold to copy by hand — guaranteed to work with no permissions
+// or APIs at all, which is the whole point of it being the last step in the chain.
+function showShareFallbackText(text) {
+  shotLogShareTextEl.value = text;
+  shotLogShareTextEl.classList.remove("hidden");
+  shotLogShareTextEl.focus();
+  shotLogShareTextEl.select();
+}
+
 // Draws the current camera frame into the overlay canvas. Used to be just ctx.clearRect, leaving
 // the canvas transparent so the <video> element underneath showed through on its own — visually
 // identical, but it meant the canvas itself had no picture in it, only skeleton lines. Now that
@@ -2686,9 +2847,32 @@ btnLog.addEventListener("click", () => {
 // long log can't carry it out of reach) and from the tap-outside-to-close handler below.
 function closeShotLog() {
   shotLogEl.classList.add("hidden");
+  shotLogShareTextEl.classList.add("hidden"); // don't leave the manual-copy fallback showing next time the log opens
 }
 
 shotLogCloseBtn.addEventListener("click", closeShotLog);
+
+// Share: gathers the context that changes how the numbers should be read (camera resolution,
+// handedness, mirror state — all live DOM/module state, read here rather than inside
+// buildShareText so that function stays pure) and hands the rest to buildShareText/
+// shareSessionText. video.videoWidth/Height can briefly be 0 before the camera's ready; buildShareText
+// already renders that honestly as "?x?" rather than "0x0".
+shotLogShareBtn.addEventListener("click", () => {
+  const text = buildShareText(log, {
+    shotCount,
+    rejectedAttemptCount,
+    unsettledAttemptCount,
+    attentionIdlePeriods,
+    attentionLateWakeCount,
+    clipsUnavailableReason,
+    modelStatusLine,
+    rightHanded,
+    mirrored: effectiveMirror(facingMode, mirrorToggled),
+    cameraWidth: video.videoWidth || null,
+    cameraHeight: video.videoHeight || null,
+  });
+  shareSessionText(text);
+});
 
 // Convenience, not the fix itself (the close button above is): tapping anywhere outside the log
 // panel while it's open also dismisses it. Skips btn-log itself so this can never race that
@@ -3732,6 +3916,126 @@ function selfTest() {
       allUncertainResult === null,
       `a measure with every reading uncertain must produce no statement at all, got: ${JSON.stringify(allUncertainResult)}`
     );
+  }
+
+  // --- Share text: buildShareText is the one pure function behind the Share button (see its own
+  // comment) — entries + counters in, one string out, so it's checked directly here exactly like
+  // summarizeShots/narrateMeasure above, no DOM or navigator involved.
+  {
+    const shareEntries = [
+      {
+        shotNum: 3,
+        bowArmAngle: 172,
+        shoulderDrop: { bow: 46, draw: 44 },
+        elbowAlign: { signed: 2, deviation: 2, direction: "high" },
+        handSep: 0.81,
+        anchorOk: true, armOk: true, sepOk: true, stillOk: true,
+        reachedFullDraw: true,
+        clipUrl: "blob:fake-3",
+      },
+      // Deliberately the messiest of the three: an uncertain (below-MIN_VISIBILITY) bow-arm and
+      // draw-shoulder reading, a failed trigger condition, a short-of-full-draw draw, AND a
+      // failed clip — proves null-handling, trigger pass/fail, fullDraw, and clip failure all
+      // come through honestly on the same row rather than only being exercised in isolation.
+      {
+        shotNum: 2,
+        bowArmAngle: null,
+        shoulderDrop: { bow: 45, draw: null },
+        elbowAlign: null,
+        handSep: 0.62,
+        anchorOk: true, armOk: false, sepOk: true, stillOk: true,
+        reachedFullDraw: false,
+        clipFailReason: "no clip — recording came out empty",
+      },
+      {
+        shotNum: 1,
+        bowArmAngle: 170,
+        shoulderDrop: { bow: 44, draw: 45 },
+        elbowAlign: { signed: -1, deviation: 1, direction: "low" },
+        handSep: 0.79,
+        anchorOk: true, armOk: true, sepOk: true, stillOk: true,
+        reachedFullDraw: true,
+        clipUrl: "blob:fake-1",
+      },
+    ];
+    const shareCounters = {
+      shotCount: 3,
+      rejectedAttemptCount: 1,
+      unsettledAttemptCount: 0,
+      attentionIdlePeriods: 0,
+      attentionLateWakeCount: 0,
+      clipsUnavailableReason: null,
+      modelStatusLine: "Pose model: full — pose detection took about 12.3ms/frame, 47.1 fps actually rendered, measured at startup.",
+      rightHanded: true,
+      mirrored: false,
+      cameraWidth: 720,
+      cameraHeight: 1280,
+    };
+    const shareText = buildShareText(shareEntries, shareCounters);
+
+    console.assert(shareText.includes("Arrows this session: 3"), "share text must state the true session total, not just how many rows are included");
+    console.assert(shareText.includes("Movements ignored (not real draws): 1"), "share text must include rejectedAttemptCount even though a rejected movement never becomes its own row");
+    console.assert(shareText.includes("Camera 720x1280"), "share text header must carry the camera resolution");
+    console.assert(shareText.includes("right-handed") && shareText.includes("mirror off"), "share text header must carry handedness and mirror state");
+
+    // One labelled line per draw, in stable shot=N order, oldest first — chronological even
+    // though the input array (like the real log) was newest-first.
+    const drawLines = shareText.split("\n").filter((l) => l.startsWith("shot="));
+    console.assert(drawLines.length === 3, `share text must include exactly one line per logged draw, got ${drawLines.length}`);
+    console.assert(
+      drawLines[0].startsWith("shot=1") && drawLines[1].startsWith("shot=2") && drawLines[2].startsWith("shot=3"),
+      `draw lines must be chronological (oldest first) regardless of input order, got: ${drawLines.map((l) => l.slice(0, 8)).join(", ")}`
+    );
+
+    // Nulls/uncertain readings must be represented honestly, never as a fake 0 that would look
+    // like a real (if unusually low) measurement to whoever eventually tunes the thresholds.
+    console.assert(drawLines[1].includes("bowArm=uncertain"), "a null bow-arm reading must render as 'uncertain', not a fake number");
+    console.assert(drawLines[1].includes("shoulderDraw=uncertain"), "a null draw-shoulder reading must render as 'uncertain', not a fake number");
+    console.assert(!drawLines[1].includes("bowArm=0") && !drawLines[1].includes("shoulderDraw=0"), "a null reading must never render as a fake zero");
+
+    // Every trigger condition's pass/fail must come through, per shot — this is the whole point:
+    // the owner's only route to real hand-sep/trigger figures without remembering ?debug.
+    console.assert(drawLines[1].includes("arm=fail"), "a failed trigger condition must show as fail on its shot's line");
+    console.assert(drawLines[0].includes("arm=pass") && drawLines[0].includes("still=pass"), "passing trigger conditions must show as pass");
+    console.assert(drawLines[1].includes("handSep=0.620"), "hand separation must be included per shot, at real precision, for threshold retuning");
+
+    // Short-of-full-draw and clip status/failure reason must both be visible on the row.
+    console.assert(drawLines[1].includes("fullDraw=no"), "a draw that fell short of full draw must say so on its own line");
+    console.assert(drawLines[0].includes("fullDraw=yes") && drawLines[0].includes("recorded=yes"), "a full draw with a clip must say so on its own line");
+    console.assert(
+      drawLines[1].includes("recorded=no") && drawLines[1].includes('clipFailReason="no clip — recording came out empty"'),
+      "a failed clip must show recorded=no plus its stated reason on its own shot's line"
+    );
+    console.assert(shareText.includes('Shot 2: no clip — recording came out empty'), "a clip failure must also appear in the session-level Clip failures section");
+
+    // Consistency lines must be present and must reuse narrateMeasure's own wording, not a
+    // second, possibly-diverging implementation.
+    console.assert(shareText.includes("Consistency:"), "share text must include the consistency section");
+    const bowArmShareLine = narrateMeasure(shareEntries, (e) => e.bowArmAngle, "Bow arm", wordForBowArm, BOW_ARM_CONSISTENCY_FLOOR_DEG);
+    console.assert(
+      bowArmShareLine && shareText.includes(bowArmShareLine.text),
+      "share text's consistency section must match narrateMeasure's own wording exactly, not a re-derived copy"
+    );
+
+    // The truncation notice: only 2 of these 3 entries "survive" as if the log had capped them —
+    // simulates a 30-arrow session sharing only its last few draws. Must say so explicitly rather
+    // than silently presenting the partial sample as the whole session.
+    const truncatedText = buildShareText(shareEntries.slice(0, 2), { ...shareCounters, shotCount: 30 });
+    console.assert(
+      truncatedText.includes("only the most recent 2 of 30 draws are included"),
+      "share text must explicitly say when fewer draws are included than actually happened"
+    );
+    const completeText = buildShareText(shareEntries, { ...shareCounters, shotCount: 3 });
+    console.assert(
+      !completeText.includes("only the most recent"),
+      "share text must NOT show a truncation notice when every draw that happened is included"
+    );
+
+    // Empty session: no shots yet, must say so plainly rather than rendering an empty or broken
+    // draws section.
+    const emptyShareText = buildShareText([], { ...shareCounters, shotCount: 0, rejectedAttemptCount: 0 });
+    console.assert(emptyShareText.includes("Arrows this session: 0"), "an empty session must still state the (zero) arrow count");
+    console.assert(emptyShareText.includes("(none)"), "an empty session's draws section must say plainly that there are none, not render blank");
   }
 
   // --- Shot clips: MIME selection order, attaching a blob to the right shot number, discarding
