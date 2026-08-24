@@ -1006,6 +1006,15 @@ Rules the PM follows:
   **Still do not guess values** — this needs the recorded-footage harness
   working (see Testing) so a change can be measured against real frames instead
   of argued about.
+- **`lastDrawWrist` is not reset when tracking is lost.** Found in passing while
+  re-deriving the stillness constants, not acted on. Every other piece of
+  per-frame state resets at the three recovery points (`landmarkSmoother`,
+  `resetSettling`, the crop box, and now `stillHoldStartMs`) — this one does
+  not, so a stale pre-loss wrist position can produce one artificially low speed
+  reading on the frame tracking is reacquired. The new `FULL_DRAW_STILL_HOLD_MS`
+  requirement incidentally neutralises this for STILL specifically (one
+  anomalous frame cannot fake a sustained hold), which is why it was not treated
+  as urgent, but anything reading raw `speed` is still exposed.
 - **Do clips actually record on the owner's iPhone?** Unknown. Failures now name
   themselves on the row. If every row reports the same failure, canvas-stream
   recording is likely unviable on that Safari version, and the fallback —
