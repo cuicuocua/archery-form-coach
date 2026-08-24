@@ -117,28 +117,100 @@ Rules the PM follows:
   is the proxy offset and the fix is a reference point closer to the true
   anchor. If the shaft really runs 19° off the elbow, the measurement is right
   and only then does the threshold get retuned, with real numbers.
-- **Hand separation cannot be rescued by retuning. The poses come out in the
-  wrong ORDER, so there is no gap to put a threshold in.** Measured 2026-08-24
-  against a synthetic body, with the probe first proven faithful by reproducing
-  `selfTest`'s own aspect-ratio fixture exactly (1.988 → 1.157). At roughly the
-  camera angle the owner's own field data implies (~45° off perpendicular, back-
-  derived from his 2026-08-23 full-draw reading of 1.13): resting 0.56, walking
-  1.10, **full draw 1.17**, nocking 1.33, mid-raise 1.45. Nocking an arrow and
-  raising the bow both read as *more drawn than full draw*, and this holds at
-  every angle tested including 90°. Cause: the measure is a scalar distance, so
-  it sums total arm spread and discards direction — "bow arm out one way, draw
-  arm out the other" (nocking, mid-raise) geometrically beats "bow arm out,
-  draw hand tucked at the jaw" (real full draw). Independently corroborated
-  without the synthetic model at all: a live 1,497-sample session of the owner
-  **standing still in a kitchen, not shooting** produced a median of 1.07 —
-  above `DRAW_ATTEMPT_MIN_SEP` 97% of the time and above
-  `FULL_DRAW_HAND_SEP_MIN` 67% — which is essentially the same number as his
-  real full draw. It logged 12 draws and called 5 of them arrows.
-  Orientation sensitivity is separately severe: a fixed full-draw body swings
-  from 1.571 to 0.247 as the camera rotates, crossing below the 0.75 threshold
-  at ~65°, so a real full draw reads as "not drawn" from a phone placed 25° off.
-  This is NOT the aspect-ratio bug wearing a new hat — portrait and landscape
-  numbers matched to 1e-16; `toPixelSpace` is correct and orthogonal to this.
+- **Hand separation: the synthetic model that condemned it was WRONG about the
+  owner's own numbers, and the constants have now been re-derived against his
+  real measurements. The open question is narrower than this entry once
+  claimed.** Read this whole entry before touching any hand-separation
+  constant; the history matters because the wrong conclusion was argued
+  convincingly and nearly got acted on.
+
+  **What was measured against a synthetic body (2026-08-24)** — the probe was
+  proven faithful by reproducing `selfTest`'s own aspect-ratio fixture exactly
+  (1.988 → 1.157), so the tooling was not at fault. At roughly the camera angle
+  the owner's field data implied: resting 0.56, walking 1.10, full draw 1.17,
+  nocking 1.33, mid-raise 1.45. That ordering — nocking and mid-raise reading
+  as *more drawn than full draw* — is what produced the conclusion "there is no
+  gap to put a threshold in, so no value can work."
+
+  **What the owner then measured on his own body, same day:** full draw **1.5**,
+  resting **1.07** (median of 1,497 samples). The synthetic model understated
+  his real full draw by a fifth and inverted the relationship the argument
+  depended on. **Treat the synthetic figures above as superseded for full draw
+  and resting.** They are kept here only because the two unverified ones —
+  nocking and mid-raise — are still the open question, and because the lesson
+  generalises: a synthetic body calibrated from one back-derived camera angle
+  produced numbers confident enough to justify deleting a working signal.
+
+  **What shipped (2026-08-24), re-derived from his real numbers together rather
+  than one at a time**: `DRAW_ATTEMPT_MIN_SEP` 0.3 → **1.2**,
+  `FULL_DRAW_HAND_SEP_MIN` 0.75 → **1.35**, and `SHOT_MIN_PEAK_SEP_FRACTION`
+  (0.8, a fraction *of* `FULL_DRAW_HAND_SEP_MIN`) replaced by a standalone
+  **`SHOT_MIN_PEAK_SEP = 1.3`**. That last change is the important structural
+  one: while the peak gate was defined as a fraction of the full-draw
+  threshold, raising the full-draw threshold dragged the peak gate up with it
+  with no guarantee it cleared his resting 1.07 — a change could look correct
+  and remain broken. **Do not re-couple those two constants.** Every one of the
+  three now sits above his resting 1.07 and below his full draw 1.5; the
+  arithmetic is written out at each constant.
+
+  **What is still genuinely unknown: his nocking and mid-raise readings.** The
+  original argument was never "resting beats full draw" — it was "nocking and
+  mid-raise beat full draw", an ORDERING problem that no threshold can fix.
+  Those two numbers have never been measured on his body. If they come in above
+  1.5, phantom rows will persist and the rebuild around anchor + stillness +
+  duration is the answer after all. If they come in below 1.2, this is simply
+  fixed. **Get those two readings before concluding anything further in either
+  direction.**
+
+  **Orientation sensitivity is a separate, unfixed problem.** A fixed full-draw
+  body swings from 1.571 to 0.247 as the camera rotates, so a real full draw
+  can read as "not drawn" from a phone placed well off perpendicular. This is
+  NOT the aspect-ratio bug wearing a new hat — portrait and landscape numbers
+  matched to 1e-16; `toPixelSpace` is correct and orthogonal to this. The
+  re-derived constants above do nothing about it.
+
+- **STILL is a HOLD now, not a moment (2026-08-24).** The owner's complaint was
+  two separate faults in one trigger. First, `FULL_DRAW_STILL_MAX` was 0.35
+  while his real draw-wrist drift while holding at full draw measures **0.05** —
+  seven times looser than his actual hold, so almost any movement passed. Now
+  **0.15**, three times his measurement, deliberately not tighter because 0.05
+  is a single sample and not a spread. Second, and more important structurally:
+  the check was INSTANTANEOUS SPEED, so a brief pause mid-draw satisfied it on
+  one lucky frame. `FULL_DRAW_STILL_HOLD_MS` (500ms) now requires the stillness
+  to have held CONTINUOUSLY — any single non-still frame collapses the streak to
+  zero, no partial credit. `stillSpeedOk` (slow right now) and `stillOk` (has
+  stayed slow) are deliberately separate names in `isAtFullDraw` so the two
+  ideas can never be conflated again. `stillHoldStartMs` resets alongside
+  `resetSettling()` — same reset points as everything else in this file — so a
+  stale pre-reset position can never seed a false hold. Compound let-off makes
+  half a second of stillness trivial to hold, which is why this costs a real
+  shot nothing; a recurve archer would need this loosened (see the bow-type
+  decision above).
+
+- **ELIGIBLE now requires the landmarks a measurement actually needs to be
+  visible (2026-08-24).** Field report: "too lax — it stays lit when I walk
+  almost out of frame with only a shoulder and an arm visible." This was a
+  structural gap, not a threshold. Eligibility meant `SETTLE_FRAMES_REQUIRED`
+  consecutive good-tracking frames plus a stable crop box, and **nothing in it
+  asked whether the joints the logged measures divide and subtract were in the
+  picture at all** — so a frame could be "trustworthy enough to log from" with
+  most of the body missing. `REQUIRED_MEASUREMENT_LANDMARKS` /
+  `missingMeasurementLandmarks` were derived by reading `bowArmAngleOf`,
+  `shoulderDropOf`, `drawElbowAlignmentOf` and `torsoLength`, not guessed: both
+  shoulders, elbows and wrists are required unconditionally (which side is "bow"
+  flips with the handedness toggle, so a frame cannot know in advance which it
+  will need), but a hip and an ear are each needed on only ONE side, because
+  `shoulderDropOf` genuinely falls back to the other side — requiring both would
+  be a stricter bar than the measures themselves apply, and would cost real
+  shots. **Deliberately does NOT reset `settledFrames`**: a shoulder briefly
+  dipping below `MIN_VISIBILITY` does not make the smoothing filter or the crop
+  box stale the way losing the archer entirely does (which already resets
+  through `resetSettling`), so recovery is immediate rather than a fresh
+  multi-second wait. This is a DIFFERENT check from `ROI_MIN_VISIBLE_LANDMARKS`,
+  which asks the much looser "is there roughly a body here to build a crop box
+  from" — a frame can clear that and badly fail this, which is exactly the
+  reported case. A real attempt with no eligible frame is still not silently
+  dropped: it counts in `unsettledAttemptCount` and says so in the shot log.
 
 - **The anchor check is the signal to build on, and it is currently excluded
   from the decisions that matter.** Same measurement run: full draw reads
@@ -747,13 +819,7 @@ Rules the PM follows:
   generous engage side of the gate already covers the case a stricter
   orientation check would have tried to add.
 
-  **Numeric invariants, both enforced by `selfTest`.**
-  `ATTENTION_REST_HAND_SEP_MAX` (0.2) sits below `DRAW_ATTEMPT_MIN_SEP` (0.3)
-  on purpose — hands cannot read as "calm" by this feature's own standard
-  while also being far enough apart to count as an in-progress attempt, which
-  is what makes the explicit hard rule in `updateAttentionState` ("an attempt
-  in progress is never allowed to idle") true by construction, not just by
-  the rule itself. `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` (150ms) sits well
+  **Numeric invariants.** `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` (150ms) sits well
   under `SHOT_MIN_DURATION_MS` (600ms), so a genuine draw can never start and
   finish entirely inside one blind idle-rate gap and go completely unnoticed.
   A softer, empirical risk sits alongside that hard guarantee and is *not*
@@ -780,19 +846,46 @@ Rules the PM follows:
   theoretical: `updateAttentionState` refuses to idle at all until
   `modelDecisionMade` is true.
 
-  **GEOMETRY-FIX NOTE.** `ATTENTION_REST_HAND_SEP_MAX` and
-  `ATTENTION_REST_MOVE_MAX_PER_SEC` are both torso-length-scaled distances,
-  computed the same way `DRAW_ATTEMPT_MIN_SEP`/`FULL_DRAW_STILL_MAX` already
-  are — deliberately, so both inherit the in-progress fix to this app's
-  coordinate maths (MediaPipe's x/y are normalised to frame width/height
-  separately, not one shared scale, so today's Euclidean distances are
-  stretched on a non-square frame) automatically through the shared
-  `torsoLength()` function, rather than being tuned against today's
-  distorted numbers. They were set relative to the existing constants they
-  sit near (comfortably below/above `DRAW_ATTEMPT_MIN_SEP`/
-  `FULL_DRAW_STILL_MAX`) specifically so that relationship survives the fix;
-  whoever does that retuning should sanity-check these two alongside it, the
-  same way `DRAW_ATTEMPT_MIN_SEP` itself needs revisiting.
+  **THE CALM CHECK WAS REBUILT 2026-08-24, AND THE STRUCTURAL GUARANTEE ABOVE
+  CHANGED SHAPE WITH IT — read this before touching either side.** The owner
+  field-tested ATTN and reported it "seems pointless". He was right, and the
+  reason was arithmetic: the calm check required hand separation at or below
+  `ATTENTION_REST_HAND_SEP_MAX` (0.2), and his measured resting separation is
+  ~1.07. The condition could never once have fired, so the battery saving
+  never engaged. Per his own proposal, the calm check now tests that the BOW
+  ARM IS HANGING DOWN (`bowArmRaiseHeight <= ATTENTION_REST_ARM_DOWN_MAX`,
+  -0.6) instead — the same signal `RAISE` is built on, which is the one
+  trigger he reported as working correctly. The whole-body stillness half
+  (`ATTENTION_REST_MOVE_MAX_PER_SEC`) is unchanged.
+
+  **`ATTENTION_REST_HAND_SEP_MAX` is deleted, and so is the numeric invariant
+  that used to make "an in-progress attempt can never idle" true by
+  construction.** That invariant only worked because the calm check and
+  `DRAW_ATTEMPT_MIN_SEP` measured the same quantity in the same units. Arm
+  elevation and hand separation are different axes of the body, so no
+  inequality between two constants can carry that guarantee any more, and
+  none is asserted. **The guarantee now rests ENTIRELY on the explicit
+  `if (attempt)` hard rule in `updateAttentionState`** — which is proven
+  directly by its own `selfTest` assertion (it feeds that branch
+  deliberately calm-looking landmarks and confirms engaged wins anyway). That
+  assertion was previously a defensive backstop and is now load-bearing:
+  verified by neutering the rule and watching it fail. Do not delete it, and
+  do not try to reconstruct the old numeric invariant — it is deliberately
+  gone.
+
+  **GEOMETRY-FIX NOTE.** `ATTENTION_REST_ARM_DOWN_MAX` and
+  `ATTENTION_REST_MOVE_MAX_PER_SEC` are both torso-length-scaled, computed
+  through the shared `torsoLength()` function, so both inherit this app's
+  coordinate-maths fix automatically rather than being tuned against
+  distorted numbers. `ATTENTION_REST_ARM_DOWN_MAX` was set relative to
+  `RAISE_TRIGGER_DOWN_FRACTION` (-0.3) — comfortably below it, so the arm
+  cannot read as "resting" anywhere inside the raise trigger's own hysteresis
+  band.
+
+  **Not done, and the next lever if idling still fails in the field:** the
+  check reads the BOW arm only, not both arms. Nocking moves mostly the draw
+  arm, so if nocking turns out to keep the app awake, a symmetric draw-arm
+  check is the thing to add.
 
 ## Interface: three modes (designed, not yet built)
 
@@ -834,6 +927,14 @@ Rules the PM follows:
   setup — the most valuable calibration data this project has ever had, and the
   only numbers here not derived from a synthetic model. Treat them as ground
   truth over any desk estimate, including the ones in the Key decisions above.
+
+  **STATUS 2026-08-24, after the fixes below shipped: SEP, STILL, OPEN,
+  ELIGIBLE and ATTN have all been CHANGED but NONE has been retested on his
+  body.** Every reading recorded below predates those changes. Do not cite any
+  of them as the current behaviour of the app, and do not tune anything further
+  against them — they describe the app as it was when he measured it. The next
+  session's readings supersede this block entirely. ARM and POSE are unchanged
+  since he measured them; RAISE was correct and was deliberately left alone.
 
   - **SEP — "ridiculous". Full draw measures 1.5; the gate is 0.75.** His
     resting reading was ~1.07 (median of 1,497 samples, same day). **This partly
@@ -882,18 +983,29 @@ Rules the PM follows:
     computes arm elevation and RAISE already proves that signal works, so this
     is mostly rewiring rather than new geometry.
 
-- **Rebuild attempt detection around anchor + stillness + duration.** Supersedes
-  the old "retune the detection thresholds" item, which is now answered: see the
-  two Key decisions above. Retuning `FULL_DRAW_HAND_SEP_MIN` is proven not to
-  work at any value, because nocking and mid-raise read as more drawn than full
-  draw. The work is (a) stop `trackShotAttempt`/`endAttempt` gating on raw hand
-  separation, (b) make `reachedFullDraw` a sustained condition rather than a
-  single-frame OR, (c) re-derive `DRAW_ATTEMPT_MIN_SEP`,
-  `SHOT_MIN_PEAK_SEP_FRACTION` and the two `ATTENTION_REST_*` constants against
-  whatever replaces it, since all of them are defined in hand separation's
-  units and cannot simply be carried over. **Still do not guess values** — this
-  needs the recorded-footage harness working (see Testing) so a change can be
-  measured against real frames instead of argued about.
+- **Get the owner's NOCKING and MID-RAISE hand-separation readings.** This is
+  the cheapest high-value measurement left and it decides the next item. The
+  constants have been re-derived against his real resting (1.07) and full-draw
+  (1.5) numbers, but the original case against hand separation was an ORDERING
+  claim — nocking and mid-raise reading as more drawn than full draw — and those
+  two have never been measured on his body, only on a synthetic model that has
+  since been proven wrong about his other two numbers. Above 1.5 and the rebuild
+  below is required; below 1.2 and it is not.
+- **Rebuild attempt detection around anchor + stillness + duration — CONDITIONAL
+  now, not settled.** The claim that retuning "is proven not to work at any
+  value" rested on the synthetic model above and is no longer trustworthy; the
+  re-derived constants may simply be sufficient. Do not start this work until
+  the nocking/mid-raise readings say it is needed. If it is, the work is (a)
+  stop `trackShotAttempt`/`endAttempt` gating on raw hand separation, (b) make
+  `reachedFullDraw` a sustained condition rather than a single-frame OR — this
+  half is worth doing REGARDLESS of what those readings say, since a
+  single-frame OR is too weak a bar on its own terms, and (c) re-derive
+  `DRAW_ATTEMPT_MIN_SEP` and `SHOT_MIN_PEAK_SEP` against whatever replaces it.
+  Note `ATTENTION_REST_HAND_SEP_MAX` is no longer in that list — it has been
+  deleted, and the attention gate no longer measures hand separation at all.
+  **Still do not guess values** — this needs the recorded-footage harness
+  working (see Testing) so a change can be measured against real frames instead
+  of argued about.
 - **Do clips actually record on the owner's iPhone?** Unknown. Failures now name
   themselves on the row. If every row reports the same failure, canvas-stream
   recording is likely unviable on that Safari version, and the fallback —
