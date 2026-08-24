@@ -86,6 +86,24 @@
     </div>
   </div>
 
-  <script type="module" src="app.js"></script>
+  <!-- app.js is loaded through this tiny bootstrap, not a plain <script type="module" src="app.js">,
+       so the ?triggertest panel's "Hard reload" button (see buildTriggerTestPanel in app.js) can
+       genuinely bust the cache. ES modules are cached per exact URL, and a query string on THIS
+       page (index.html) does nothing to the separate URL app.js is fetched from — a plain reload,
+       even a forced one, can still hand back a stale cached module (see CLAUDE.md's Testing
+       section, "ES modules cache per origin"). Reading a `cb` param off our OWN url and forwarding
+       it onto app.js's own src is what actually changes app.js's URL, which is the only thing that
+       guarantees a real network fetch instead of a cache hit. No `cb` param (the normal case, every
+       load that isn't the hard-reload button) means app.js is requested exactly as before —
+       ordinary caching still applies, nothing about normal use changes. -->
+  <script>
+    (function () {
+      var cb = new URLSearchParams(location.search).get("cb");
+      var s = document.createElement("script");
+      s.type = "module";
+      s.src = "app.js" + (cb ? "?cb=" + encodeURIComponent(cb) : "");
+      document.body.appendChild(s);
+    })();
+  </script>
 </body>
 </html>

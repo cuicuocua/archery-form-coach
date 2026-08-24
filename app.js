@@ -26,12 +26,17 @@ const FULL_DRAW_ANCHOR_MAX = 0.3; // draw-hand wrist must be this close to the m
 // cannot anchor ahead of my mouth. it'll always be below or slightly backwards." These two add
 // DIRECTION on top of FULL_DRAW_ANCHOR_MAX's existing distance gate — they never replace it, and
 // FULL_DRAW_ANCHOR_MAX itself is untouched (it's the one constant in this file measured off a real
-// reading; changing it needs a new reading, not a desk decision). Both below are UNMEASURED
-// PLACEHOLDERS, defaulted permissively on purpose (same discipline as every other new constant in
-// this block) so neither can reject a real anchor before the owner has read his own numbers off
-// the ?triggertest ANCHOR screen — the same loop that produced FULL_DRAW_ANCHOR_MAX's own value.
-const FULL_DRAW_ANCHOR_ABOVE_MAX = 0.25; // fraction of torso length the draw wrist may sit ABOVE the anchor point (mouth-midpoint, or nose if the mouth isn't visible) and still pass — image y grows downward, so this bounds how far UP is still plausible, which is the "above the nose" failure mode reported. Deliberately generous: real mouth-to-nose distance is roughly 0.05-0.1 torso-lengths, so 0.25 only rules out the grossly-too-high cases, not anything close to a real anchor. No corresponding "how far below" limit exists — dropping low is never anatomically wrong for a release-aid hand near the jaw, only "too far above" is
-const FULL_DRAW_ANCHOR_BACKWARD_MIN = -0.1; // the draw wrist's position along the anchor-point→draw-ear axis, in torso-lengths (see isAtFullDraw's own comment for why the draw-side ear, not the shoulder line, defines "backwards" here) — positive means toward the ear (backwards, as the owner described), negative means toward the front of the face. A true anchor should read at or above 0; permissively allowed slightly negative for now, since the exact position of "the mouth" this measures from has its own slop and an unmeasured threshold shouldn't reject a real anchor over it
+// reading; changing it needs a new reading, not a desk decision).
+//
+// MEASURED 2026-08-24, same session and same ?triggertest ANCHOR screen as FULL_DRAW_ANCHOR_MAX's
+// own reading, both replacing the unmeasured placeholders they launched with (0.25 / -0.1). As with
+// every other reading in this file, this is a SINGLE SAMPLE, not a spread across several shots —
+// treat it as a real anchor, not as proof of how much it varies shot to shot. Loosening either
+// value needs a session showing REAL anchors getting rejected (several shots, not one), the same
+// bar every other calibration constant here is held to; a single field report of a false reject
+// would justify investigating, not retuning on the spot.
+const FULL_DRAW_ANCHOR_ABOVE_MAX = 0.05; // fraction of torso length the draw wrist may sit ABOVE the anchor point (mouth-midpoint, or nose if the mouth isn't visible) and still pass — image y grows downward, so this bounds how far UP is still plausible, which is the "above the nose" failure mode reported. Was 0.25 (unmeasured; loose enough to permit the hand up around eyebrow height). Owner's own reading: his draw hand sits 0.08 torso-lengths BELOW the mouth at real anchor (i.e. anchorVerticalOffset ≈ +0.08, the opposite side of this limit entirely), so 0.05 of allowed room ABOVE the mouth leaves him roughly 0.13 torso-lengths (~6cm on his own build) of margin before this would ever reject a real anchor
+const FULL_DRAW_ANCHOR_BACKWARD_MIN = 0; // the draw wrist's position along the anchor-point→draw-ear axis, in torso-lengths (see isAtFullDraw's own comment for why the draw-side ear, not the shoulder line, defines "backwards" here) — positive means toward the ear (backwards, as the owner described), negative means toward the front of the face. Was -0.1 (unmeasured; permitted the hand a tenth of a torso-length IN FRONT of the mouth — exactly the case the owner reported as wrong). Owner's own words settle this at exactly 0, not some small positive tolerance: "i cannot anchor ahead of my mouth. it'll always be below or slightly backwards" — a compound anchor is never in front, so anything at or behind the mouth (>= 0) is anatomically the only possibility, and anything negative is definitionally wrong. His own reading was 0.17, comfortably clear of this line
 const FULL_DRAW_BOW_ARM_MIN = 140; // degrees; bow arm must be at least this straight to count as "drawn". Was 150 — loosened 2026-08-24 after the owner reported "sometimes i shoot with my arm not 100% straight and the slight bend doesn't pass the trigger." Not a measurement, a deliberate response to a false-reject field report: the new ARM CONE check below (FULL_DRAW_ARM_CONE_APERTURE_DEG) now shares the job of ruling out "arm isn't really extended toward the shot" that straightness alone used to carry by itself, so straightness itself can afford to be laxer
 // ARM CONE — owner, 2026-08-24, replacing an earlier "reuse the raise-height signal" instruction
 // with his own better one: "create a cone in front of my shoulder joint and check for the arm to
@@ -4637,6 +4642,7 @@ function buildTriggerTestPanel() {
       <h2 class="dbg-heading">Raw inputs it's reading</h2>
       <div data-x="tt-inputs"></div>
     </section>
+    <button type="button" class="tt-reload-btn" data-x="tt-reload">⟳ Hard reload (clears cached app.js)</button>
   `;
   ttRefs = {};
   triggerTestEl.querySelectorAll("[data-x]").forEach((el) => {
@@ -4648,6 +4654,20 @@ function buildTriggerTestPanel() {
     renderCurrentTrigger();
   };
   ttRefs["tt-next"].addEventListener("click", () => advance(1));
+  // HARD RELOAD — owner's own request while testing a build that changes frequently: a plain
+  // location.reload() is not enough here, because ES modules are cached per exact URL and a
+  // reload of the SAME url can still hand back the OLD app.js (see CLAUDE.md's Testing section,
+  // "ES modules cache per origin", and the bootstrap loader in index.html this depends on). The
+  // fix has to change app.js's own URL, not just re-request this page — so this sets a fresh `cb`
+  // (cache-bust) value, which index.html's bootstrap script reads and appends to app.js's own src,
+  // guaranteeing a real network fetch instead of a cache hit. Every OTHER existing param
+  // (?triggertest, ?debug, ?selftest, ...) is carried over unchanged via URLSearchParams, so the
+  // owner lands back in the exact mode he was testing, not a bare reload to the plain app.
+  ttRefs["tt-reload"].addEventListener("click", () => {
+    const params = new URLSearchParams(location.search);
+    params.set("cb", String(Date.now()));
+    location.href = `${location.pathname}?${params.toString()}`;
+  });
   // Keyboard equivalents cost nothing and help anyone testing on a desktop — Space/Enter/→ mirror
   // the one big button (forward, wrapping); ← is a bonus back-step the on-screen button
   // deliberately doesn't offer (the owner asked for ONE big forward button, not a pair).
@@ -5433,14 +5453,60 @@ function selfTest() {
   // NOT a claim that real phone video is 1x1 or square — quite the opposite, see below.
   const NOOP_W = 1, NOOP_H = 1;
   const mkLandmarks = (overrides) => {
-    const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 1 }));
-    for (const i in overrides) lm[i] = { ...lm[i], ...overrides[i] };
+    const lm = Array.from({ length: 25 }, () => ({ x: 0, y: 0, visibility: 0 }));
+    // A landmark this fixture never mentions at all defaults to invisible (visibility: 0) — see
+    // the FIXTURE BUG comment on `base` below for why: an untouched slot sitting at the frame's
+    // corner, marked fully confident, is a landmark that isn't really there pretending to be one.
+    // A landmark the fixture DOES mention gets visibility: 1 by default — nearly every override in
+    // this file is written as just `{ x, y }` with no visibility key, on the long-standing
+    // convention that placing a real coordinate there means "this joint is visible here"; that
+    // default is applied FIRST so an override that explicitly sets visibility (occlusion fixtures
+    // like `{ x, y, visibility: 0 }`) still wins over it.
+    for (const i in overrides) lm[i] = { visibility: 1, ...overrides[i] };
     return lm;
   };
   // Shared skeleton scale: shoulder-to-hip torso length of 0.3.
+  //
+  // FIXTURE BUG FOUND THIS TASK (2026-08-24), fixed at TWO levels. `base` set no ears (7/8), so any
+  // fixture built on it that reached the ANCHOR DIRECTION backward-check (see
+  // FULL_DRAW_ANCHOR_BACKWARD_MIN below) was silently measuring the anchor->ear axis off whatever
+  // mkLandmarks defaulted an unmentioned landmark to — back then, { x: 0, y: 0, visibility: 1 },
+  // the frame's top-left corner marked fully confident. The shared `drawn` full-draw fixture read a
+  // NEGATIVE (in-front-of-the-mouth) backward value off that corner, which only passed because the
+  // placeholder threshold (-0.1) was loose enough to swallow nonsense. Real ear positions below
+  // close that hole directly: any fixture spreading `base` and not overriding 7/8 now gets a
+  // genuine head, not a corner.
+  //
+  // The wider fix, applied after auditing every fixture in this file for the same class of defect:
+  // mkLandmarks itself now defaults an untouched landmark to visibility: 0 (see its own comment
+  // above), so a fixture that forgets to set a landmark the code under test actually needs gets a
+  // correctly-invisible slot instead of a corner point pretending to be a confident real one — this
+  // class of bug is now structurally caught by the pipeline's own visibility gates, rather than
+  // relying on the next engineer to notice a specific coordinate looks wrong. That sweep found one
+  // more real instance beyond `base`'s ears: the `slightBend` fixture further down (search for its
+  // own FIXTURE BUG comment) never set a draw wrist at all, and was silently passing isAtFullDraw's
+  // visibility gate off the same corner default.
+  //
+  // Anthropometric reasoning for where the ears actually go, at this rig's own 0.3 torso-length
+  // scale: this is a side-on view with the bow arm reaching toward decreasing x (see the
+  // `raise`/`drawn` fixtures below: bow wrist sits at x=0.0, far from the body) and the draw hand
+  // coming back near the mouth at higher x — so the archer's face points toward LOW x, and the
+  // ears (back of the head) sit toward HIGH x, same side as the mouth but further out.
+  // - Horizontal (mouth-to-ear, tragus to lip corner): roughly 8-9cm on an adult, against a
+  //   roughly 45-50cm shoulder-to-hip torso -> ratio ~0.17-0.19. At this rig's 0.3 torso scale
+  //   that's an offset of ~0.05-0.06; used 0.06.
+  // - Vertical (tragus sits slightly above mouth level, not level with it): roughly 3-4cm on an
+  //   adult against the same ~45-50cm torso -> ratio ~0.07-0.08, i.e. ~0.02-0.025 at this scale;
+  //   used 0.025 (image y grows downward, so "above" is a SMALLER y).
+  // Both ears are placed at the SAME point: a true side-on profile projects the near and far ear
+  // to almost the same 2D position (the far one occluded behind the head, differing mainly in
+  // real-world visibility, which is a separate axis fixtures below override explicitly — e.g.
+  // drawEarOccluded/bothEarsOccluded — when they specifically need one ear hidden).
   const base = {
     9: { x: 0.5, y: 0.3 }, // mouth L
     10: { x: 0.5, y: 0.3 }, // mouth R
+    7: { x: 0.56, y: 0.275 }, // L_EAR — see anthropometric reasoning above
+    8: { x: 0.56, y: 0.275 }, // R_EAR — same point; a real side-on profile projects both ears together
     11: { x: 0.3, y: 0.3 }, // bow (left) shoulder
     12: { x: 0.5, y: 0.3 }, // draw (right) shoulder
     13: { x: 0.15, y: 0.3 }, // bow elbow — collinear with shoulder(0.3) and bow wrist(0.0) used by the "drawn"/"drifted"/mid-draw fixtures below: 180°, a genuinely straight arm
@@ -5506,10 +5572,21 @@ function selfTest() {
   // --- Drawing in progress: hands already apart and already near anchor (so anchor, arm, and
   // separation would all pass) but the draw wrist is still travelling fast between frames —
   // must be rejected by stillness alone, not because it never got close enough.
+  //
+  // midDraw2's wrist position was corrected this task (2026-08-24), same audit as base's ear fix
+  // above: it used to sit at (0.5, 0.32), directly below the mouth with zero component toward the
+  // (previously corner-default) ear axis, so once base got a real head this fixture's own
+  // anchorBackward went NEGATIVE — it would have failed the direction check that didn't exist when
+  // this fixture was written, silently turning "rejected by stillness alone" into "rejected by
+  // stillness AND direction", which breaks the isolation this test claims in its own comment above
+  // (a broken stillness check could then hide behind the direction check still failing, and this
+  // assertion would keep passing for the wrong reason). Moved to (0.56, 0.30) — toward the real
+  // draw ear, same side base's fix uses — so anchor/arm/separation all genuinely pass on their own
+  // and stillness is once again the only thing left to reject it.
   lastDrawWrist = null;
   const midDraw1 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.4, y: 0.31 } });
   isAtFullDraw(midDraw1, 0, true, NOOP_W, NOOP_H); // seeds lastDrawWrist; this call's own result isn't the point
-  const midDraw2 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.5, y: 0.32 } });
+  const midDraw2 = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.56, y: 0.3 } });
   const midScale = torsoLength(midDraw2, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
   const midAnchor = {
     x: (midDraw2[MOUTH_L].x + midDraw2[MOUTH_R].x) / 2,
@@ -5667,6 +5744,18 @@ function selfTest() {
       24: { x: 0.56, y: 0.6 }, // draw hip
       9: { x: 0.43, y: 0.3 }, // mouth — centred over the torso, near the head, far from either resting hand
       10: { x: 0.43, y: 0.3 },
+      // Ears — added in the same audit as `base`'s own ear fix above. This fixture doesn't spread
+      // `base`, so it had the identical corner-default gap: isAtFullDraw's ANCHOR DIRECTION check
+      // (see FULL_DRAW_ANCHOR_BACKWARD_MIN) would have silently measured off a (0,0) landmark if
+      // anything here ever isolated it. Currently harmless in practice — this fixture's own
+      // anchorDist is already ~1.0 (its whole point: the resting hand is nowhere near the mouth),
+      // so anchorOk fails on distance alone regardless of direction — but a real head costs nothing
+      // and means that stays true by the geometry, not by an unrelated gate hiding it. Same offset
+      // convention as `base` (~0.06 out, ~0.025 up from the mouth); this fixture has no strong
+      // facing direction of its own (arms hang straight down, not reaching for a bow), so both ears
+      // sit symmetrically either side of the mouth rather than both toward one side.
+      7: { x: 0.37, y: 0.275 }, // L_EAR
+      8: { x: 0.49, y: 0.275 }, // R_EAR
     });
     const restScale = torsoLength(restingArmsAtSides, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
     const restHandSep =
@@ -5806,8 +5895,18 @@ function selfTest() {
     // threshold (would have failed) but above the NEW, loosened 140° threshold (must now pass) —
     // while staying level enough to clear the cone easily. Owner's own field report: "sometimes i
     // shoot with my arm not 100% straight and the slight bend doesn't pass the trigger."
+    //
+    // FIXTURE BUG FOUND THIS TASK (2026-08-24), same audit as `base`'s ear fix and the mkLandmarks
+    // default-visibility fix above: this fixture never set a draw wrist (16) at all, so before
+    // mkLandmarks's untouched-landmark default was changed to invisible, isAtFullDraw's own
+    // initial visibility gate ([drawWrist, bowShoulder, bowElbow, bowWrist].every(visible)) was
+    // silently passing off the OLD corner-default (0,0, visibility:1) standing in for the draw
+    // wrist — this fixture was never actually exercising isAtFullDraw's arm checks at all until
+    // the default-visibility fix made that gate correctly reject it. Given a real draw wrist here,
+    // matching `drawn`'s own anchor position, so this is now a genuine full-draw pose with only
+    // the bow arm bent, same as the comment above always claimed it to be.
     lastDrawWrist = null;
-    const slightBend = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.4 } }); // bow wrist dropped; bow elbow stays at base's (0.15, 0.3)
+    const slightBend = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.4 }, 16: { x: 0.52, y: 0.31 } }); // bow wrist dropped; bow elbow stays at base's (0.15, 0.3); draw wrist at a real anchor position
     const slightBendAngle = angleAt(slightBend[L_SHOULDER], slightBend[L_ELBOW], slightBend[L_WRIST]);
     console.assert(
       slightBendAngle > FULL_DRAW_BOW_ARM_MIN && slightBendAngle < 150,
