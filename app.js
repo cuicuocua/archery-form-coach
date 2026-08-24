@@ -260,21 +260,45 @@ const CROP_BOX_STABLE_MAX_DELTA = 0.02; // the crop box's size AND position must
 // first place" are literally the same question, asked with opposite defaults baked into which
 // side of the boolean each caller trusts.
 //
-// GEOMETRY-FIX NOTE (see the PM's brief this was built from): ATTENTION_REST_HAND_SEP_MAX and
+// GEOMETRY-FIX NOTE (see the PM's brief this was built from): ATTENTION_REST_ARM_DOWN_MAX and
 // ATTENTION_REST_MOVE_MAX_PER_SEC are both torso-length-scaled distances, computed the exact same
-// Math.hypot(...)/torsoLength(...) way as DRAW_ATTEMPT_MIN_SEP and FULL_DRAW_STILL_MAX already
-// are elsewhere in this file — deliberately, so that when the in-progress fix to this app's
-// coordinate maths lands (MediaPipe's x/y are normalised to frame WIDTH/HEIGHT separately, not
-// one shared scale, so today's Euclidean distances are stretched on a non-square frame), these
-// two constants inherit the correction automatically through the shared torsoLength() function,
-// the same way DRAW_ATTEMPT_MIN_SEP will. They were NOT tuned against today's distorted numbers —
-// they're set relative to DRAW_ATTEMPT_MIN_SEP/FULL_DRAW_STILL_MAX's own existing values instead
+// .../torsoLength(...) way as DRAW_ATTEMPT_MIN_SEP and FULL_DRAW_STILL_MAX already are elsewhere
+// in this file — deliberately, so that when the in-progress fix to this app's coordinate maths
+// lands (MediaPipe's x/y are normalised to frame WIDTH/HEIGHT separately, not one shared scale,
+// so today's Euclidean distances are stretched on a non-square frame), these two constants
+// inherit the correction automatically through the shared torsoLength() function, the same way
+// DRAW_ATTEMPT_MIN_SEP will. They were NOT tuned against today's distorted numbers — they're set
+// relative to RAISE_TRIGGER_DOWN_FRACTION/FULL_DRAW_STILL_MAX's own existing values instead
 // (comfortably below/above them) specifically so they stay sensibly related after that fix, but
 // whoever does that retuning should still sanity-check these two alongside it.
 const ATTENTION_GATING_ENABLED = true; // master on/off switch. Set to false to go back to full-rate detection on every frame, exactly like before this feature existed — flip this first if the detector is ever suspected of causing trouble in the field. Structural safety net even while true: idle NEVER means "stopped detecting", only "detecting less often" (see the runtime block below) — so this switch changes cost, never correctness or recoverability
 const ATTENTION_IDLE_SAMPLE_INTERVAL_MS = 150; // while idle, pose detection still runs this often — this (plus one frame's own processing time) is the WORST-CASE delay between the owner actually starting a routine and the app noticing and returning to full rate. LOWER for a faster reaction (less battery/heat saved); RAISE for more battery/heat saved (slower reaction) — keep it well under SHOT_MIN_DURATION_MS (600ms) so a genuine draw can never start and finish inside one blind gap; see the selfTest assertion enforcing that relationship
 const ATTENTION_IDLE_AFTER_MS = 1500; // how long the calm condition below must hold, continuously, before the app allows itself to idle at all — a single calm-looking frame proves nothing (an archer pausing mid-routine for a second looks identical for one frame), so this requires a genuine held stretch of stillness, not just one lucky sample. RAISE to make the app more reluctant to idle (safer, more battery used); LOWER to idle sooner
-const ATTENTION_REST_HAND_SEP_MAX = 0.2; // hand separation (torso-length fraction) at/below which the hands count as "relaxed" for the calm check — deliberately well BELOW DRAW_ATTEMPT_MIN_SEP (0.3, the floor that starts a tracked attempt), so hands can never be resting by this measure's standard while also being in the middle of a real draw attempt; see the invariant assertion in selfTest. RAISE cautiously (never above DRAW_ATTEMPT_MIN_SEP) if ordinary at-rest hand position sits higher than expected; LOWER for a stricter definition of "relaxed"
+// ATTENTION_REST_ARM_DOWN_MAX replaces a field-tested-wrong hand-separation floor. The original
+// calm check required hand separation ≤ 0.2 (torso-lengths) to count as "relaxed" — but the
+// owner's own ?triggertest field report (see CLAUDE.md's ATTN entry) measured his real resting
+// hand separation at ~1.07, over five times that floor, so the calm condition could never fire at
+// all and the battery saving never engaged ("seems pointless" — his words). His own proposal,
+// which this implements: check that the bow arm is down instead of checking how far apart the
+// hands are. bowArmRaiseHeight (torso-length fraction of the bow wrist's height above/below the
+// bow shoulder — 0 is shoulder height, negative is below) is the exact signal RAISE_TRIGGER_UP_
+// FRACTION/RAISE_TRIGGER_DOWN_FRACTION already build the RAISE trigger on, and RAISE was the one
+// trigger the owner reported as working correctly — reusing a proven signal instead of inventing
+// a second one. At or below this value counts as "hanging down, resting" for the calm check.
+// Deliberately well BELOW RAISE_TRIGGER_DOWN_FRACTION (-0.3, the point the raise trigger itself
+// merely considers "cleared" — not the same claim as "resting"), so the arm cannot read as calm
+// by this measure's own standard anywhere inside the raise trigger's own hysteresis band, let
+// alone while actually raising or drawing. IMPORTANT DIFFERENCE from the hand-separation constant
+// it replaces: that one had a clean, asserted numeric relationship to DRAW_ATTEMPT_MIN_SEP (same
+// metric, same units — hand separation), which made "an in-progress attempt can never read as
+// calm" true by construction. Arm elevation and hand separation are different axes of the body,
+// so no such inequality between constants exists here, and none is asserted — the "in-progress
+// attempt never idles" guarantee now rests ENTIRELY on the explicit hard rule in
+// updateAttentionState (see that function's own comment), proven directly by its own selfTest
+// assertion rather than inferred from a numeric relationship. RAISE (stricter, idles less often)
+// if ordinary standing ever reads above this; LOWER (idles more readily) if the owner's real
+// resting arm position sits comfortably below it and battery saving should engage sooner.
+const ATTENTION_REST_ARM_DOWN_MAX = -0.6;
 const ATTENTION_REST_MOVE_MAX_PER_SEC = 0.5; // how fast the body's reference point (hip midpoint, see bodyReferencePoint) may drift, in torso-lengths per second, and still count as "not walking/stepping". Ordinary standing sway is a small fraction of this; a real step or a walk toward/away from the line covers far more than a torso-length in a second. RAISE if ordinary standing sway is ever mistaken for movement (blocks idling, safe but wastes battery); LOWER if genuine walking is ever mistaken for standing still (also safe on its own — it only delays idling — but defeats the point of this feature if it happens often)
 // ===========================================================================
 
@@ -551,7 +575,7 @@ let debugRaiseHeight = null;
 // them a second time, purely for display, with a snapshot of the previous-frame state taken
 // before updateAttentionState overwrites it. Never read by anything except the trigger-test panel.
 let debugAttnCalm = null; // the calm/not-calm verdict attentionIsClearlyCalm reached this frame
-let debugAttnHandSep = null; // hand separation as ATTN sees it (handSeparationForAttention) — a different formula from the SEP gate's own handSep, see ATTENTION_REST_HAND_SEP_MAX's own comment
+let debugAttnArmHeight = null; // bow-arm elevation as ATTN sees it (bowArmRaiseHeight) — see ATTENTION_REST_ARM_DOWN_MAX's own comment
 let debugAttnSpeed = null; // body-reference-point drift speed, torso-lengths/second, as ATTN sees it
 // Whether the crop box used THIS frame was stable (see cropBoxIsStable) — captured in renderLoop
 // right where that's already computed for frameEligible, so the panel can show it as its own
@@ -1135,17 +1159,22 @@ function bodyReferencePoint(landmarks) {
 // the constants block's own comment for why sharing it is the whole point). Pure — no module
 // state read or written — so selfTest can drive it directly with fixture landmarks. Returns
 // whether THIS ONE sample looks clearly calm: no landmarks at all (nobody there to be shooting —
-// unambiguous), or landmarks present with both hands confidently relaxed together AND (when
-// there's a previous sample to compare against) the body not stepping/walking. Anything else —
-// a wrist not visible, no usable scale, hands apart, or the body moving — returns false. This is
-// deliberately NOT symmetric with "is a draw happening": it only ever answers "is there positive
-// proof of calm", which is exactly the bar fail-toward-recording needs on both ends (see
-// updateAttentionState): allowing idle requires this to be true; staying idle requires it to
-// keep being true; anything else, on either end, defaults toward engaged.
+// unambiguous), or landmarks present with the bow arm confidently hanging down AND (when there's
+// a previous sample to compare against) the body not stepping/walking. Anything else — the bow
+// shoulder/wrist not visible, no usable torso scale, the arm raised or mid-raise, or the body
+// moving — returns false. This is deliberately NOT symmetric with "is a draw happening": it only
+// ever answers "is there positive proof of calm", which is exactly the bar fail-toward-recording
+// needs on both ends (see updateAttentionState): allowing idle requires this to be true; staying
+// idle requires it to keep being true; anything else, on either end, defaults toward engaged.
+//
+// Built on bowArmRaiseHeight (see ATTENTION_REST_ARM_DOWN_MAX's own comment) rather than hand
+// separation, which this replaces: the owner's own field measurement showed his resting hand
+// separation never comes close to a "relaxed" floor, so that check could never fire. Arm
+// elevation is the one signal the owner independently confirmed works (RAISE).
 function attentionIsClearlyCalm(landmarks, prevRef, dtSec, frameWidth, frameHeight) {
   if (!landmarks) return true;
-  const handSep = handSeparationForAttention(landmarks, frameWidth, frameHeight);
-  if (handSep === null || handSep > ATTENTION_REST_HAND_SEP_MAX) return false;
+  const armHeight = bowArmRaiseHeight(landmarks, frameWidth, frameHeight);
+  if (armHeight === null || armHeight > ATTENTION_REST_ARM_DOWN_MAX) return false;
   const ref = bodyReferencePoint(landmarks);
   if (ref && prevRef && dtSec > 0) {
     const scale = attentionScale(landmarks, frameWidth, frameHeight);
@@ -1211,12 +1240,21 @@ function updateAttentionState(nowMs, landmarks, frameWidth, frameHeight, gatingE
   attentionLastEvalMs = nowMs;
 
   // Hard rule, checked first, that nothing below is allowed to override: an attempt in progress
-  // must never see the pipeline idle out from under it. In practice this can never actually fire
-  // — ATTENTION_REST_HAND_SEP_MAX sits below DRAW_ATTEMPT_MIN_SEP by construction (see that
-  // constant's own comment and the invariant selfTest checks), so hands cannot be "calm" by this
-  // function's own standard while an attempt is open — but it stays here, explicit, as a second
-  // independent guarantee that doesn't rely on remembering that numeric relationship correctly
-  // forever, and it also documents the intent directly rather than leaving it implicit.
+  // must never see the pipeline idle out from under it. THIS IS NOW THE ONLY GUARANTEE OF THAT —
+  // read this carefully before touching either the calm check or trackShotAttempt's
+  // attempt-opening conditions. The calm check used to be built on hand separation, the exact
+  // same metric (and units) DRAW_ATTEMPT_MIN_SEP gates attempt-opening on, so a numeric inequality
+  // between the two constants (ATTENTION_REST_HAND_SEP_MAX < DRAW_ATTEMPT_MIN_SEP, asserted in
+  // selfTest) made "an open attempt can never read calm" true by construction. The calm check is
+  // now built on bowArmRaiseHeight (see ATTENTION_REST_ARM_DOWN_MAX's own comment) — a different
+  // axis of the body from hand separation, with no equivalent numeric relationship to
+  // DRAW_ATTEMPT_MIN_SEP or any other attempt-opening threshold. A real draw (or a landmark
+  // artifact that looks like one) could in principle cross DRAW_ATTEMPT_MIN_SEP on hand
+  // separation alone without the bow arm's elevation changing — so nothing here rules that out by
+  // construction any more. This explicit check is what closes that gap: it reads `attempt`
+  // directly, ignoring the calm verdict entirely, so the guarantee holds regardless of what the
+  // calm check measures. Proven directly (not inferred) by its own selfTest assertion, which
+  // feeds this branch CALM-looking landmarks on purpose and confirms engaged wins anyway.
   if (attempt) {
     attentionCalmSinceMs = null;
     attentionEngaged = true;
@@ -4164,7 +4202,7 @@ function syncDebugOverlay(nowMs, landmarks, frameWidth, frameHeight) {
 //
 // READ-ONLY, same discipline as ?debug: every number on this panel is read straight off state the
 // real detection pipeline already computed this frame (debugInfo, raiseArmed, attempt,
-// settledFrames, lastCropBoxStable, lastPoseSeen, attentionEngaged, debugAttnCalm/HandSep/Speed —
+// settledFrames, lastCropBoxStable, lastPoseSeen, attentionEngaged, debugAttnCalm/ArmHeight/Speed —
 // see those variables' own declarations for the handful of places TRIGGERTEST had to join DEBUG
 // to populate them, and the ATTN block in renderLoop for why attentionIsClearlyCalm could just be
 // called a second time instead). Nothing here computes a NEW measurement or reimplements any
@@ -4630,10 +4668,16 @@ const TRIGGER_DEFS = [
     id: "attn",
     label: "ATTN",
     sentence: "Is the app currently watching you at full speed — rather than idling to save battery between shots?",
-    doThis: "Move — raise your arm, separate your hands, or just walk around — to light this (engaged). Stand completely relaxed and still for about a second and a half to let it go dark (idle). Nothing ever stops the app watching for good; idle just means it checks less often.",
+    doThis: "Raise your bow arm, or just walk around, to light this (engaged). Let your bow arm hang all the way down and stand still for about a second and a half to let it go dark (idle). Nothing ever stops the app watching for good; idle just means it checks less often.",
     note: null,
     read(landmarks) {
-      const { bowWrist, drawWrist } = triggerTestRoleLabels();
+      const { bowWrist, bowShoulder, bowHip } = triggerTestRoleLabels();
+      // How long the CURRENT calm streak has held, straight off the real module state
+      // (attentionCalmSinceMs/attentionEngaged) that updateAttentionState itself maintains — not a
+      // separate display-only copy, so this can never drift out of sync with the real decision.
+      // Only meaningful while engaged and mid-streak; null (shown as "—") otherwise.
+      const calmHeldMs =
+        attentionEngaged && attentionCalmSinceMs != null ? performance.now() - attentionCalmSinceMs : null;
       return {
         lamp: attentionEngaged,
         rows: [
@@ -4644,10 +4688,20 @@ const TRIGGER_DEFS = [
             ok: debugAttnCalm,
           },
           {
-            label: "Hand separation",
-            value: `${ttFmt(debugAttnHandSep)} × torso`,
-            threshold: `needs ≤ ${ATTENTION_REST_HAND_SEP_MAX} to count as relaxed`,
-            ok: debugAttnHandSep == null ? null : debugAttnHandSep <= ATTENTION_REST_HAND_SEP_MAX,
+            label: "Calm held",
+            value: !attentionEngaged
+              ? "already idle — battery saving active"
+              : calmHeldMs == null
+                ? "not currently calm"
+                : `${(calmHeldMs / 1000).toFixed(1)}s / ${(ATTENTION_IDLE_AFTER_MS / 1000).toFixed(1)}s needed`,
+            threshold: "",
+            ok: null, // informational progress, not a pass/fail gate on its own — the lamp is the verdict
+          },
+          {
+            label: "Bow arm height",
+            value: `${ttFmt(debugAttnArmHeight)} × torso above shoulder`,
+            threshold: `needs ≤ ${ATTENTION_REST_ARM_DOWN_MAX} to count as hanging down`,
+            ok: debugAttnArmHeight == null ? null : debugAttnArmHeight <= ATTENTION_REST_ARM_DOWN_MAX,
           },
           {
             label: "Body movement",
@@ -4657,8 +4711,9 @@ const TRIGGER_DEFS = [
           },
         ],
         inputs: [
+          ttInputRow(landmarks, bowShoulder, "bow shoulder"),
           ttInputRow(landmarks, bowWrist, "bow wrist"),
-          ttInputRow(landmarks, drawWrist, "draw wrist"),
+          ttInputRow(landmarks, bowHip, "bow hip — torso scale"),
           ttInputRow(landmarks, L_HIP, "left hip — body reference point"),
           ttInputRow(landmarks, R_HIP, "right hip — body reference point"),
         ],
@@ -5088,7 +5143,7 @@ function renderLoop() {
   if (TRIGGERTEST) {
     const ttDtSec = ttPrevAttnEvalMs === null ? 0 : (now - ttPrevAttnEvalMs) / 1000;
     debugAttnCalm = attentionIsClearlyCalm(rawLandmarks, ttPrevAttnRef, ttDtSec, frameWidth, frameHeight);
-    debugAttnHandSep = rawLandmarks ? handSeparationForAttention(rawLandmarks, frameWidth, frameHeight) : null;
+    debugAttnArmHeight = rawLandmarks ? bowArmRaiseHeight(rawLandmarks, frameWidth, frameHeight) : null;
     const ttRef = rawLandmarks ? bodyReferencePoint(rawLandmarks) : null;
     const ttScale = rawLandmarks ? attentionScale(rawLandmarks, frameWidth, frameHeight) : null;
     if (ttRef && ttPrevAttnRef && ttDtSec > 0 && ttScale) {
@@ -6083,12 +6138,12 @@ function selfTest() {
     attentionPrevRef = null;
     attentionLastEvalMs = null;
     attempt = null;
-    const calmFixture = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.58 }, 16: { x: 0.32, y: 0.58 } }); // hands relaxed together, well under ATTENTION_REST_HAND_SEP_MAX
+    const calmFixture = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.7 } }); // bow wrist well below the bow shoulder (height (0.3-0.7)/0.3 = -1.33) — comfortably past ATTENTION_REST_ARM_DOWN_MAX (-0.6), a genuinely hanging arm
     updateAttentionState(0, calmFixture, NOOP_W, NOOP_H, true, true);
     console.assert(ttById.attn.read(calmFixture).lamp === true, "ATTN must still read lit (engaged) on the very first calm sample — one sample is never enough to idle");
     updateAttentionState(ATTENTION_IDLE_AFTER_MS + 1, calmFixture, NOOP_W, NOOP_H, true, true);
     console.assert(ttById.attn.read(calmFixture).lamp === false, "ATTN must read dark (idle) once the calm condition has held continuously for ATTENTION_IDLE_AFTER_MS");
-    const movingFixture = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } }); // hands apart — not calm
+    const movingFixture = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } }); // bow arm raised out to the side (height 0, well above ATTENTION_REST_ARM_DOWN_MAX) — not calm
     updateAttentionState(ATTENTION_IDLE_AFTER_MS + 100, movingFixture, NOOP_W, NOOP_H, true, true);
     console.assert(ttById.attn.read(movingFixture).lamp === true, "ATTN must read lit (engaged) again the instant a single sample stops being calm — no confirmation delay");
   }
@@ -7973,8 +8028,7 @@ function selfTest() {
   {
     const restLandmarks = mkLandmarks({
       ...base,
-      15: { x: 0.4, y: 0.3 }, // bow wrist
-      16: { x: 0.42, y: 0.3 }, // draw wrist, right next to it — hands relaxed together
+      15: { x: 0.3, y: 0.7 }, // bow wrist — height (0.3-0.7)/0.3 = -1.33, well below ATTENTION_REST_ARM_DOWN_MAX (-0.6): arm genuinely hanging down
     });
     console.assert(
       attentionIsClearlyCalm(null, null, 0, NOOP_W, NOOP_H) === true,
@@ -7982,19 +8036,19 @@ function selfTest() {
     );
     console.assert(
       attentionIsClearlyCalm(restLandmarks, null, 0, NOOP_W, NOOP_H) === true,
-      "relaxed hands, with no previous reference point to judge stillness against yet, should read as clearly calm"
+      "bow arm hanging down, with no previous reference point to judge stillness against yet, should read as clearly calm"
     );
 
     const drawnLandmarks = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
     console.assert(
       attentionIsClearlyCalm(drawnLandmarks, null, 0, NOOP_W, NOOP_H) === false,
-      "hands far apart (a real draw) must never read as clearly calm"
+      "bow arm extended out at shoulder height (a real draw) must never read as clearly calm"
     );
 
-    const noWristLandmarks = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3, visibility: 0 }, 16: { x: 0.42, y: 0.3 } });
+    const noWristLandmarks = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.7, visibility: 0 } });
     console.assert(
       attentionIsClearlyCalm(noWristLandmarks, null, 0, NOOP_W, NOOP_H) === false,
-      "an invisible wrist can't confirm the hands are relaxed — must not read as clearly calm"
+      "an invisible bow wrist can't confirm the arm is down — must not read as clearly calm"
     );
 
     const calmRef = bodyReferencePoint(restLandmarks);
@@ -8005,15 +8059,18 @@ function selfTest() {
     const farRef = { x: calmRef.x + 1, y: calmRef.y }; // ~3+ torso-lengths of drift in one second — unmistakably walking
     console.assert(
       attentionIsClearlyCalm(restLandmarks, farRef, 1, NOOP_W, NOOP_H) === false,
-      "a body reference point that moved far in one second (walking) must not read as clearly calm, even with relaxed hands"
+      "a body reference point that moved far in one second (walking) must not read as clearly calm, even with the bow arm down"
     );
 
-    // Numeric invariants the state machine's hard rule and structural safety depend on — see
-    // updateAttentionState's own comments for what each protects.
-    console.assert(
-      ATTENTION_REST_HAND_SEP_MAX < DRAW_ATTEMPT_MIN_SEP,
-      "ATTENTION_REST_HAND_SEP_MAX must stay below DRAW_ATTEMPT_MIN_SEP, or a real in-progress attempt could read as 'calm' and be allowed to idle"
-    );
+    // NO numeric invariant lives here any more (there used to be one: ATTENTION_REST_HAND_SEP_MAX
+    // < DRAW_ATTEMPT_MIN_SEP, both hand-separation constants in the same units, which made "an
+    // open attempt can never read calm" true by construction). The calm check is now built on
+    // bowArmRaiseHeight — a different axis of the body from hand separation, with no equivalent
+    // relationship to DRAW_ATTEMPT_MIN_SEP or any other attempt-opening threshold to assert. See
+    // ATTENTION_REST_ARM_DOWN_MAX's own comment and the hard-rule comment in updateAttentionState
+    // for the full reasoning; the "Hard rule" block further down is what proves the guarantee now
+    // holds, by exercising updateAttentionState's explicit `if (attempt)` check directly rather
+    // than inferring it from a numeric relationship between constants.
     console.assert(
       ATTENTION_IDLE_SAMPLE_INTERVAL_MS < SHOT_MIN_DURATION_MS,
       "ATTENTION_IDLE_SAMPLE_INTERVAL_MS must stay below SHOT_MIN_DURATION_MS — otherwise a genuine draw could start and finish entirely inside a single blind idle-sampling gap and never be noticed by any sample at all"
@@ -8085,17 +8142,24 @@ function selfTest() {
       console.assert(attentionEngaged === true, `cycle ${cycle}: the very next not-calm sample must engage — no latch-off, ever`);
     }
 
-    // --- Fail toward recording: a genuinely AMBIGUOUS movement — hands apart enough not to be
-    // relaxed, but nowhere near a real draw attempt (DRAW_ATTEMPT_MIN_SEP) — is exactly the kind
-    // of thing nocking, adjusting a release aid, or turning partway could look like. It must
-    // still engage, never idle through it: "treated as shooting, not discarded."
-    const ambiguousLm = mkLandmarks({ ...base, 15: { x: 0.4, y: 0.3 }, 16: { x: 0.48, y: 0.32 } });
-    // Computed via the real production function (not a hand-rolled reimplementation) so this
-    // check can never drift out of sync with what attentionIsClearlyCalm itself actually measures.
+    // --- Fail toward recording: a genuinely AMBIGUOUS bow-arm position — partly lifted, neither
+    // hanging down nor raised as far as the RAISE trigger's own threshold — is exactly the kind of
+    // thing nocking, adjusting a release aid, or lifting the bow slightly could look like. Hands
+    // stay together (small separation, well under DRAW_ATTEMPT_MIN_SEP) so this isn't ALSO a real
+    // draw attempt by that separate signal — the only thing making it "ambiguous" is the arm
+    // height. It must still engage, never idle through it: "treated as shooting, not discarded."
+    const ambiguousLm = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.39 }, 16: { x: 0.32, y: 0.39 } });
+    // Computed via the real production functions (not a hand-rolled reimplementation) so these
+    // checks can never drift out of sync with what attentionIsClearlyCalm itself actually measures.
+    const ambigArmHeight = bowArmRaiseHeight(ambiguousLm, NOOP_W, NOOP_H);
+    console.assert(
+      ambigArmHeight > ATTENTION_REST_ARM_DOWN_MAX && ambigArmHeight < RAISE_TRIGGER_UP_FRACTION,
+      "the ambiguous fixture's arm height should sit strictly between 'hanging down' and the raise trigger's own threshold, or this isn't testing the ambiguous case at all"
+    );
     const ambigHandSep = handSeparationForAttention(ambiguousLm, NOOP_W, NOOP_H);
     console.assert(
-      ambigHandSep > ATTENTION_REST_HAND_SEP_MAX && ambigHandSep < DRAW_ATTEMPT_MIN_SEP,
-      "the ambiguous fixture should sit strictly between 'clearly relaxed' and 'a real draw attempt', or this isn't testing the ambiguous case at all"
+      ambigHandSep < DRAW_ATTEMPT_MIN_SEP,
+      "the ambiguous fixture's hands should stay well short of a real draw attempt, so arm height alone is what's under test here"
     );
     attentionEngaged = true;
     attentionCalmSinceMs = null;
@@ -8129,9 +8193,12 @@ function selfTest() {
     console.assert(attentionLateWakeCount === 1, "waking up on a sample where hands are already past DRAW_ATTEMPT_MIN_SEP should count as exactly one late wake");
 
     // --- Hard rule: an attempt in progress must never be allowed to idle, no matter what a
-    // single sample looks like. Can't actually happen given the ATTENTION_REST_HAND_SEP_MAX <
-    // DRAW_ATTEMPT_MIN_SEP invariant above, but this is the explicit, defensive guarantee, not
-    // one relying on remembering that numeric relationship forever.
+    // single sample looks like. THIS IS NOW THE ONLY THING THAT PROVES THAT — see
+    // updateAttentionState's own comment on the `if (attempt)` branch. There is no longer a
+    // numeric invariant between constants backing this up (the calm check no longer shares hand
+    // separation's units with DRAW_ATTEMPT_MIN_SEP), so this test earns its keep for real: it
+    // feeds CALM-looking landmarks (calmLm — bow arm hanging down, per the fixture above) while an
+    // attempt is open and confirms engagement wins anyway, purely from `attempt` being truthy.
     attentionEngaged = true;
     attentionCalmSinceMs = null;
     attempt = { startMs: 0, peakHandSep: 0.5, eligibleFrames: [], eligibleSeen: 0, reachedFullDraw: false };
