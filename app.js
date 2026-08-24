@@ -20,7 +20,31 @@ const DRAW_ELBOW_ALIGN_MAX_DEVIATION = 8; // degrees the draw elbow may sit off 
 // recurve archer anchors differently (fingers under the chin, not a release hand near the jaw)
 // and can't hold nearly as steady (no let-off, fighting full poundage the whole time).
 const FULL_DRAW_ANCHOR_MAX = 0.3; // draw-hand wrist must be this close to the mouth/nose, as a fraction of torso length, to count as "at anchor". MEASURED, not guessed: the owner read 0.24 at his own real anchor on 2026-08-24 using the ?triggertest inspector, and this leaves ~25% headroom over that. Was 0.45, which he reported as firing "even when i'm nowhere near my mouth" — 0.45 is a radius of roughly 22cm on a typical torso, out past the cheek. The old value was loose ON PURPOSE, on the assumption that hand separation did the real discriminating and this only filtered out the grossly wrong; that assumption is now dead (see the hand-separation Key decision in CLAUDE.md — SEP fires on a resting body, as does ARM), so this gate has to carry weight it was never sized for. Tightening here fails toward a MISLABELLED row, not a lost arrow: anchorOk feeds reachedFullDraw, never whether an attempt is logged, so a draw that misses this still appears in the log marked short of full draw
-const FULL_DRAW_BOW_ARM_MIN = 150; // degrees; bow arm must be at least this straight to count as "drawn" (looser than the good-form target above — full draw should still be detected on so-so form)
+
+// ANCHOR is a DISTANCE only — a circle around the mouth — which accepts anatomically impossible
+// positions along with real ones (in front of the mouth, above the nose). Owner, 2026-08-24: "i
+// cannot anchor ahead of my mouth. it'll always be below or slightly backwards." These two add
+// DIRECTION on top of FULL_DRAW_ANCHOR_MAX's existing distance gate — they never replace it, and
+// FULL_DRAW_ANCHOR_MAX itself is untouched (it's the one constant in this file measured off a real
+// reading; changing it needs a new reading, not a desk decision). Both below are UNMEASURED
+// PLACEHOLDERS, defaulted permissively on purpose (same discipline as every other new constant in
+// this block) so neither can reject a real anchor before the owner has read his own numbers off
+// the ?triggertest ANCHOR screen — the same loop that produced FULL_DRAW_ANCHOR_MAX's own value.
+const FULL_DRAW_ANCHOR_ABOVE_MAX = 0.25; // fraction of torso length the draw wrist may sit ABOVE the anchor point (mouth-midpoint, or nose if the mouth isn't visible) and still pass — image y grows downward, so this bounds how far UP is still plausible, which is the "above the nose" failure mode reported. Deliberately generous: real mouth-to-nose distance is roughly 0.05-0.1 torso-lengths, so 0.25 only rules out the grossly-too-high cases, not anything close to a real anchor. No corresponding "how far below" limit exists — dropping low is never anatomically wrong for a release-aid hand near the jaw, only "too far above" is
+const FULL_DRAW_ANCHOR_BACKWARD_MIN = -0.1; // the draw wrist's position along the anchor-point→draw-ear axis, in torso-lengths (see isAtFullDraw's own comment for why the draw-side ear, not the shoulder line, defines "backwards" here) — positive means toward the ear (backwards, as the owner described), negative means toward the front of the face. A true anchor should read at or above 0; permissively allowed slightly negative for now, since the exact position of "the mouth" this measures from has its own slop and an unmeasured threshold shouldn't reject a real anchor over it
+const FULL_DRAW_BOW_ARM_MIN = 140; // degrees; bow arm must be at least this straight to count as "drawn". Was 150 — loosened 2026-08-24 after the owner reported "sometimes i shoot with my arm not 100% straight and the slight bend doesn't pass the trigger." Not a measurement, a deliberate response to a false-reject field report: the new ARM CONE check below (FULL_DRAW_ARM_CONE_APERTURE_DEG) now shares the job of ruling out "arm isn't really extended toward the shot" that straightness alone used to carry by itself, so straightness itself can afford to be laxer
+// ARM CONE — owner, 2026-08-24, replacing an earlier "reuse the raise-height signal" instruction
+// with his own better one: "create a cone in front of my shoulder joint and check for the arm to
+// be placed there and extended rather than only extended." An arm can be perfectly straight
+// (passing FULL_DRAW_BOW_ARM_MIN) while hanging at the archer's side — armOk never checked WHERE
+// the straight arm pointed. This constant is the cone's aperture; see bowArmElevationOf's own
+// comment for why the cone's axis is horizontal ELEVATION rather than an attempted 3D "in front of
+// the body" direction. UNMEASURED PLACEHOLDER, defaulted permissively (wide) — 45° comfortably
+// passes ordinary shooting form (a drawn bow arm sits close to horizontal) while still failing an
+// arm hanging at the side (~90° off horizontal) outright, which is the one case this exists to
+// catch. Read the live elevation angle off the ?triggertest ARM screen to tighten this once real
+// numbers exist, same loop as every other constant in this block.
+const FULL_DRAW_ARM_CONE_APERTURE_DEG = 45;
 const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. THE key signal: a compound's draw length is fixed by a mechanical stop, so this is near-binary (mid-raise vs. hard against the wall) and can be set with confidence
 const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one
 const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
@@ -473,8 +497,17 @@ function emptyDebugInfo(reason) {
     reason,
     handSep: null, sepOk: null,
     anchorDist: null, anchorOk: null,
-    bowArmAngle: null, armOk: null,
+    anchorVerticalOffset: null, anchorVerticalOk: null,
+    anchorBackward: null, anchorBackwardOk: null,
+    bowArmAngle: null, armStraightOk: null,
+    armElevation: null, armConeOk: null, armOk: null,
     speed: null, stillOk: null,
+    // Pixel-space points/scale, filled in only on a frame that got all the way through — used
+    // exclusively by drawTriggerTestOverlay to draw the acceptance regions on top of the camera
+    // picture without recomputing any geometry a second time (see that function's own comment).
+    // Never read by any detection/gating/measurement code, same as the rest of this object.
+    anchorPx: null, drawWristPx: null, bowWristPx: null, bowShoulderPx: null,
+    anchorEarPx: null, scale: null,
   };
 }
 
@@ -1519,6 +1552,54 @@ function updateRaiseTrigger(landmarks, frameWidth, frameHeight, nowMs = performa
 }
 // ===========================================================================
 
+// ===== ARM CONE — see FULL_DRAW_ARM_CONE_APERTURE_DEG's own comment for the field report this
+// exists to fix (a bow arm hanging straight at the archer's side passes plain straightness).
+//
+// The cone's axis is horizontal ELEVATION (the bow shoulder→wrist line's angle off horizontal),
+// not an attempted 3D "pointing in front of the body" direction — a single camera's 2D projection
+// cannot recover that reliably, and picking the wrong axis produces a check that works from one
+// camera position and silently fails from another. CLAUDE.md already records that exact class of
+// bug twice (the aspect-ratio distortion toPixelSpace fixes, and hand separation collapsing from
+// 1.571 to 0.247 under pure body rotation). Elevation avoids it on three counts: it's measured
+// against gravity (the image's y-axis), so it doesn't depend on which way the archer faces, the
+// mirror toggle, or the handedness toggle — the three things that have broken directional logic in
+// this file before; it kills the reported failure mode directly (an arm hanging at the side reads
+// ~90° off horizontal, nowhere near a realistic aperture); and it needs no shoulder-line reference,
+// which CLAUDE.md separately records as nearly degenerate in this app's side-on framing (the same
+// reason drawElbowAlignmentOf was written to avoid it).
+//
+// dx is folded through Math.abs() specifically so this reads the same magnitude whether the bow
+// arm extends to the camera's left or right — which side depends only on facing direction and the
+// mirror toggle, neither of which may move a measured number (see CLAUDE.md's mirroring Key
+// decision: mirroring never touches a landmark coordinate). Positive = wrist above shoulder,
+// negative = below, 0 = level — ordinary atan2 sign convention flipped once for image y growing
+// downward.
+//
+// DELIBERATELY NOT IMPLEMENTED: a horizontal half of the cone (front-of-body vs. behind-the-back),
+// which the owner's own phrasing ("in front of my shoulder") and instructions explicitly allowed
+// for IF it could be made reliable. The only candidate reference for "which way is forward" in a
+// single 2D frame is the shoulder-to-shoulder line — exactly the reference CLAUDE.md already
+// documents as nearly degenerate in this app's side-on framing (both shoulders project close
+// together in x). Building the horizontal half on that reference would reintroduce the same
+// unreliable-axis problem elevation was chosen specifically to avoid, so it's left out rather than
+// shipped silently wrong. Elevation alone still catches the reported case (arm at the side) outright.
+//
+// Uses toPixelSpace (see that function's own comment) so this is computed in a physically honest
+// space — an aspect-ratio-distorted frame would report a false angle here exactly like it once did
+// for bowArmAngleOf, before that fix. Never guesses: null if the bow shoulder or bow wrist isn't
+// confidently visible, same convention as bowArmRaiseHeight just above.
+function bowArmElevationOf(landmarks, frameWidth, frameHeight) {
+  const bowShoulder = rightHanded ? L_SHOULDER : R_SHOULDER;
+  const bowWrist = rightHanded ? L_WRIST : R_WRIST;
+  if (!visible(landmarks, bowShoulder) || !visible(landmarks, bowWrist)) return null;
+  const shoulder = toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight);
+  const wrist = toPixelSpace(landmarks[bowWrist], frameWidth, frameHeight);
+  const dx = wrist.x - shoulder.x;
+  const dy = wrist.y - shoulder.y;
+  return -(Math.atan2(dy, Math.abs(dx)) * 180) / Math.PI;
+}
+// ===========================================================================
+
 // Shoulder drop for one shoulder: the vertical gap between that shoulder and its ear,
 // normalised by torso length and given as a percentage — bigger number = shoulder sits
 // further from the ear = more dropped, which is what "dropping my shoulders more" means.
@@ -2034,6 +2115,55 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const anchorDist = Math.hypot(wrist.x - anchor.x, wrist.y - anchor.y) / scale;
   const handSep = Math.hypot(wrist.x - bowWristPos.x, wrist.y - bowWristPos.y) / scale;
 
+  // ANCHOR DIRECTION — see FULL_DRAW_ANCHOR_ABOVE_MAX/FULL_DRAW_ANCHOR_BACKWARD_MIN's own comments
+  // for why a plain distance circle isn't enough. Both measured from the SAME anchor point
+  // anchorDist already uses (mouth-midpoint, or nose if the mouth isn't visible), not a second,
+  // possibly-disagreeing reference — so "how far" and "which direction" are always talking about
+  // the same point.
+  //
+  // Vertical: image y grows downward, so a wrist ABOVE the anchor has a SMALLER y — hence
+  // wrist.y - anchor.y (positive = below, negative = above), the same sign convention
+  // bowArmRaiseHeight already uses for shoulder/wrist. Needs only the anchor point and the draw
+  // wrist, both already confirmed above — never unmeasurable once anchorDist itself is.
+  const anchorVerticalOffset = (wrist.y - anchor.y) / scale;
+  const anchorVerticalOk = anchorVerticalOffset >= -FULL_DRAW_ANCHOR_ABOVE_MAX;
+
+  // Backward: "behind the mouth, toward the draw side" has no meaning without a body-relative
+  // axis, and the shoulder line is nearly degenerate in this app's side-on framing (see CLAUDE.md
+  // — the same reason drawElbowAlignmentOf avoids it) so it cannot supply one safely. The
+  // anchor-point→draw-ear vector can: it's a real, local direction on the head itself, present in
+  // every frame the anchor check already needs the head confidently visible for.
+  //
+  // Prefer the draw-side ear (physically where a release-aid hand ends up, so it best captures
+  // "backwards" from the owner's perspective); fall back to the bow-side ear if the draw-side one
+  // is occluded — a side-on archer often has one ear or the other hidden from the camera, and the
+  // same "own side preferred, other side as fallback" convention already used by
+  // shoulderDropOf's ear lookup applies here for the same reason (running off whichever ear IS
+  // visible beats not running at all). If NEITHER ear is confidently visible, this cannot be
+  // measured at all — never guess a direction from a landmark that isn't there: anchorBackwardOk
+  // stays null (not true), so the combined anchorOk below cannot pass on an unconfirmed direction.
+  const drawEar = rightHanded ? R_EAR : L_EAR;
+  const bowEarForAnchor = rightHanded ? L_EAR : R_EAR;
+  const anchorEarIdx = visible(landmarks, drawEar) ? drawEar : visible(landmarks, bowEarForAnchor) ? bowEarForAnchor : null;
+  let anchorBackward = null, anchorBackwardOk = null, anchorEarPx = null;
+  if (anchorEarIdx !== null) {
+    const ear = toPixelSpace(landmarks[anchorEarIdx], frameWidth, frameHeight);
+    anchorEarPx = ear;
+    const axisX = ear.x - anchor.x, axisY = ear.y - anchor.y;
+    const axisLen = Math.hypot(axisX, axisY);
+    if (axisLen > 0) {
+      // Signed component of the anchor->wrist vector along the anchor->ear axis, normalised to
+      // the same torso-length units anchorDist/handSep already use — positive means toward the
+      // ear (backwards), negative means toward the front of the face.
+      const wristVecX = wrist.x - anchor.x, wristVecY = wrist.y - anchor.y;
+      anchorBackward = (wristVecX * axisX + wristVecY * axisY) / axisLen / scale;
+      anchorBackwardOk = anchorBackward >= FULL_DRAW_ANCHOR_BACKWARD_MIN;
+    }
+  }
+
+  const anchorDistOk = anchorDist <= FULL_DRAW_ANCHOR_MAX;
+  const anchorOk = anchorDistOk && anchorVerticalOk && anchorBackwardOk === true;
+
   const bowArmAngle = bowArmAngleOf(landmarks, frameWidth, frameHeight);
   if (bowArmAngle === null) {
     // handSep is already known at this point (computed above) even though the bow arm's own
@@ -2042,6 +2172,15 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
     trackShotAttempt({ handSep, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
+
+  // ARM CONE — see bowArmElevationOf's own comment for the geometry and why elevation (not a 3D
+  // "in front of the body" direction) is what's measured. Only the shoulder/wrist visibility
+  // bowArmElevationOf checks for itself is required, both already confirmed above, so this can
+  // never be unmeasurable once bowArmAngle itself is.
+  const armElevation = bowArmElevationOf(landmarks, frameWidth, frameHeight);
+  const armStraightOk = bowArmAngle >= FULL_DRAW_BOW_ARM_MIN;
+  const armConeOk = armElevation !== null && Math.abs(armElevation) <= FULL_DRAW_ARM_CONE_APERTURE_DEG;
+  const armOk = armStraightOk && armConeOk;
 
   // Stillness: compare to where the draw wrist was last frame. Speed (distance moved per
   // second), not raw distance, so it doesn't depend on how often this happens to get called.
@@ -2057,12 +2196,22 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const speed =
     prev && dtSec > 0 ? Math.hypot(wrist.x - prev.x, wrist.y - prev.y) / scale / dtSec : Infinity;
 
-  const anchorOk = anchorDist <= FULL_DRAW_ANCHOR_MAX;
-  const armOk = bowArmAngle >= FULL_DRAW_BOW_ARM_MIN;
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
   const stillOk = speed <= FULL_DRAW_STILL_MAX;
 
-  if (DEBUG || TRIGGERTEST) debugInfo = { reason: null, anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+  if (DEBUG || TRIGGERTEST) {
+    debugInfo = {
+      reason: null,
+      anchorDist, anchorOk, anchorVerticalOffset, anchorVerticalOk, anchorBackward, anchorBackwardOk,
+      handSep, sepOk,
+      bowArmAngle, armStraightOk, armElevation, armConeOk, armOk,
+      speed, stillOk,
+      // Pixel-space points/scale for drawTriggerTestOverlay — see emptyDebugInfo's own comment.
+      anchorPx: anchor, drawWristPx: wrist, bowWristPx: bowWristPos,
+      bowShoulderPx: toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight),
+      anchorEarPx, scale,
+    };
+  }
 
   const atFullDraw = anchorOk && armOk && sepOk && stillOk;
 
@@ -3999,16 +4148,67 @@ function ttInputRow(landmarks, idx, label) {
 const ttFmt = (v, digits = 2) => (v == null ? "—" : v.toFixed(digits));
 const ttFmtDeg = (v) => (v == null ? "—" : `${Math.round(v)}°`);
 
+// ===== TRIGGER TEST OVERLAY DRAWING — the acceptance region for the CURRENTLY SELECTED trigger,
+// drawn straight onto the camera picture. Owner, after using the numeric panel above: "i'd like
+// to see the cones and the boxes and the other artifacts like these" — a number says a check
+// failed, a drawn region shows WHY (a cone pointing somewhere daft, an anchor region sitting off
+// his face), which a number alone cannot.
+//
+// Colour is the only language this uses: green (TT_OVERLAY_PASS/_FILL) when that specific
+// sub-condition is currently met, a neutral off-white (TT_OVERLAY_NEUTRAL/_FILL) when it isn't or
+// can't be told — never red, and never a third colour, so "green" keeps meaning one single thing
+// everywhere on this overlay. Thin strokes, translucent fills, on purpose — the owner needs to see
+// his own body through the shape, not have it painted over.
+//
+// Each TRIGGER_DEFS entry's own `draw(landmarks, frameWidth, frameHeight)` (added below, only on
+// screens with real geometry to show — see the per-entry comments) reads pixel-space points
+// straight off debugInfo where isAtFullDraw already computed them (anchorPx, drawWristPx,
+// bowWristPx, bowShoulderPx, anchorEarPx, scale) rather than recomputing any geometry a second
+// time, same "read real state, never a second calculation" discipline as read() above — the
+// numbers on the panel and the shape on screen must never be able to disagree. RAISE is the one
+// exception (see its own draw() below) since bowArmRaiseHeight's visibility requirements are
+// looser than isAtFullDraw's and debugInfo may not have populated its pixel fields at all while a
+// raise is being demonstrated on its own.
+//
+// Screens with no sensible geometry (FULLDRAW, OPEN, ELIGIBLE, POSE, ATTN) simply have no `draw`
+// — drawTriggerTestOverlay no-ops for those rather than inventing a decorative shape.
+const TT_OVERLAY_PASS = "rgba(0, 230, 118, 0.95)";
+const TT_OVERLAY_PASS_FILL = "rgba(0, 230, 118, 0.16)";
+const TT_OVERLAY_NEUTRAL = "rgba(255, 255, 255, 0.75)";
+const TT_OVERLAY_NEUTRAL_FILL = "rgba(255, 255, 255, 0.08)";
+const ttStrokeColor = (ok) => (ok === true ? TT_OVERLAY_PASS : TT_OVERLAY_NEUTRAL);
+const ttFillColor = (ok) => (ok === true ? TT_OVERLAY_PASS_FILL : TT_OVERLAY_NEUTRAL_FILL);
+
+function drawTtCircle(center, radius, ok) {
+  ctx.beginPath();
+  ctx.arc(center.x, center.y, Math.max(radius, 1), 0, Math.PI * 2);
+  ctx.fillStyle = ttFillColor(ok);
+  ctx.fill();
+  ctx.strokeStyle = ttStrokeColor(ok);
+  ctx.stroke();
+}
+
+function drawTtLine(a, b, ok) {
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = ttStrokeColor(ok);
+  ctx.stroke();
+}
+// ===========================================================================
+
 // One entry per screen, in cycle order. `read(landmarks, frameWidth, frameHeight)` returns
 // everything renderCurrentTrigger needs to paint THIS trigger, computed from real, live module
 // state — never a new calculation. `sentence`/`doThis`/`note` are static, plain-language text
-// written for a non-coder standing in front of the camera, not for a developer.
+// written for a non-coder standing in front of the camera, not for a developer. `draw`, where
+// present, paints that same trigger's acceptance region onto the camera canvas — see the TRIGGER
+// TEST OVERLAY DRAWING block just above for the shared conventions.
 const TRIGGER_DEFS = [
   {
     id: "anchor",
     label: "ANCHOR",
-    sentence: "Is your string hand right up at your anchor point — near your mouth or jaw — the way it sits at a real full draw?",
-    doThis: "Draw back to your normal anchor position to light this. Move your draw hand away from your face — resting position, reaching for an arrow, scratching your nose — to make it go dark.",
+    sentence: "Is your string hand right up at your anchor point — near your mouth or jaw, at or below that level, and behind it toward your draw side — the way it sits at a real full draw?",
+    doThis: "Draw back to your normal anchor position to light this. Move your draw hand away from your face — resting position, reaching for an arrow, scratching your nose — to make it go dark. The three rows below split this into distance, height and front/back, so you can see exactly which one is holding it back if the lamp won't light.",
     note: null,
     read(landmarks) {
       const { bowShoulder, bowElbow, bowWrist, drawShoulder, drawHip, bowHip, drawWrist } = triggerTestRoleLabels();
@@ -4016,12 +4216,18 @@ const TRIGGER_DEFS = [
       return {
         lamp: d.anchorOk === true,
         reason: d.reason,
-        rows: [{ label: "Distance from anchor", value: `${ttFmt(d.anchorDist)} × torso`, threshold: `needs ≤ ${FULL_DRAW_ANCHOR_MAX}`, ok: d.anchorOk }],
+        rows: [
+          { label: "Distance from anchor", value: `${ttFmt(d.anchorDist)} × torso`, threshold: `needs ≤ ${FULL_DRAW_ANCHOR_MAX}`, ok: d.anchorDist == null ? null : d.anchorDist <= FULL_DRAW_ANCHOR_MAX },
+          { label: "Height (below mouth level)", value: `${ttFmt(d.anchorVerticalOffset)} × torso`, threshold: `needs ≥ ${(-FULL_DRAW_ANCHOR_ABOVE_MAX).toFixed(2)} (positive = below)`, ok: d.anchorVerticalOk },
+          { label: "Behind the mouth (toward draw ear)", value: `${ttFmt(d.anchorBackward)} × torso`, threshold: `needs ≥ ${FULL_DRAW_ANCHOR_BACKWARD_MIN} — "—" means neither ear is visible enough to tell`, ok: d.anchorBackwardOk },
+        ],
         inputs: [
           ttInputRow(landmarks, drawWrist, "draw wrist"),
           ttInputRow(landmarks, MOUTH_L, "mouth (one side)"),
           ttInputRow(landmarks, MOUTH_R, "mouth (other side)"),
           ttInputRow(landmarks, NOSE, "nose — backup anchor point if the mouth isn't visible"),
+          ttInputRow(landmarks, rightHanded ? R_EAR : L_EAR, "draw-side ear — defines \"backwards\", preferred"),
+          ttInputRow(landmarks, rightHanded ? L_EAR : R_EAR, "bow-side ear — backup for \"backwards\" if the draw-side ear is occluded"),
           ttInputRow(landmarks, drawShoulder, "draw shoulder — for the torso-length scale"),
           ttInputRow(landmarks, drawHip, "draw hip — for the torso-length scale"),
           ttInputRow(landmarks, bowShoulder, "bow shoulder — backup scale, and required before any of the four full-draw checks can run at all"),
@@ -4031,12 +4237,47 @@ const TRIGGER_DEFS = [
         ],
       };
     },
+    // The acceptance region as three shapes, each coloured by its OWN sub-check (not the combined
+    // anchorOk) so the owner can see spatially which one is failing, matching the three rows
+    // above: a circle at the distance limit, a horizontal line at the highest the wrist may sit
+    // (the reported "above the nose" boundary), and — only when an ear was confidently visible
+    // enough to compute it (see isAtFullDraw's own comment) — a line perpendicular to the
+    // anchor→ear axis marking the backward cutoff. Plus the actual anchor→wrist line, so he can
+    // see the distance he's being judged on, not just read it as a number.
+    draw() {
+      const d = debugInfo;
+      if (!d.anchorPx || !d.scale) return;
+      drawTtCircle(d.anchorPx, FULL_DRAW_ANCHOR_MAX * d.scale, d.anchorDist == null ? null : d.anchorDist <= FULL_DRAW_ANCHOR_MAX);
+
+      const cutoffY = d.anchorPx.y - FULL_DRAW_ANCHOR_ABOVE_MAX * d.scale;
+      const halfW = d.scale * 0.6;
+      drawTtLine({ x: d.anchorPx.x - halfW, y: cutoffY }, { x: d.anchorPx.x + halfW, y: cutoffY }, d.anchorVerticalOk);
+
+      if (d.anchorEarPx) {
+        const axisX = d.anchorEarPx.x - d.anchorPx.x, axisY = d.anchorEarPx.y - d.anchorPx.y;
+        const axisLen = Math.hypot(axisX, axisY);
+        if (axisLen > 0) {
+          const ux = axisX / axisLen, uy = axisY / axisLen;
+          const px = -uy, py = ux; // perpendicular unit vector
+          const originX = d.anchorPx.x + ux * FULL_DRAW_ANCHOR_BACKWARD_MIN * d.scale;
+          const originY = d.anchorPx.y + uy * FULL_DRAW_ANCHOR_BACKWARD_MIN * d.scale;
+          const halfLen = d.scale * 0.5;
+          drawTtLine(
+            { x: originX - px * halfLen, y: originY - py * halfLen },
+            { x: originX + px * halfLen, y: originY + py * halfLen },
+            d.anchorBackwardOk
+          );
+        }
+      }
+
+      if (d.drawWristPx) drawTtLine(d.anchorPx, d.drawWristPx, d.anchorOk);
+    },
   },
   {
     id: "arm",
     label: "ARM",
-    sentence: "Is your bow arm — the one holding the bow — straight?",
-    doThis: "Extend your bow arm fully straight toward the target to light this. Bend your bow elbow to make it go dark.",
+    sentence: "Is your bow arm — the one holding the bow — straight, AND pointed out roughly level from your shoulder rather than hanging or raised?",
+    doThis: "Extend your bow arm fully straight toward the target, roughly level with your shoulder, to light this. Bend your bow elbow, or drop the whole arm to your side, to make it go dark — the two rows below show straightness and direction separately, so you can see which one is failing.",
     note: null,
     read(landmarks) {
       const { bowShoulder, bowElbow, bowWrist, drawWrist } = triggerTestRoleLabels();
@@ -4044,7 +4285,10 @@ const TRIGGER_DEFS = [
       return {
         lamp: d.armOk === true,
         reason: d.reason,
-        rows: [{ label: "Bow-arm angle", value: ttFmtDeg(d.bowArmAngle), threshold: `needs ≥ ${FULL_DRAW_BOW_ARM_MIN}°`, ok: d.armOk }],
+        rows: [
+          { label: "Bow-arm angle (straightness)", value: ttFmtDeg(d.bowArmAngle), threshold: `needs ≥ ${FULL_DRAW_BOW_ARM_MIN}°`, ok: d.armStraightOk },
+          { label: "Elevation off horizontal (the cone)", value: ttFmtDeg(d.armElevation), threshold: `needs within ±${FULL_DRAW_ARM_CONE_APERTURE_DEG}° of level`, ok: d.armConeOk },
+        ],
         inputs: [
           ttInputRow(landmarks, bowShoulder, "bow shoulder"),
           ttInputRow(landmarks, bowElbow, "bow elbow"),
@@ -4052,6 +4296,37 @@ const TRIGGER_DEFS = [
           ttInputRow(landmarks, drawWrist, "draw wrist — not used by THIS check directly, but required before any of the four full-draw checks can run at all"),
         ],
       };
+    },
+    // The cone as a filled wedge from the bow shoulder (two rays at ±the aperture from
+    // horizontal, opening toward whichever side the wrist is actually on), coloured by armConeOk
+    // alone — then the real shoulder→wrist ray drawn on top, thicker, coloured by the COMBINED
+    // armOk (straight AND in the cone), so a straight arm pointing the wrong way is visibly
+    // "outside the wedge" even though the ray itself isn't bent.
+    draw() {
+      const d = debugInfo;
+      if (!d.bowShoulderPx || !d.bowWristPx) return;
+      const shoulder = d.bowShoulderPx, wrist = d.bowWristPx;
+      const armLen = Math.hypot(wrist.x - shoulder.x, wrist.y - shoulder.y);
+      const coneLen = armLen > 0 ? armLen * 1.2 : (d.scale || 80);
+      const sign = wrist.x >= shoulder.x ? 1 : -1;
+      const apertureRad = (FULL_DRAW_ARM_CONE_APERTURE_DEG * Math.PI) / 180;
+      const dxCone = sign * coneLen * Math.cos(apertureRad);
+      const topEnd = { x: shoulder.x + dxCone, y: shoulder.y - coneLen * Math.sin(apertureRad) };
+      const bottomEnd = { x: shoulder.x + dxCone, y: shoulder.y + coneLen * Math.sin(apertureRad) };
+
+      ctx.beginPath();
+      ctx.moveTo(shoulder.x, shoulder.y);
+      ctx.lineTo(topEnd.x, topEnd.y);
+      ctx.lineTo(bottomEnd.x, bottomEnd.y);
+      ctx.closePath();
+      ctx.fillStyle = ttFillColor(d.armConeOk);
+      ctx.fill();
+      ctx.strokeStyle = ttStrokeColor(d.armConeOk);
+      ctx.stroke();
+
+      ctx.lineWidth = 4;
+      drawTtLine(shoulder, wrist, d.armOk);
+      ctx.lineWidth = 2;
     },
   },
   {
@@ -4075,6 +4350,24 @@ const TRIGGER_DEFS = [
         ],
       };
     },
+    // The wrist-to-wrist line, coloured by sepOk, with a perpendicular tick mark showing where
+    // FULL_DRAW_HAND_SEP_MIN falls along it (measured from the bow wrist) — so the owner can see
+    // how far short of (or past) the required separation his hands actually are, not just read it.
+    draw() {
+      const d = debugInfo;
+      if (!d.bowWristPx || !d.drawWristPx || !d.scale) return;
+      drawTtLine(d.bowWristPx, d.drawWristPx, d.sepOk);
+      const dx = d.drawWristPx.x - d.bowWristPx.x, dy = d.drawWristPx.y - d.bowWristPx.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 0) {
+        const reqLen = FULL_DRAW_HAND_SEP_MIN * d.scale;
+        const ux = dx / len, uy = dy / len;
+        const markX = d.bowWristPx.x + ux * reqLen, markY = d.bowWristPx.y + uy * reqLen;
+        const px = -uy, py = ux;
+        const tick = d.scale * 0.08;
+        drawTtLine({ x: markX - px * tick, y: markY - py * tick }, { x: markX + px * tick, y: markY + py * tick }, d.sepOk);
+      }
+    },
   },
   {
     id: "still",
@@ -4093,6 +4386,15 @@ const TRIGGER_DEFS = [
           ttInputRow(landmarks, drawWrist, "draw wrist — compared against where it was on the previous frame; there's no second landmark for this one"),
         ],
       };
+    },
+    // A circle around the draw wrist sized to the allowed per-second drift radius — coloured by
+    // stillOk. Not a motion trail (that would need extra state this file doesn't otherwise keep,
+    // see the comment on lastDrawWrist being a single remembered frame, not a history buffer) —
+    // just "this is the tolerance you're being held to right now".
+    draw() {
+      const d = debugInfo;
+      if (!d.drawWristPx || !d.scale) return;
+      drawTtCircle(d.drawWristPx, FULL_DRAW_STILL_MAX * d.scale, d.stillOk);
     },
   },
   {
@@ -4140,6 +4442,18 @@ const TRIGGER_DEFS = [
           ttInputRow(landmarks, bowHip, "bow hip — for the torso-length scale"),
         ],
       };
+    },
+    // A horizontal line at bow-shoulder height — the RAISE_TRIGGER_UP_FRACTION (0) threshold —
+    // coloured by raiseArmed. Computed straight from the raw landmark here rather than through
+    // debugInfo (see this block's own comment): bowArmRaiseHeight's visibility needs are looser
+    // than isAtFullDraw's own full-draw gate, so a raise can be live and armed while debugInfo's
+    // pixel fields are still sitting on a bail from a frame before the draw wrist was visible.
+    draw(landmarks, frameWidth, frameHeight) {
+      const { bowShoulder } = triggerTestRoleLabels();
+      if (!visible(landmarks, bowShoulder)) return;
+      const shoulder = toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight);
+      const halfW = (debugInfo.scale || 80) * 0.8;
+      drawTtLine({ x: shoulder.x - halfW, y: shoulder.y }, { x: shoulder.x + halfW, y: shoulder.y }, raiseArmed);
     },
   },
   {
@@ -4448,6 +4762,35 @@ function syncTriggerTestPanel(nowMs, landmarks, frameWidth, frameHeight) {
   renderCurrentTrigger();
 }
 
+// Paints the CURRENTLY SELECTED trigger's acceptance region on top of whatever paintCanvas already
+// drew this frame (skeleton included) — see the TRIGGER TEST OVERLAY DRAWING block above
+// TRIGGER_DEFS for the shared drawing primitives and colour convention.
+//
+// CLIP SAFETY — the `activeRecording` check below is the ONLY thing that guarantees this, and it
+// has to be a real runtime check, not just "called from a different code path than the recording
+// branch": canvas.captureStream samples whatever pixels are actually sitting on the shared
+// `canvas` element when the browser next grabs a frame for the stream, regardless of which
+// function last drew to it or when — drawing this overlay onto the same canvas at any point while
+// a clip is recording risks it landing in that clip, even if paintCanvas itself took its
+// non-recording branch this same tick. So this bails out immediately whenever a clip is active,
+// full stop, before touching the canvas at all.
+//
+// No-ops immediately when there's no fresh pose (landmarks null/undefined) or the current screen
+// has no `draw` at all (FULLDRAW, OPEN, ELIGIBLE, POSE, ATTN) — nothing decorative gets invented
+// for those, per the brief.
+function drawTriggerTestOverlay(landmarks, frameWidth, frameHeight) {
+  if (!TRIGGERTEST || !landmarks || activeRecording) return;
+  const def = TRIGGER_DEFS[ttIndex];
+  if (!def.draw) return;
+  ctx.save();
+  ctx.lineWidth = 2;
+  try {
+    def.draw(landmarks, frameWidth, frameHeight);
+  } finally {
+    ctx.restore();
+  }
+}
+
 // Built here, not in the early bootstrap block near triggerTestEl's own declaration — see that
 // block's comment for why (TRIGGER_DEFS's temporal dead zone). This is the actual "turn it on"
 // call for the whole feature; everything above this point in the file is just declarations.
@@ -4750,6 +5093,7 @@ function renderLoop() {
 
   syncDebugOverlay(now, landmarksForDebug, frameWidth, frameHeight);
   syncTriggerTestPanel(now, landmarksForDebug, frameWidth, frameHeight);
+  drawTriggerTestOverlay(landmarksForDebug, frameWidth, frameHeight);
 }
 
 function updateHandButtonLabel() {
@@ -5348,15 +5692,144 @@ function selfTest() {
       ttById.fulldraw.read(restingArmsAtSides).lamp === false,
       "AT FULL DRAW must stay dark at rest even though SEP alone incorrectly fires — ANCHOR failing must be enough to keep the composite honest"
     );
-    // ADDITIONAL FINDING, not predicted by the original brief (which only named SEP): a relaxed
-    // hanging arm doesn't buckle at the elbow under just its own weight, so it measures as very
-    // nearly straight — which means ARM ALSO reads lit on this exact same resting pose, by the
-    // same "ordinary standing posture looks more like a drawn bow than it should" mechanism as
-    // SEP. Reported here rather than smoothed over, per the brief's own instruction to surface
-    // unpredicted failures prominently.
+    // ARM CONE FIX (this task, 2026-08-24): a relaxed hanging arm doesn't buckle at the elbow
+    // under just its own weight, so it still measures as very nearly straight (armStraightOk true
+    // on its own) — this fixture used to be the "additional finding" proving ARM had the same
+    // shape of bug as SEP, firing on an ordinary resting stance. bowArmElevationOf now measures
+    // this exact arm at ~-90° off horizontal (straight down), nowhere near the
+    // FULL_DRAW_ARM_CONE_APERTURE_DEG (45°) aperture, so armConeOk — and therefore the combined
+    // armOk — now correctly rejects it. THIS is the headline assertion: an arm hanging at the
+    // side must fail armOk, and this exact fixture is proven (see the PM's own verification run,
+    // reverting FULL_DRAW_ARM_CONE_APERTURE_DEG's check) to have read `true` before this fix.
     console.assert(
-      ttById.arm.read(restingArmsAtSides).lamp === true,
-      "ADDITIONAL FINDING: ARM also reads lit on this same resting stance — a relaxed hanging arm measures as very nearly straight, the same shape of bug as SEP"
+      ttById.arm.read(restingArmsAtSides).lamp === false,
+      "ARM CONE FIX: an arm hanging straight at the archer's side must NOT read as armOk even though it measures as straight — this is the headline case FULL_DRAW_ARM_CONE_APERTURE_DEG exists to catch"
+    );
+
+    // ===== ANCHOR DIRECTION — this task (2026-08-24). Owner: "i cannot anchor ahead of my mouth.
+    // it'll always be below or slightly backwards." Fixtures below probe each new sub-check in
+    // isolation. Shared head geometry: mouth at (0.40, 0.20); draw-side ear (R_EAR, since
+    // rightHanded is true throughout selfTest) straight out to the side at the SAME height — a
+    // deliberately simple axis (pure +x) so anchorBackward reduces to a plain x-comparison and
+    // every number below can be hand-checked.
+    const anchorHead = {
+      9: { x: 0.4, y: 0.2 }, 10: { x: 0.4, y: 0.2 }, // mouth
+      [R_EAR]: { x: 0.5, y: 0.2 }, // draw-side ear when rightHanded
+      [L_EAR]: { x: 0.3, y: 0.2 }, // bow-side ear (fallback)
+    };
+
+    // Correct anchor: right distance, at/below mouth level, behind it toward the draw ear — all
+    // three sub-checks, and the combined anchorOk, must pass.
+    lastDrawWrist = null;
+    const goodAnchor = mkLandmarks({ ...base, ...anchorHead, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.42, y: 0.22 } });
+    isAtFullDraw(goodAnchor, 0, true, NOOP_W, NOOP_H);
+    console.assert(debugInfo.anchorVerticalOk === true, "correct anchor: vertical sub-check must pass (wrist at/below mouth level)");
+    console.assert(debugInfo.anchorBackwardOk === true, "correct anchor: backward sub-check must pass (wrist toward the draw ear)");
+    console.assert(debugInfo.anchorOk === true, "correct anchor: combined anchorOk must pass when all three sub-checks do");
+
+    // Hand above the nose: same horizontal position as the mouth, far enough above it to clear
+    // FULL_DRAW_ANCHOR_ABOVE_MAX while staying inside the plain distance circle — isolates the
+    // failure to the vertical sub-check, proving it does real work beyond what the distance circle
+    // alone already covers (the "above the nose" failure the owner reported).
+    lastDrawWrist = null;
+    const aboveNose = mkLandmarks({ ...base, ...anchorHead, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.4, y: 0.12 } });
+    isAtFullDraw(aboveNose, 0, true, NOOP_W, NOOP_H);
+    console.assert(debugInfo.anchorDist <= FULL_DRAW_ANCHOR_MAX, "above-nose fixture must stay within the plain distance circle, or this isn't isolating the vertical check");
+    console.assert(debugInfo.anchorVerticalOk === false, "above-nose fixture: vertical sub-check must fail");
+    console.assert(debugInfo.anchorOk === false, "above-nose fixture: combined anchorOk must fail even though distance alone would have passed");
+
+    // Hand in front of the mouth, AT THE CORRECT DISTANCE: isolates the failure to the backward
+    // sub-check — directly the owner's own complaint ("i cannot anchor ahead of my mouth"), and
+    // also the "correct distance but wrong side" case from the brief.
+    lastDrawWrist = null;
+    const inFrontOfMouth = mkLandmarks({ ...base, ...anchorHead, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.34, y: 0.22 } });
+    isAtFullDraw(inFrontOfMouth, 0, true, NOOP_W, NOOP_H);
+    console.assert(debugInfo.anchorDist <= FULL_DRAW_ANCHOR_MAX, "in-front-of-mouth fixture must stay within the plain distance circle, or this isn't isolating the backward check");
+    console.assert(debugInfo.anchorVerticalOk === true, "in-front-of-mouth fixture: vertical sub-check must pass on its own (this fixture isolates backward, not vertical)");
+    console.assert(debugInfo.anchorBackwardOk === false, "in-front-of-mouth fixture: backward sub-check must fail");
+    console.assert(debugInfo.anchorOk === false, "in-front-of-mouth fixture: combined anchorOk must fail even at the correct distance and height");
+
+    // Ear-visibility fallback, one ear only: the draw-side ear (the preferred one) is occluded —
+    // a side-on archer often has one ear or the other hidden from the camera. The backward check
+    // must still run off the bow-side ear rather than going silent just because the preferred one
+    // is missing.
+    lastDrawWrist = null;
+    const drawEarOccluded = mkLandmarks({
+      ...base, ...anchorHead,
+      [R_EAR]: { x: 0.5, y: 0.2, visibility: 0 }, // draw-side ear hidden
+      15: { x: 0.0, y: 0.3 }, 16: { x: 0.42, y: 0.22 },
+    });
+    isAtFullDraw(drawEarOccluded, 0, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo.anchorBackward !== null,
+      "the backward check must still run (fall back to the bow-side ear), not go null, just because the preferred draw-side ear is occluded"
+    );
+
+    // Ear-visibility fallback, BOTH hidden: the backward direction genuinely cannot be measured —
+    // must degrade to "not confirmed" (null), never guess a pass. anchorOk must stay false even
+    // though distance and vertical both pass on their own — an unconfirmed direction is not the
+    // same thing as a confirmed one, and the combined check must not treat it as a pass.
+    lastDrawWrist = null;
+    const bothEarsOccluded = mkLandmarks({
+      ...base, ...anchorHead,
+      [L_EAR]: { x: 0.3, y: 0.2, visibility: 0 },
+      [R_EAR]: { x: 0.5, y: 0.2, visibility: 0 },
+      15: { x: 0.0, y: 0.3 }, 16: { x: 0.42, y: 0.22 },
+    });
+    isAtFullDraw(bothEarsOccluded, 0, true, NOOP_W, NOOP_H);
+    console.assert(debugInfo.anchorBackward === null, "with both ears occluded, anchorBackward must stay null — never guess a direction with no ear to measure it from");
+    console.assert(debugInfo.anchorBackwardOk === null, "with both ears occluded, anchorBackwardOk must be null (unconfirmed), never true");
+    console.assert(
+      debugInfo.anchorVerticalOk === true && debugInfo.anchorDist <= FULL_DRAW_ANCHOR_MAX,
+      "sanity check: this fixture's distance and vertical position are otherwise a real anchor, isolating the missing-ear case specifically"
+    );
+    console.assert(debugInfo.anchorOk === false, "with the backward direction unconfirmed, combined anchorOk must not pass on distance and vertical alone");
+
+    // ===== ARM CONE — additional fixtures beyond restingArmsAtSides (the headline hanging-arm
+    // case, already asserted above).
+
+    // Properly extended: the existing `drawn` fixture's bow arm (shoulder->elbow->wrist collinear,
+    // pointing level out to the side) should measure ~0° elevation and pass both ARM sub-checks.
+    console.assert(
+      Math.abs(bowArmElevationOf(drawn, NOOP_W, NOOP_H)) < 1e-6,
+      "a bow arm extended level with the shoulder should measure ~0° elevation"
+    );
+    lastDrawWrist = null;
+    isAtFullDraw(drawn, 0, true, NOOP_W, NOOP_H);
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo.armStraightOk === true && debugInfo.armConeOk === true && debugInfo.armOk === true,
+      "a properly extended, level bow arm must pass both ARM sub-checks"
+    );
+
+    // Slightly bent, now passing: bent enough to measure ~146° at the elbow — below the OLD 150°
+    // threshold (would have failed) but above the NEW, loosened 140° threshold (must now pass) —
+    // while staying level enough to clear the cone easily. Owner's own field report: "sometimes i
+    // shoot with my arm not 100% straight and the slight bend doesn't pass the trigger."
+    lastDrawWrist = null;
+    const slightBend = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.4 } }); // bow wrist dropped; bow elbow stays at base's (0.15, 0.3)
+    const slightBendAngle = angleAt(slightBend[L_SHOULDER], slightBend[L_ELBOW], slightBend[L_WRIST]);
+    console.assert(
+      slightBendAngle > FULL_DRAW_BOW_ARM_MIN && slightBendAngle < 150,
+      `slight-bend fixture must land strictly between the new (${FULL_DRAW_BOW_ARM_MIN}°) and old (150°) thresholds to be a fair test, got ${slightBendAngle.toFixed(1)}°`
+    );
+    isAtFullDraw(slightBend, 0, true, NOOP_W, NOOP_H);
+    console.assert(
+      debugInfo.armStraightOk === true,
+      `a ${slightBendAngle.toFixed(1)}° bend must pass the loosened FULL_DRAW_BOW_ARM_MIN (${FULL_DRAW_BOW_ARM_MIN}°) — it would have failed the old 150° threshold`
+    );
+    console.assert(debugInfo.armConeOk === true, "the slight-bend fixture's arm should still be level enough to clear the cone");
+
+    // Pure bowArmElevationOf checks: raised overhead (~+90°) and never-guess on a missing wrist.
+    const overheadArm = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.0 } }); // bow wrist straight above the bow shoulder
+    console.assert(
+      Math.abs(bowArmElevationOf(overheadArm, NOOP_W, NOOP_H) - 90) < 1e-6,
+      "a bow arm raised straight overhead should measure ~+90° elevation"
+    );
+    const noWristForElevation = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.0, visibility: 0 } });
+    console.assert(
+      bowArmElevationOf(noWristForElevation, NOOP_W, NOOP_H) === null,
+      "bowArmElevationOf must never guess — null when the bow wrist isn't confidently visible"
     );
 
     // RAISE / OPEN: a dedicated arm-raised fixture (the earlier `raise` fixture's bow arm points
