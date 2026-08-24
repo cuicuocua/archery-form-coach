@@ -829,6 +829,59 @@ Rules the PM follows:
 
 ## Open work
 
+- **FIELD FEEDBACK, 2026-08-24, owner testing every trigger one at a time with
+  `?triggertest`.** These are REAL MEASURED READINGS off his own body at his own
+  setup — the most valuable calibration data this project has ever had, and the
+  only numbers here not derived from a synthetic model. Treat them as ground
+  truth over any desk estimate, including the ones in the Key decisions above.
+
+  - **SEP — "ridiculous". Full draw measures 1.5; the gate is 0.75.** His
+    resting reading was ~1.07 (median of 1,497 samples, same day). **This partly
+    contradicts the "hand separation is unfixable" Key decision above and that
+    entry must not be trusted without re-checking.** That conclusion rested on a
+    synthetic model predicting ~1.17 at full draw for his camera angle; he
+    actually reads 1.5, so the model understated the real gap. Resting 1.07 vs
+    full draw 1.5 is a usable separation, and simply RAISING the gate may work
+    after all. **What is still missing, and what the original argument actually
+    turned on: his measured NOCKING and MID-RAISE readings.** The claim was
+    never "resting beats full draw", it was "nocking and mid-raise beat full
+    draw" — an ordering problem, not a threshold one. Get those two numbers
+    before either raising the gate or rebuilding around anchor. Until then both
+    the pessimistic conclusion and the optimistic reading are unproven.
+  - **STILL — far too lax. He measures 0.05 while holding at full draw;
+    `FULL_DRAW_STILL_MAX` is 0.35**, seven times looser than his real hold. Also
+    note his separate complaint that it counts a *moment* rather than a *hold*:
+    the check is instantaneous speed, so a brief pause mid-draw satisfies it.
+    Tightening the threshold and adding a duration requirement are two different
+    fixes and both look warranted.
+  - **AT FULL DRAW — held back by ARM**, because of a slight bend in his bow
+    arm. Measured before `FULL_DRAW_BOW_ARM_MIN` was loosened 150° → 140° the
+    same day; retest before acting.
+  - **RAISE — "works perfectly."** The only trigger he reported as correct. It
+    is also the only one built around a body-relative direction rather than a
+    scalar magnitude, which is worth noticing.
+  - **OPEN — always lit, "even with one hand behind my back."** Expected: an
+    attempt opens on hand separation ≥ `DRAW_ATTEMPT_MIN_SEP` (0.3) or an armed
+    raise, and his resting separation is ~1.07, so it can never close. This is
+    the phantom-shot mechanism confirmed directly on the device. Retest after
+    the current changes, then rethink.
+  - **ELIGIBLE — too lax: stays lit when he walks almost out of frame with only
+    a shoulder and an arm visible.** Real gap, not a threshold: eligibility is
+    `SETTLE_FRAMES_REQUIRED` consecutive frames plus a stable crop box, and
+    **nothing in it requires the landmarks a measurement actually needs to be
+    visible.** So a frame can be "eligible to log from" while most of the body
+    is missing. This is the same family as the framing check that was designed
+    and never built.
+  - **POSE — appears correct**, though he found it hard to interpret. Wording,
+    not behaviour.
+  - **ATTN — "seems pointless."** `ATTENTION_REST_HAND_SEP_MAX` is 0.2 and his
+    hands never come within that of each other, so it can effectively never read
+    calm and the battery saving never engages. **His own proposal, and it is a
+    good one: check that his arms are not raised and that he is fairly
+    stationary** — i.e. resting with arms down. Note `bowArmRaiseHeight` already
+    computes arm elevation and RAISE already proves that signal works, so this
+    is mostly rewiring rather than new geometry.
+
 - **Rebuild attempt detection around anchor + stillness + duration.** Supersedes
   the old "retune the detection thresholds" item, which is now answered: see the
   two Key decisions above. Retuning `FULL_DRAW_HAND_SEP_MIN` is proven not to
