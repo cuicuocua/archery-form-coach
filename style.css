@@ -431,6 +431,31 @@ body.triggertest-mode #readouts {
   color: var(--amber);
   font-weight: 600;
 }
+
+/* Hard-reload button — deliberately the visual opposite of .tt-next-btn above: small, muted,
+   sits alone at the very bottom of the panel. The owner taps "Next trigger" constantly and this
+   only rarely (when testing a build that just changed), so this must never compete with that
+   button for the thumb or the eye — see its own comment in buildTriggerTestPanel for what it
+   actually does. */
+.tt-reload-btn {
+  display: block;
+  margin: 1.5em auto 0;
+  padding: 0.5em 1em;
+  border: 1px solid var(--grey);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--grey);
+  font-size: clamp(11px, 1.6vw, 13px);
+  font-weight: 600;
+  opacity: 0.7;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tt-reload-btn:active {
+  opacity: 1;
+  background: rgba(154, 160, 166, 0.15);
+}
 /* ===========================================================================*/
 
 /* PROVISIONAL — HANDOVER.md Stage 4 calibration/framing status line (see app.js,
