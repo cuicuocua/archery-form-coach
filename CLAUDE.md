@@ -940,6 +940,21 @@ browser first (camera + toggles + shot log), then via the Cloudflare tunnel URL
 on iPhone Safari for the real side-on shooting test. See README.md for exact
 commands.
 
+### `?selftest` alone does NOT run every assertion
+
+Some assertions are gated behind `?triggertest` (they drive that view's real DOM
+through `ttRefs`). A plain `?selftest` run silently skips them and still prints
+"selfTest done", so it looks like full coverage and isn't. This cost a wrong
+conclusion on 2026-08-24: a deliberate mutation to `armOk` appeared to prove the
+headline assertion could not fail, when in fact the assertion had simply never
+executed. **Always run `?selftest&debug&triggertest` — the union — before
+trusting a green result**, and treat a clean plain `?selftest` as partial.
+
+Related trap from the same session: **ES modules cache per origin, and a query
+string on the HTML does not bust `app.js`.** After editing the file, a reload of
+the same `localhost:PORT` can re-run the OLD module. Serve on a fresh port to
+force a genuine re-fetch when a mutation test's result matters.
+
 ### Recorded-footage harness (built 2026-08-24, NOT yet working end to end)
 
 The owner recorded a 95s portrait session (varied shot speeds, deliberately
