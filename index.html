@@ -15,6 +15,13 @@
        about normal (non-debug) behaviour or layout. Its content is built once at startup
        (buildDebugPanel in app.js) and only text/classes are touched after that. -->
   <div id="debug" class="hidden"></div>
+  <!-- ?triggertest — live single-trigger inspector. Same sibling-of-#stage trick as #debug above
+       (see body.triggertest-mode in style.css): a 40%/60% grid puts this panel on the left and
+       the real camera+skeleton (#stage, unchanged) on the right. Stays display:none via .hidden
+       unless ?triggertest is in the URL (see app.js), so it changes nothing about normal or
+       ?debug behaviour. Built once at startup (buildTriggerTestPanel in app.js); after that only
+       text/classes on its existing nodes are touched (renderCurrentTrigger). -->
+  <div id="triggertest" class="hidden"></div>
   <div id="stage">
     <div id="camerabox">
       <video id="video" autoplay playsinline muted></video>

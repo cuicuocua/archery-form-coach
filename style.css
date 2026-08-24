@@ -297,6 +297,142 @@ body.debug-mode #readouts {
   display: none;
 }
 
+/* ===== ?triggertest LAYOUT — same 40%/60% grid trick as ?debug above (body.debug-mode), on its
+   own independent class so ?triggertest works completely on its own without also needing ?debug
+   in the URL, and so ?debug's own layout/panel are untouched by any of this. See app.js's
+   TRIGGERTEST constant and the TRIGGER TEST block for the JS side. */
+body.triggertest-mode {
+  display: grid;
+  grid-template-columns: 40% 60%;
+  width: 100vw;
+  height: 100dvh;
+}
+
+@media (orientation: portrait) {
+  body.triggertest-mode {
+    grid-template-columns: 1fr;
+    grid-template-rows: 40% 60%;
+  }
+}
+
+body.triggertest-mode #stage {
+  width: 100%;
+  height: 100%;
+}
+
+body.triggertest-mode #readouts {
+  display: none;
+}
+/* ===========================================================================*/
+
+/* ===== ?triggertest PANEL — the live single-trigger inspector. Reuses the .dbg-* component
+   classes above wherever the look is identical (sections, headings, rows, lamps, the never-blank
+   reason line) — only what's genuinely new (the big title, the big lamp, the one big cycle
+   button, the plain-language text blocks) gets its own tt- class. Built once at startup
+   (buildTriggerTestPanel in app.js); every refresh after that only touches text/classes on the
+   same nodes (renderCurrentTrigger), same discipline as #debug. */
+#triggertest {
+  position: static;
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  box-sizing: border-box;
+  padding: calc(env(safe-area-inset-top, 12px) + 10px) 14px calc(env(safe-area-inset-bottom, 12px) + 10px);
+  background: #0a0a0a;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#triggertest.hidden {
+  display: none;
+}
+
+/* "3 of 10" — small, sits above the big name so a glance answers "where am I in the list" without
+   competing with the name for attention. */
+.tt-position {
+  font-size: clamp(12px, 1.8vw, 15px);
+  opacity: 0.6;
+  text-align: center;
+}
+
+/* The current trigger's own name — the thing the owner has to read from several metres away to
+   confirm which screen he's on before deciding whether to walk up and change it, per his own
+   request. As big as this panel's width comfortably allows. */
+.tt-title {
+  font-size: clamp(28px, 8vw, 56px);
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-align: center;
+  line-height: 1.05;
+}
+
+.tt-lampwrap {
+  display: flex;
+  justify-content: center;
+}
+
+/* Bigger variant of .dbg-lamp (see above) — same lit/dark colours and glow, just sized to be read
+   from a few metres, matching the big title above it. */
+.tt-lamp {
+  min-height: 3em;
+  width: 70%;
+  font-size: clamp(20px, 5vw, 36px);
+  border-radius: 16px;
+  border-width: 2px;
+}
+
+/* THE big cycle button — one large, unmissable tap target, not a row of small ones, because every
+   tap costs the owner a walk from wherever he's standing to read the current trigger. Sized and
+   coloured to be impossible to confuse with a lamp (lamps are green/dark; this is a steady, high-
+   contrast accent that never changes colour) or to mis-tap. */
+.tt-next-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 4.5em;
+  padding: 0.5em;
+  border: none;
+  border-radius: 16px;
+  background: #2d7dd2;
+  color: #fff;
+  font-weight: 800;
+  font-size: clamp(20px, 4.5vw, 30px);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tt-next-btn:active {
+  background: #235f9e;
+}
+
+.tt-next-sub {
+  font-size: clamp(11px, 1.6vw, 14px);
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.tt-text {
+  font-size: clamp(14px, 2.2vw, 18px);
+  line-height: 1.45;
+  margin: 0;
+}
+
+/* The SEP screen's known-issue callout (and any other trigger that ever needs one) — same amber
+   "worth flagging" treatment as .dbg-reason-bail, deliberately not hidden or softened. */
+.tt-note {
+  color: var(--amber);
+  font-weight: 600;
+}
+/* ===========================================================================*/
+
 /* PROVISIONAL — HANDOVER.md Stage 4 calibration/framing status line (see app.js,
    renderCalibrationStatus). Quiet only on the one state that's actually fine — agreement — with
    the amber "worth flagging, not alarming" treatment reserved for the states that are genuinely

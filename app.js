@@ -294,6 +294,18 @@ const STARTUP_MODEL_WATCHDOG_MS = 45000; // how long the pose-model DOWNLOAD ste
 
 const DEBUG = location.search.includes("debug"); // ?debug in the URL shows the live trigger-condition overlay
 
+// ?triggertest in the URL shows a live, single-trigger inspector instead of the multi-trigger
+// ?debug grid — see the TRIGGER TEST block further down (near buildTriggerTestPanel) for the
+// panel itself. Kept as its own flag, independent of DEBUG, so ?triggertest works completely on
+// its own (no need to also pass ?debug) and ?debug's own panel/layout stay exactly as they were —
+// see that block's own comment for the couple of `if (DEBUG)` display-only capture points this
+// flag also has to fire, since this panel needs the exact same real computed numbers (debugInfo,
+// debugRaiseHeight, lastPoseSeen, lastCropBoxStable) those already exist to capture, just shown
+// one trigger at a time instead of all at once. Read-only in every case: none of those capture
+// points ever feed back into detection, gating, measurement or logging — only into what a
+// diagnostic panel displays.
+const TRIGGERTEST = location.search.includes("triggertest");
+
 // ===== DEBUG OVERLAY REFRESH — performance knob, not calibration; safe to change without a
 // coach, same family as SMOOTHING/POSE MODEL/ROI CROPPING above (kept here rather than inside
 // CALIBRATE WITH COACH, which is reserved for archery-form thresholds — see README's "The numbers
@@ -351,6 +363,22 @@ if (DEBUG) {
   debugEl.classList.remove("hidden");
   document.body.classList.add("debug-mode"); // see the ?debug LAYOUT block in style.css — the only thing that turns the two-column grid on
   buildDebugPanel(); // built once, here, before any frame renders — see its own comment for why
+}
+
+// ?triggertest — live single-trigger inspector, independent of ?debug (see the TRIGGERTEST
+// constant's own comment and the TRIGGER TEST block further down, near buildTriggerTestPanel).
+const triggerTestEl = document.getElementById("triggertest");
+let ttRefs = null;
+if (TRIGGERTEST) {
+  triggerTestEl.classList.remove("hidden");
+  document.body.classList.add("triggertest-mode"); // see the ?triggertest LAYOUT block in style.css
+  // buildTriggerTestPanel() itself is NOT called here, unlike buildDebugPanel() above — it reads
+  // TRIGGER_DEFS, a `const` defined much further down in this file (in the TRIGGER TEST block),
+  // and calling it this early would hit that `const`'s temporal dead zone (module top-level
+  // execution hasn't reached its initialiser yet). buildTriggerTestPanel() is a function
+  // DECLARATION so it hoists fine and can be defined down there — it just can't be CALLED until
+  // TRIGGER_DEFS itself has actually run, so the call site lives right after that block instead,
+  // gated on this same TRIGGERTEST flag. See TRIGGER_DEFS's own comment.
 }
 // PROVISIONAL — Stage 4 calibration/framing status line (see HANDOVER.md and the CALIBRATION
 // block further down). Belongs on Stage 3's future Setup screen; lives here, minimally, until
@@ -479,6 +507,14 @@ let debugEvents = { attemptStarted: 0, raiseFired: 0, frameEligible: 0, shotLogg
 // captured every frame that can read it at all, purely so the TRIGGERS/STATE section can show the
 // actual number next to RAISE_TRIGGER_UP_FRACTION, not just the armed/unarmed boolean.
 let debugRaiseHeight = null;
+// ?triggertest-only display state for the ATTN screen (see TRIGGER TEST further down). Nothing
+// in updateAttentionState/attentionIsClearlyCalm was changed to add this — both are already pure,
+// side-effect-free functions (see attentionIsClearlyCalm's own comment), so renderLoop just calls
+// them a second time, purely for display, with a snapshot of the previous-frame state taken
+// before updateAttentionState overwrites it. Never read by anything except the trigger-test panel.
+let debugAttnCalm = null; // the calm/not-calm verdict attentionIsClearlyCalm reached this frame
+let debugAttnHandSep = null; // hand separation as ATTN sees it (handSeparationForAttention) — a different formula from the SEP gate's own handSep, see ATTENTION_REST_HAND_SEP_MAX's own comment
+let debugAttnSpeed = null; // body-reference-point drift speed, torso-lengths/second, as ATTN sees it
 // Whether the crop box used THIS frame was stable (see cropBoxIsStable) — captured in renderLoop
 // right where that's already computed for frameEligible, so the panel can show it as its own
 // continuous lamp without recomputing crop-box geometry a second time.
@@ -1472,11 +1508,11 @@ let raiseArmed = false;
 // DEBUG_EVENT_LATCH_MS above), which isAtFullDraw's own call passes its real nowMs into instead.
 function updateRaiseTrigger(landmarks, frameWidth, frameHeight, nowMs = performance.now()) {
   const height = bowArmRaiseHeight(landmarks, frameWidth, frameHeight);
-  if (DEBUG) debugRaiseHeight = height; // display-only — see debugRaiseHeight's own comment
+  if (DEBUG || TRIGGERTEST) debugRaiseHeight = height; // display-only — see debugRaiseHeight's own comment
   if (height === null) return;
   if (!raiseArmed && height >= RAISE_TRIGGER_UP_FRACTION) {
     raiseArmed = true;
-    if (DEBUG) debugEvents.raiseFired = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
+    if (DEBUG || TRIGGERTEST) debugEvents.raiseFired = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
   } else if (raiseArmed && height <= RAISE_TRIGGER_DOWN_FRACTION) {
     raiseArmed = false;
   }
@@ -1942,7 +1978,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   // going blank — see emptyDebugInfo's own comment. Every bail branch below overwrites this with
   // its own specific reason; only a path nobody has written yet would ever leave this generic one
   // standing, and even that is a real, readable sentence rather than silence.
-  if (DEBUG) debugInfo = emptyDebugInfo("full draw check not yet run this frame");
+  if (DEBUG || TRIGGERTEST) debugInfo = emptyDebugInfo("full draw check not yet run this frame");
 
   // RAISE TRIGGER: independent of the stricter visibility this function's own full-draw checks
   // need below — see bowArmRaiseHeight's own comment. Updated (and fed to trackShotAttempt via
@@ -1952,7 +1988,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   updateRaiseTrigger(landmarks, frameWidth, frameHeight, nowMs);
 
   if (![drawWrist, bowShoulder, bowElbow, bowWrist].every((i) => visible(landmarks, i))) {
-    if (DEBUG) {
+    if (DEBUG || TRIGGERTEST) {
       const missing = describeMissingLandmarks(landmarks, [
         [drawWrist, "draw wrist"],
         [bowShoulder, "bow shoulder"],
@@ -1974,7 +2010,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   } else if (visible(landmarks, NOSE)) {
     anchorNorm = landmarks[NOSE];
   } else {
-    if (DEBUG) debugInfo = emptyDebugInfo("no anchor landmark — mouth and nose not confidently visible");
+    if (DEBUG || TRIGGERTEST) debugInfo = emptyDebugInfo("no anchor landmark — mouth and nose not confidently visible");
     trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -1988,7 +2024,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
     torsoLength(landmarks, drawShoulder, drawHip, frameWidth, frameHeight) ??
     torsoLength(landmarks, bowShoulder, bowHip, frameWidth, frameHeight);
   if (!scale) {
-    if (DEBUG) debugInfo = emptyDebugInfo("no torso scale — hip not confidently visible on either side");
+    if (DEBUG || TRIGGERTEST) debugInfo = emptyDebugInfo("no torso scale — hip not confidently visible on either side");
     trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -2002,7 +2038,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   if (bowArmAngle === null) {
     // handSep is already known at this point (computed above) even though the bow arm's own
     // angle isn't — no reason to throw away a real reading here, including on the ?debug panel.
-    if (DEBUG) debugInfo = { ...emptyDebugInfo("bow-arm angle unavailable — shoulder/elbow/wrist are degenerate (identical positions)"), handSep };
+    if (DEBUG || TRIGGERTEST) debugInfo = { ...emptyDebugInfo("bow-arm angle unavailable — shoulder/elbow/wrist are degenerate (identical positions)"), handSep };
     trackShotAttempt({ handSep, raiseArmed, atFullDraw: false, eligible: false }, nowMs);
     return false;
   }
@@ -2026,7 +2062,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
   const stillOk = speed <= FULL_DRAW_STILL_MAX;
 
-  if (DEBUG) debugInfo = { reason: null, anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
+  if (DEBUG || TRIGGERTEST) debugInfo = { reason: null, anchorDist, anchorOk, handSep, sepOk, bowArmAngle, armOk, speed, stillOk };
 
   const atFullDraw = anchorOk && armOk && sepOk && stillOk;
 
@@ -2109,7 +2145,7 @@ function trackShotAttempt(sample, nowMs) {
         eligibleSeen: 0,
         reachedFullDraw: false,
       };
-      if (DEBUG) debugEvents.attemptStarted = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
+      if (DEBUG || TRIGGERTEST) debugEvents.attemptStarted = nowMs; // display-only latch, see DEBUG_EVENT_LATCH_MS
       // Recording starts here, not in endAttempt, so the raise and draw are in the clip too — by
       // the time endAttempt fires the good part is already over. Starts regardless of this
       // frame's eligibility — the clip is a recording of what happened, not a measurement.
@@ -3901,6 +3937,523 @@ function syncDebugOverlay(nowMs, landmarks, frameWidth, frameHeight) {
   r["s-fps"].textContent = debugInstantFps == null ? "—" : debugInstantFps.toFixed(1);
 }
 
+// ===== TRIGGER TEST — ?triggertest live single-trigger inspector. Built after the owner used
+// ?debug for a real session and asked for something different: "make it similar to debug except
+// there is only one trigger on the side and there's an explanation of what it checks for and the
+// values that it's measuring so i understand what it's expecting of me and i can monitor if it's
+// getting the correct input." This is a different PRESENTATION of the same real state ?debug's
+// TRIGGERS/STATE section already shows — one trigger at a time, in depth, with the plain-language
+// explanation and the raw landmark inputs ?debug never had room for — not a second measurement
+// pipeline. He cycles through the ten screens with the one big button below (or Space/→/← on a
+// desktop), standing back far enough for the camera to see his whole body to read a trigger, then
+// walking up to switch — see buildTriggerTestPanel's button for why it's one big control, not a
+// row of small ones: every tap costs him a walk, so it has to be unmissable from a few metres.
+//
+// READ-ONLY, same discipline as ?debug: every number on this panel is read straight off state the
+// real detection pipeline already computed this frame (debugInfo, raiseArmed, attempt,
+// settledFrames, lastCropBoxStable, lastPoseSeen, attentionEngaged, debugAttnCalm/HandSep/Speed —
+// see those variables' own declarations for the handful of places TRIGGERTEST had to join DEBUG
+// to populate them, and the ATTN block in renderLoop for why attentionIsClearlyCalm could just be
+// called a second time instead). Nothing here computes a NEW measurement or reimplements any
+// geometry — the four full-draw gates' own numbers (anchorDist/handSep/bowArmAngle/speed) come
+// straight out of isAtFullDraw's own debugInfo object, not a second calculation of that formula.
+//
+// Do NOT tune any of the text below to make a trigger look like it's behaving well. SEP in
+// particular is proven (see CLAUDE.md) to light up on an ordinary resting stance — the note on
+// that screen says so plainly, and stays even if that's uncomfortable to read while testing.
+
+// Landmark role labels, keyed by CURRENT handedness — rightHanded can change any time via the 🎯
+// button, so this is computed fresh on every call rather than once, exactly like isAtFullDraw's
+// own role lookups.
+function triggerTestRoleLabels() {
+  return {
+    bowShoulder: rightHanded ? L_SHOULDER : R_SHOULDER,
+    drawShoulder: rightHanded ? R_SHOULDER : L_SHOULDER,
+    bowElbow: rightHanded ? L_ELBOW : R_ELBOW,
+    drawElbow: rightHanded ? R_ELBOW : L_ELBOW,
+    bowWrist: rightHanded ? L_WRIST : R_WRIST,
+    drawWrist: rightHanded ? R_WRIST : L_WRIST,
+    bowHip: rightHanded ? L_HIP : R_HIP,
+    drawHip: rightHanded ? R_HIP : L_HIP,
+  };
+}
+
+// One row describing a single landmark's live visibility/confidence — the raw input the owner
+// asked for, so he can tell "this trigger is reading bad input" apart from "this trigger is
+// reading good input and firing/not firing correctly". `landmarks` may be a real array, null (a
+// frame where detection ran and found nobody), or undefined (an idle-throttle tick that never ran
+// detection at all — see syncDebugOverlay's own comment on that three-way distinction, which this
+// mirrors); all three safely fall through to "not seen this frame" here. Smoothing never touches
+// `visibility` (see CLAUDE.md), so reading it off the smoothed landmarks this panel already has is
+// exactly the same number MediaPipe itself reported — not a second, different confidence figure.
+function ttInputRow(landmarks, idx, label) {
+  const lm = landmarks ? landmarks[idx] : null;
+  return {
+    label,
+    seen: !!lm,
+    confidence: lm ? lm.visibility ?? 0 : null,
+    ok: !!landmarks && visible(landmarks, idx),
+  };
+}
+
+const ttFmt = (v, digits = 2) => (v == null ? "—" : v.toFixed(digits));
+const ttFmtDeg = (v) => (v == null ? "—" : `${Math.round(v)}°`);
+
+// One entry per screen, in cycle order. `read(landmarks, frameWidth, frameHeight)` returns
+// everything renderCurrentTrigger needs to paint THIS trigger, computed from real, live module
+// state — never a new calculation. `sentence`/`doThis`/`note` are static, plain-language text
+// written for a non-coder standing in front of the camera, not for a developer.
+const TRIGGER_DEFS = [
+  {
+    id: "anchor",
+    label: "ANCHOR",
+    sentence: "Is your string hand right up at your anchor point — near your mouth or jaw — the way it sits at a real full draw?",
+    doThis: "Draw back to your normal anchor position to light this. Move your draw hand away from your face — resting position, reaching for an arrow, scratching your nose — to make it go dark.",
+    note: null,
+    read(landmarks) {
+      const { bowShoulder, bowElbow, bowWrist, drawShoulder, drawHip, bowHip, drawWrist } = triggerTestRoleLabels();
+      const d = debugInfo;
+      return {
+        lamp: d.anchorOk === true,
+        reason: d.reason,
+        rows: [{ label: "Distance from anchor", value: `${ttFmt(d.anchorDist)} × torso`, threshold: `needs ≤ ${FULL_DRAW_ANCHOR_MAX}`, ok: d.anchorOk }],
+        inputs: [
+          ttInputRow(landmarks, drawWrist, "draw wrist"),
+          ttInputRow(landmarks, MOUTH_L, "mouth (one side)"),
+          ttInputRow(landmarks, MOUTH_R, "mouth (other side)"),
+          ttInputRow(landmarks, NOSE, "nose — backup anchor point if the mouth isn't visible"),
+          ttInputRow(landmarks, drawShoulder, "draw shoulder — for the torso-length scale"),
+          ttInputRow(landmarks, drawHip, "draw hip — for the torso-length scale"),
+          ttInputRow(landmarks, bowShoulder, "bow shoulder — backup scale, and required before any of the four full-draw checks can run at all"),
+          ttInputRow(landmarks, bowHip, "bow hip — backup scale"),
+          ttInputRow(landmarks, bowElbow, "bow elbow — not used by THIS check directly, but required before any of the four full-draw checks can run at all"),
+          ttInputRow(landmarks, bowWrist, "bow wrist — same as above, a shared prerequisite"),
+        ],
+      };
+    },
+  },
+  {
+    id: "arm",
+    label: "ARM",
+    sentence: "Is your bow arm — the one holding the bow — straight?",
+    doThis: "Extend your bow arm fully straight toward the target to light this. Bend your bow elbow to make it go dark.",
+    note: null,
+    read(landmarks) {
+      const { bowShoulder, bowElbow, bowWrist, drawWrist } = triggerTestRoleLabels();
+      const d = debugInfo;
+      return {
+        lamp: d.armOk === true,
+        reason: d.reason,
+        rows: [{ label: "Bow-arm angle", value: ttFmtDeg(d.bowArmAngle), threshold: `needs ≥ ${FULL_DRAW_BOW_ARM_MIN}°`, ok: d.armOk }],
+        inputs: [
+          ttInputRow(landmarks, bowShoulder, "bow shoulder"),
+          ttInputRow(landmarks, bowElbow, "bow elbow"),
+          ttInputRow(landmarks, bowWrist, "bow wrist"),
+          ttInputRow(landmarks, drawWrist, "draw wrist — not used by THIS check directly, but required before any of the four full-draw checks can run at all"),
+        ],
+      };
+    },
+  },
+  {
+    id: "sep",
+    label: "SEP",
+    sentence: "Are your two hands far enough apart to look like a real full draw — roughly three-quarters of your own torso length or more?",
+    doThis: "Draw the bow all the way back to light this. Bring your hands back together to make it go dark.",
+    note: "Known issue, proven against a real session (see CLAUDE.md): standing normally with your arms relaxed at your sides is often enough on its own to light this up — your shoulders alone are usually wider than this threshold. If this stays lit while you're just standing there doing nothing, that's a known limitation of this check, not something wrong with your stance — it's one of the reasons this inspector exists.",
+    read(landmarks) {
+      const { bowWrist, drawWrist, bowShoulder, bowElbow } = triggerTestRoleLabels();
+      const d = debugInfo;
+      return {
+        lamp: d.sepOk === true,
+        reason: d.reason,
+        rows: [{ label: "Hand separation", value: `${ttFmt(d.handSep)} × torso`, threshold: `needs ≥ ${FULL_DRAW_HAND_SEP_MIN}`, ok: d.sepOk }],
+        inputs: [
+          ttInputRow(landmarks, bowWrist, "bow wrist"),
+          ttInputRow(landmarks, drawWrist, "draw wrist"),
+          ttInputRow(landmarks, bowShoulder, "bow shoulder — required before any of the four full-draw checks can run at all"),
+          ttInputRow(landmarks, bowElbow, "bow elbow — same as above"),
+        ],
+      };
+    },
+  },
+  {
+    id: "still",
+    label: "STILL",
+    sentence: "Has your draw hand stopped moving — are you holding steady?",
+    doThis: "Hold your position still for a moment to light this. Keep moving your draw arm/hand to make it go dark.",
+    note: null,
+    read(landmarks) {
+      const { drawWrist } = triggerTestRoleLabels();
+      const d = debugInfo;
+      return {
+        lamp: d.stillOk === true,
+        reason: d.reason,
+        rows: [{ label: "Draw-wrist speed", value: `${ttFmt(d.speed)} × torso/second`, threshold: `needs ≤ ${FULL_DRAW_STILL_MAX}`, ok: d.stillOk }],
+        inputs: [
+          ttInputRow(landmarks, drawWrist, "draw wrist — compared against where it was on the previous frame; there's no second landmark for this one"),
+        ],
+      };
+    },
+  },
+  {
+    id: "fulldraw",
+    label: "AT FULL DRAW",
+    sentence: "Are all four full-draw checks true at the same time — anchored, arm straight, hands apart, and holding still?",
+    doThis: "Draw fully to your anchor point and hold still to light this. Check the sub-checks below to see exactly which one is holding it back if it won't light.",
+    note: null,
+    read() {
+      const d = debugInfo;
+      const allFour = d.anchorOk === true && d.armOk === true && d.sepOk === true && d.stillOk === true;
+      return {
+        lamp: allFour,
+        reason: d.reason,
+        subLamps: [
+          { label: "ANCHOR", ok: d.anchorOk },
+          { label: "ARM", ok: d.armOk },
+          { label: "SEP", ok: d.sepOk },
+          { label: "STILL", ok: d.stillOk },
+        ],
+        rows: [],
+        inputs: [],
+      };
+    },
+  },
+  {
+    id: "raise",
+    label: "RAISE",
+    sentence: "Has your bow arm come up to shoulder height or higher — the first deliberate movement of your shot routine?",
+    doThis: "Raise your bow arm up to shoulder height or above to light this. Lower it back down well below shoulder height to make it go dark — there's deliberate hysteresis built in, so it won't flicker right at shoulder height.",
+    note: null,
+    read(landmarks) {
+      const { bowShoulder, bowWrist, bowHip } = triggerTestRoleLabels();
+      return {
+        lamp: raiseArmed,
+        rows: [{
+          label: "Bow-wrist height above shoulder",
+          value: `${ttFmt(debugRaiseHeight)} × torso`,
+          threshold: `≥ ${RAISE_TRIGGER_UP_FRACTION} lights it, ≤ ${RAISE_TRIGGER_DOWN_FRACTION} clears it`,
+          ok: raiseArmed,
+        }],
+        inputs: [
+          ttInputRow(landmarks, bowShoulder, "bow shoulder"),
+          ttInputRow(landmarks, bowWrist, "bow wrist"),
+          ttInputRow(landmarks, bowHip, "bow hip — for the torso-length scale"),
+        ],
+      };
+    },
+  },
+  {
+    id: "open",
+    label: "OPEN",
+    sentence: "Has the app decided a shot attempt is currently in progress — either because your bow arm came up to shoulder height, or your hands separated?",
+    doThis: "Raise your bow arm to shoulder height, OR pull your hands apart, to open it. Relax completely — arm down, hands together — and hold still for a moment to close it.",
+    note: null,
+    read(landmarks) {
+      const { bowShoulder, bowWrist, drawWrist } = triggerTestRoleLabels();
+      const d = debugInfo;
+      const isOpen = attempt !== null;
+      let detail = "no attempt open";
+      if (attempt) {
+        const drawing = attempt.startMs !== null;
+        const elapsedMs = performance.now() - (drawing ? attempt.startMs : attempt.watchStartedAt);
+        detail = `open ${(elapsedMs / 1000).toFixed(1)}s (${drawing ? "drawing" : "raise phase"}) — peak hand sep ${ttFmt(attempt.peakHandSep)}`;
+      }
+      return {
+        lamp: isOpen,
+        rows: [
+          {
+            label: "Hand separation",
+            value: `${ttFmt(d.handSep)} × torso`,
+            threshold: `≥ ${DRAW_ATTEMPT_MIN_SEP} opens it`,
+            ok: d.handSep == null ? null : d.handSep >= DRAW_ATTEMPT_MIN_SEP,
+          },
+          { label: "Raise armed", value: raiseArmed ? "yes" : "no", threshold: "also opens it", ok: raiseArmed },
+          { label: "Attempt state", value: detail, threshold: "", ok: null },
+        ],
+        inputs: [
+          ttInputRow(landmarks, bowShoulder, "bow shoulder — for RAISE"),
+          ttInputRow(landmarks, bowWrist, "bow wrist — for RAISE and SEP"),
+          ttInputRow(landmarks, drawWrist, "draw wrist — for SEP"),
+        ],
+      };
+    },
+  },
+  {
+    id: "eligible",
+    label: "ELIGIBLE",
+    sentence: "Has the tracking pipeline been reading you steadily for long enough — and, if the zoomed-in tracking box has stopped resizing — that THIS frame's numbers are trustworthy enough to log?",
+    doThis: "This one isn't about your pose at all — it's about how long the app has been tracking you continuously. Stand still and stay in frame for a couple of seconds after the app starts (or after it loses and re-finds you) to light this. Step out of frame, or move enough that the tracking box keeps jumping around, to make it go dark.",
+    note: null,
+    read(landmarks) {
+      const NAMED = [L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST, L_HIP, R_HIP, NOSE, MOUTH_L, MOUTH_R, L_EAR, R_EAR];
+      const visibleCount = landmarks ? NAMED.filter((i) => visible(landmarks, i)).length : 0;
+      const fired = isDebugEventLit(debugEvents.frameEligible, performance.now());
+      return {
+        lamp: fired,
+        rows: [
+          {
+            label: "Consecutive good-tracking frames",
+            value: `${settledFrames}`,
+            threshold: `needs ≥ ${SETTLE_FRAMES_REQUIRED}`,
+            ok: settledFrames >= SETTLE_FRAMES_REQUIRED,
+          },
+          {
+            label: "Tracking box stable",
+            value: ROI_CROPPING_ENABLED ? (lastCropBoxStable ? "yes" : "no") : "n/a — cropping is switched off",
+            threshold: "",
+            ok: ROI_CROPPING_ENABLED ? lastCropBoxStable : null,
+          },
+          {
+            label: "Confidently-visible landmarks this frame",
+            value: `${visibleCount}`,
+            threshold: `≥ ${ROI_MIN_VISIBLE_LANDMARKS} keeps the tracking box locked on`,
+            ok: visibleCount >= ROI_MIN_VISIBLE_LANDMARKS,
+          },
+        ],
+        inputs: [], // this trigger is about frame HISTORY, not any one landmark — see the rows above instead
+      };
+    },
+  },
+  {
+    id: "pose",
+    label: "POSE",
+    sentence: "Is a body being detected in the camera frame at all, right now?",
+    doThis: "Stand where the camera can see your torso to light this. Step out of frame, turn away completely, or block the camera to make it go dark.",
+    note: null,
+    read(landmarks) {
+      const NAMED = [
+        [L_SHOULDER, "left shoulder"], [R_SHOULDER, "right shoulder"],
+        [L_ELBOW, "left elbow"], [R_ELBOW, "right elbow"],
+        [L_WRIST, "left wrist"], [R_WRIST, "right wrist"],
+        [L_HIP, "left hip"], [R_HIP, "right hip"],
+        [NOSE, "nose"], [MOUTH_L, "mouth (one side)"], [MOUTH_R, "mouth (other side)"],
+        [L_EAR, "left ear"], [R_EAR, "right ear"],
+        [L_ANKLE, "left ankle"], [R_ANKLE, "right ankle"],
+      ];
+      return {
+        lamp: lastPoseSeen,
+        rows: [{ label: "Body detected", value: lastPoseSeen ? "yes" : "no", threshold: "", ok: lastPoseSeen }],
+        inputs: NAMED.map(([idx, label]) => ttInputRow(landmarks, idx, label)),
+      };
+    },
+  },
+  {
+    id: "attn",
+    label: "ATTN",
+    sentence: "Is the app currently watching you at full speed — rather than idling to save battery between shots?",
+    doThis: "Move — raise your arm, separate your hands, or just walk around — to light this (engaged). Stand completely relaxed and still for about a second and a half to let it go dark (idle). Nothing ever stops the app watching for good; idle just means it checks less often.",
+    note: null,
+    read(landmarks) {
+      const { bowWrist, drawWrist } = triggerTestRoleLabels();
+      return {
+        lamp: attentionEngaged,
+        rows: [
+          {
+            label: "Calm signal",
+            value: debugAttnCalm == null ? "—" : debugAttnCalm ? "calm" : "not calm",
+            threshold: "must hold calm for 1.5s to idle",
+            ok: debugAttnCalm,
+          },
+          {
+            label: "Hand separation",
+            value: `${ttFmt(debugAttnHandSep)} × torso`,
+            threshold: `needs ≤ ${ATTENTION_REST_HAND_SEP_MAX} to count as relaxed`,
+            ok: debugAttnHandSep == null ? null : debugAttnHandSep <= ATTENTION_REST_HAND_SEP_MAX,
+          },
+          {
+            label: "Body movement",
+            value: `${ttFmt(debugAttnSpeed)} × torso/second`,
+            threshold: `needs ≤ ${ATTENTION_REST_MOVE_MAX_PER_SEC} to count as still`,
+            ok: debugAttnSpeed == null ? null : debugAttnSpeed <= ATTENTION_REST_MOVE_MAX_PER_SEC,
+          },
+        ],
+        inputs: [
+          ttInputRow(landmarks, bowWrist, "bow wrist"),
+          ttInputRow(landmarks, drawWrist, "draw wrist"),
+          ttInputRow(landmarks, L_HIP, "left hip — body reference point"),
+          ttInputRow(landmarks, R_HIP, "right hip — body reference point"),
+        ],
+      };
+    },
+  },
+];
+
+let ttIndex = 0; // which of TRIGGER_DEFS is currently shown — advanced only by the big cycle button or its keyboard equivalents, never automatically
+// Last REAL landmarks snapshot syncTriggerTestPanel saw (array, or null on genuine pose loss) —
+// kept separate from the per-frame `landmarks` argument, which can also be undefined on an
+// idle-throttle tick that skipped detection entirely (see syncDebugOverlay's own comment on that
+// three-way distinction) — so the cycle button can re-render immediately with the last REAL
+// answer, never a stale placeholder, without waiting for the next real frame.
+let ttLastLandmarks;
+let ttLastFrameW = 0, ttLastFrameH = 0;
+let lastTtRenderMs = -Infinity; // throttle bookkeeping, same convention and constant as lastDebugRenderMs/DEBUG_OVERLAY_REFRESH_MS
+
+// Builds the panel's DOM once (see buildDebugPanel's own comment for why this pattern — build
+// once, only text/classes touched after) and wires the one big cycle button plus its keyboard
+// equivalents. No-op, not even a DOM lookup, unless ?triggertest is in the URL (only ever called
+// from the TRIGGERTEST bootstrap block near buildDebugPanel's own call site).
+function buildTriggerTestPanel() {
+  triggerTestEl.innerHTML = `
+    <div class="tt-position" data-x="tt-position"></div>
+    <div class="tt-title" data-x="tt-title"></div>
+    <div class="tt-lampwrap"><span class="dbg-lamp tt-lamp" data-x="tt-lamp">DARK</span></div>
+    <button type="button" class="tt-next-btn" data-x="tt-next">
+      Next trigger →
+      <span class="tt-next-sub">tap here, or press space / → on a keyboard</span>
+    </button>
+    <div class="dbg-reason" data-x="tt-reason" style="display:none"></div>
+    <section class="dbg-section" data-x="tt-sublamps-section" style="display:none">
+      <h2 class="dbg-heading">Which part is holding it back</h2>
+      <div class="dbg-lamps" data-x="tt-sublamps"></div>
+    </section>
+    <section class="dbg-section">
+      <h2 class="dbg-heading">What it checks</h2>
+      <p class="tt-text" data-x="tt-sentence"></p>
+    </section>
+    <section class="dbg-section">
+      <h2 class="dbg-heading">What it wants from you</h2>
+      <p class="tt-text" data-x="tt-dothis"></p>
+      <p class="tt-text tt-note" data-x="tt-note" style="display:none"></p>
+    </section>
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Live values</h2>
+      <div data-x="tt-rows"></div>
+    </section>
+    <section class="dbg-section">
+      <h2 class="dbg-heading">Raw inputs it's reading</h2>
+      <div data-x="tt-inputs"></div>
+    </section>
+  `;
+  ttRefs = {};
+  triggerTestEl.querySelectorAll("[data-x]").forEach((el) => {
+    ttRefs[el.dataset.x] = el;
+  });
+
+  const advance = (delta) => {
+    ttIndex = (ttIndex + delta + TRIGGER_DEFS.length) % TRIGGER_DEFS.length;
+    renderCurrentTrigger();
+  };
+  ttRefs["tt-next"].addEventListener("click", () => advance(1));
+  // Keyboard equivalents cost nothing and help anyone testing on a desktop — Space/Enter/→ mirror
+  // the one big button (forward, wrapping); ← is a bonus back-step the on-screen button
+  // deliberately doesn't offer (the owner asked for ONE big forward button, not a pair).
+  document.addEventListener("keydown", (e) => {
+    if (!TRIGGERTEST) return;
+    if (e.key === " " || e.key === "Enter" || e.key === "ArrowRight") {
+      e.preventDefault();
+      advance(1);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      advance(-1);
+    }
+  });
+
+  renderCurrentTrigger(); // paint something immediately, before the first real frame arrives
+}
+
+// Repaints the currently-selected trigger's screen from ttLastLandmarks/ttLastFrameW/ttLastFrameH
+// and whatever live module state that trigger's own `read` needs (debugInfo, raiseArmed, attempt,
+// settledFrames, attentionEngaged, etc.) — never throttled itself (see syncTriggerTestPanel for
+// the throttle), so the cycle button always feels instant even though the per-frame refresh below
+// it is deliberately rate-limited like ?debug's own panel.
+function renderCurrentTrigger() {
+  if (!TRIGGERTEST || !ttRefs) return;
+  const def = TRIGGER_DEFS[ttIndex];
+  const result = def.read(ttLastLandmarks, ttLastFrameW, ttLastFrameH);
+  const r = ttRefs;
+
+  r["tt-position"].textContent = `${ttIndex + 1} of ${TRIGGER_DEFS.length}`;
+  r["tt-title"].textContent = def.label;
+  r["tt-lamp"].textContent = result.lamp ? "LIT" : "DARK";
+  r["tt-lamp"].classList.toggle("lit", !!result.lamp);
+
+  if (result.reason) {
+    r["tt-reason"].textContent = result.reason;
+    r["tt-reason"].classList.add("dbg-reason-bail");
+    r["tt-reason"].style.display = "";
+  } else {
+    // Clear text/class too, not just display — a screen with no reason must leave nothing for a
+    // later check (or a future CSS change) to find. Bug found in review: this branch used to only
+    // hide the element, so a stale reason from a PREVIOUS screen sat in the DOM (invisible, but
+    // still there) until the next screen that has one overwrote it.
+    r["tt-reason"].textContent = "";
+    r["tt-reason"].classList.remove("dbg-reason-bail");
+    r["tt-reason"].style.display = "none";
+  }
+
+  if (result.subLamps) {
+    r["tt-sublamps-section"].style.display = "";
+    r["tt-sublamps"].innerHTML = result.subLamps
+      .map((s) => {
+        const state = s.ok === true ? "lit" : s.ok === false ? "dark" : "not evaluated yet";
+        return `<div class="dbg-lampcell"><span class="dbg-lamp ${s.ok === true ? "lit" : ""}">${s.label}</span><div class="dbg-lampcaption">${state}</div></div>`;
+      })
+      .join("");
+  } else {
+    r["tt-sublamps-section"].style.display = "none";
+    r["tt-sublamps"].innerHTML = "";
+  }
+
+  r["tt-sentence"].textContent = def.sentence;
+  r["tt-dothis"].textContent = def.doThis;
+  if (def.note) {
+    r["tt-note"].textContent = def.note;
+    r["tt-note"].style.display = "";
+  } else {
+    // Clear text too, not just display — same bug and same fix as tt-reason above. This was the
+    // reported one: SEP's "known issue" paragraph stayed in the DOM after moving to STILL/AT FULL
+    // DRAW/RAISE (none of which set a note), invisible only because display:none happened to be
+    // set correctly — a false alarm waiting to happen the moment anything reads text instead of
+    // computed style, which is exactly how this was caught.
+    r["tt-note"].textContent = "";
+    r["tt-note"].style.display = "none";
+  }
+
+  r["tt-rows"].innerHTML = result.rows
+    .map((row) => {
+      const cls = row.ok == null ? "uncertain" : row.ok ? "ok" : "warn";
+      const thresh = row.threshold ? ` <span class="dbg-thresh">(${row.threshold})</span>` : "";
+      return `<div class="dbg-row dbg-row-2col"><span class="dbg-name">${row.label}</span><span class="dbg-val ${cls}">${row.value}${thresh}</span></div>`;
+    })
+    .join("");
+
+  r["tt-inputs"].innerHTML = result.inputs
+    .map((inp) => {
+      const cls = !inp.seen ? "uncertain" : inp.ok ? "ok" : "warn";
+      const confText =
+        inp.confidence == null
+          ? "not seen this frame"
+          : `${Math.round(inp.confidence * 100)}% confident (needs ≥ ${Math.round(MIN_VISIBILITY * 100)}%)`;
+      return `<div class="dbg-row dbg-row-2col"><span class="dbg-name">${inp.label}</span><span class="dbg-val ${cls}">${confText}</span></div>`;
+    })
+    .join("");
+}
+
+// Per-frame hook, called from renderLoop exactly like syncDebugOverlay (see both call sites there
+// for the idle-tick vs real-frame distinction `landmarks` carries). No-op — not even a DOM lookup
+// — unless ?triggertest is in the URL. Updates the "last known real landmarks" snapshot on every
+// call that carries one (so the cycle button can always re-render instantly from real data), but
+// only repaints the DOM at DEBUG_OVERLAY_REFRESH_MS at most, same throttle and same reasoning as
+// ?debug's own panel — nobody can read a number changing 30-60 times a second, and rebuilding this
+// panel's rows every frame would cost real main-thread time for no benefit.
+function syncTriggerTestPanel(nowMs, landmarks, frameWidth, frameHeight) {
+  if (!TRIGGERTEST) return;
+  if (landmarks !== undefined) {
+    ttLastLandmarks = landmarks;
+    ttLastFrameW = frameWidth;
+    ttLastFrameH = frameHeight;
+  }
+  if (nowMs - lastTtRenderMs < DEBUG_OVERLAY_REFRESH_MS) return;
+  lastTtRenderMs = nowMs;
+  renderCurrentTrigger();
+}
+
+// Built here, not in the early bootstrap block near triggerTestEl's own declaration — see that
+// block's comment for why (TRIGGER_DEFS's temporal dead zone). This is the actual "turn it on"
+// call for the whole feature; everything above this point in the file is just declarations.
+if (TRIGGERTEST) buildTriggerTestPanel();
+// ===========================================================================
+
 // ===== CALIBRATION — passive capture, wired into renderLoop below. No button, no explicit
 // trigger — the owner's own decision (see HANDOVER.md Stage 4). "Is he standing there, readable"
 // reuses signals the pipeline already computes, rather than a new detector:
@@ -4037,6 +4590,7 @@ function renderLoop() {
       // last real reading through the idle gap instead of flashing "not seen" for a reason that
       // has nothing to do with whether the archer is actually there.
       syncDebugOverlay(now);
+      syncTriggerTestPanel(now);
       return;
     }
     attentionLastIdleSampleMs = now; // this frame IS the idle sample — the next one is due no sooner than a full interval from now
@@ -4085,7 +4639,33 @@ function renderLoop() {
   // and BEFORE the smoothing/settling below, not after: if this call is about to re-engage from
   // idle, it resets landmarkSmoother/settledFrames/currentCropBox synchronously, so everything
   // from here to the end of this same frame already runs against the fresh, reset state.
+  // TRIGGER TEST — snapshot the previous-frame ATTN state BEFORE updateAttentionState below
+  // overwrites it, so the recompute after the real call can reconstruct exactly what it saw. Two
+  // plain local variables, read only a few lines down; never assigned anywhere else.
+  const ttPrevAttnRef = TRIGGERTEST ? attentionPrevRef : null;
+  const ttPrevAttnEvalMs = TRIGGERTEST ? attentionLastEvalMs : null;
+
   updateAttentionState(now, rawLandmarks, frameWidth, frameHeight);
+
+  // TRIGGER TEST — display-only. Calls the exact same pure functions updateAttentionState just
+  // used internally (attentionIsClearlyCalm, handSeparationForAttention, bodyReferencePoint,
+  // attentionScale, toPixelSpace) a second time, with the snapshot taken above, purely so the ATTN
+  // screen can show the live numbers behind the engaged/idle decision. Read-only: this can never
+  // feed back into attentionEngaged or anything else the real app depends on.
+  if (TRIGGERTEST) {
+    const ttDtSec = ttPrevAttnEvalMs === null ? 0 : (now - ttPrevAttnEvalMs) / 1000;
+    debugAttnCalm = attentionIsClearlyCalm(rawLandmarks, ttPrevAttnRef, ttDtSec, frameWidth, frameHeight);
+    debugAttnHandSep = rawLandmarks ? handSeparationForAttention(rawLandmarks, frameWidth, frameHeight) : null;
+    const ttRef = rawLandmarks ? bodyReferencePoint(rawLandmarks) : null;
+    const ttScale = rawLandmarks ? attentionScale(rawLandmarks, frameWidth, frameHeight) : null;
+    if (ttRef && ttPrevAttnRef && ttDtSec > 0 && ttScale) {
+      const a = toPixelSpace(ttRef, frameWidth, frameHeight);
+      const b = toPixelSpace(ttPrevAttnRef, frameWidth, frameHeight);
+      debugAttnSpeed = Math.hypot(a.x - b.x, a.y - b.y) / ttScale / ttDtSec;
+    } else {
+      debugAttnSpeed = null;
+    }
+  }
 
   // Display-only: this frame's smoothed landmarks (or null, on genuine pose loss), for
   // syncDebugOverlay's MEASURES/torso-scale section at the bottom of this function — declared
@@ -4100,7 +4680,7 @@ function renderLoop() {
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
     setReadout(readoutElbow, valueElbow, "— uncertain", "uncertain");
-    if (DEBUG) {
+    if (DEBUG || TRIGGERTEST) {
       debugInfo = emptyDebugInfo("no pose detected this frame");
       lastPoseSeen = false;
     }
@@ -4127,7 +4707,7 @@ function renderLoop() {
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
     landmarksForDebug = landmarks; // display-only — see its own declaration and syncDebugOverlay's call at the bottom of this function
-    if (DEBUG) lastPoseSeen = true;
+    if (DEBUG || TRIGGERTEST) lastPoseSeen = true;
     paintCanvas(landmarks);
     updateBowArmReadout(landmarks, frameWidth, frameHeight);
     updateShoulderDropReadout(landmarks, frameWidth, frameHeight);
@@ -4146,10 +4726,10 @@ function renderLoop() {
     // variable gets overwritten for next frame, then threaded through as an explicit argument
     // (like nowMs already is) so selfTest can drive it too.
     const cropBoxStableThisFrame = cropBoxIsStable(usedCropBox, prevUsedCropBox);
-    if (DEBUG) lastCropBoxStable = cropBoxStableThisFrame; // display-only, see its own declaration
+    if (DEBUG || TRIGGERTEST) lastCropBoxStable = cropBoxStableThisFrame; // display-only, see its own declaration
     prevUsedCropBox = usedCropBox;
     const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
-    if (DEBUG && frameEligible) debugEvents.frameEligible = now; // display-only latch, see DEBUG_EVENT_LATCH_MS
+    if ((DEBUG || TRIGGERTEST) && frameEligible) debugEvents.frameEligible = now; // display-only latch, see DEBUG_EVENT_LATCH_MS
     isAtFullDraw(landmarks, now, frameEligible, frameWidth, frameHeight);
     // `attempt` (module-level, see trackShotAttempt) is already up to date for THIS frame — the
     // isAtFullDraw call above just ran it. Read it straight rather than threading a return value
@@ -4169,6 +4749,7 @@ function renderLoop() {
   }
 
   syncDebugOverlay(now, landmarksForDebug, frameWidth, frameHeight);
+  syncTriggerTestPanel(now, landmarksForDebug, frameWidth, frameHeight);
 }
 
 function updateHandButtonLabel() {
@@ -4689,6 +5270,213 @@ function selfTest() {
     isDebugEventLit(1000, 1000 + DEBUG_EVENT_LATCH_MS + 1) === false,
     "an event must go dark once its latch window has genuinely passed — a latch that never turns off would hide every OTHER momentary event by staying lit forever"
   );
+
+  // --- ?triggertest TRIGGER_DEFS: structural shape first (runs unconditionally — doesn't depend
+  // on debugInfo being populated), then each screen's `read()` driven with real fixtures through
+  // the real pipeline functions, gated `if (DEBUG || TRIGGERTEST)` for the same reason as the
+  // ?debug NEVER-BLANK block above: debugInfo/debugRaiseHeight/lastPoseSeen/lastCropBoxStable are
+  // only populated under one of those two flags (see their assignments), so this is a correct
+  // no-op — not a false pass — on a page loaded with neither.
+  console.assert(TRIGGER_DEFS.length === 10, `TRIGGER_DEFS must have exactly 10 screens, got ${TRIGGER_DEFS.length}`);
+  console.assert(
+    TRIGGER_DEFS.map((d) => d.label).join(",") === "ANCHOR,ARM,SEP,STILL,AT FULL DRAW,RAISE,OPEN,ELIGIBLE,POSE,ATTN",
+    `TRIGGER_DEFS order/labels must match the brief exactly, got ${TRIGGER_DEFS.map((d) => d.label).join(",")}`
+  );
+  const ttById = Object.fromEntries(TRIGGER_DEFS.map((d) => [d.id, d]));
+
+  if (DEBUG || TRIGGERTEST) {
+    // A genuine held full draw (reusing the `drawn` fixture from earlier) must light ANCHOR, ARM,
+    // SEP, STILL and the AT FULL DRAW composite all at once — the SHOULD-FIRE case for all five
+    // full-draw screens, and the never-blank reason must have cleared (see debugInfo.reason).
+    lastDrawWrist = null;
+    isAtFullDraw(drawn, 0, true, NOOP_W, NOOP_H);
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H); // second frame: zero speed, so STILL passes too
+    console.assert(ttById.anchor.read(drawn).lamp === true, "ANCHOR screen must read lit on a genuine held full draw");
+    console.assert(ttById.arm.read(drawn).lamp === true, "ARM screen must read lit on a genuine held full draw");
+    console.assert(ttById.sep.read(drawn).lamp === true, "SEP screen must read lit on a genuine held full draw");
+    console.assert(ttById.still.read(drawn).lamp === true, "STILL screen must read lit on a genuine held full draw");
+    const fdOnDraw = ttById.fulldraw.read(drawn);
+    console.assert(fdOnDraw.lamp === true, "AT FULL DRAW screen must read lit once all four sub-checks are true");
+    console.assert(fdOnDraw.subLamps.every((s) => s.ok === true), "AT FULL DRAW's own sub-lamps must all show lit when the composite is lit");
+
+    // THE proven bug this whole tool exists to surface (see CLAUDE.md): a realistic body standing
+    // at rest, arms hanging naturally at the sides — NOT drawing at all — must make SEP read lit
+    // anyway, because an ordinary adult's shoulder width alone is comfortably past
+    // FULL_DRAW_HAND_SEP_MIN as a fraction of torso length. Anthropometric assumptions (standard
+    // adult anthropometry figures, as fractions of standing height): biacromial (shoulder) width
+    // ≈0.26x height, shoulder-to-hip (torso) length ≈0.29x height. On this file's shared 0.3
+    // torso-length scale (see `base` above), that puts the shoulders ≈0.26 apart (0.26/0.29 × 0.3),
+    // not `base`'s own narrower 0.2 — `base` was never meant to be an anthropometrically realistic
+    // body, just a convenient shared rig for angle fixtures, so this trigger-test fixture overrides
+    // shoulder width rather than reusing it. Hanging arms, both wrists at the same height straight
+    // down from their own shoulder, then separate horizontally by that same ≈0.26/0.3 ≈ 0.87
+    // torso-lengths — comfortably past the 0.75 threshold.
+    lastDrawWrist = null;
+    const restingArmsAtSides = mkLandmarks({
+      11: { x: 0.3, y: 0.3 }, // bow shoulder
+      12: { x: 0.56, y: 0.3 }, // draw shoulder — 0.26 apart, real anthropometric shoulder width at this torso scale (see comment above)
+      13: { x: 0.3, y: 0.45 }, // bow elbow — hangs straight down from the bow shoulder
+      14: { x: 0.56, y: 0.45 }, // draw elbow — hangs straight down from the draw shoulder
+      15: { x: 0.3, y: 0.58 }, // bow wrist — further down, same x as its own shoulder (hanging straight down, not out)
+      16: { x: 0.56, y: 0.58 }, // draw wrist — same
+      23: { x: 0.3, y: 0.6 }, // bow hip
+      24: { x: 0.56, y: 0.6 }, // draw hip
+      9: { x: 0.43, y: 0.3 }, // mouth — centred over the torso, near the head, far from either resting hand
+      10: { x: 0.43, y: 0.3 },
+    });
+    const restScale = torsoLength(restingArmsAtSides, R_SHOULDER, R_HIP, NOOP_W, NOOP_H);
+    const restHandSep =
+      Math.hypot(
+        restingArmsAtSides[R_WRIST].x - restingArmsAtSides[L_WRIST].x,
+        restingArmsAtSides[R_WRIST].y - restingArmsAtSides[L_WRIST].y
+      ) / restScale;
+    console.assert(
+      restHandSep >= FULL_DRAW_HAND_SEP_MIN,
+      `resting-arms-at-sides fixture must itself measure past FULL_DRAW_HAND_SEP_MIN (${FULL_DRAW_HAND_SEP_MIN}) for this to be a fair test of the known bug — got ${restHandSep.toFixed(3)}`
+    );
+    isAtFullDraw(restingArmsAtSides, 0, true, NOOP_W, NOOP_H);
+    isAtFullDraw(restingArmsAtSides, 500, true, NOOP_W, NOOP_H); // standing still — isolates the finding to SEP/ANCHOR/ARM specifically, not STILL
+    console.assert(
+      ttById.sep.read(restingArmsAtSides).lamp === true,
+      "PROVEN BUG (see CLAUDE.md): SEP must read lit on an ordinary resting stance — if this ever reads dark, either the underlying bug was fixed (update the report) or this fixture stopped being realistic"
+    );
+    console.assert(
+      ttById.anchor.read(restingArmsAtSides).lamp === false,
+      "ANCHOR must correctly stay dark at rest (the draw hand is nowhere near the face) — this is what keeps AT FULL DRAW honest even while SEP alone is wrong"
+    );
+    console.assert(
+      ttById.fulldraw.read(restingArmsAtSides).lamp === false,
+      "AT FULL DRAW must stay dark at rest even though SEP alone incorrectly fires — ANCHOR failing must be enough to keep the composite honest"
+    );
+    // ADDITIONAL FINDING, not predicted by the original brief (which only named SEP): a relaxed
+    // hanging arm doesn't buckle at the elbow under just its own weight, so it measures as very
+    // nearly straight — which means ARM ALSO reads lit on this exact same resting pose, by the
+    // same "ordinary standing posture looks more like a drawn bow than it should" mechanism as
+    // SEP. Reported here rather than smoothed over, per the brief's own instruction to surface
+    // unpredicted failures prominently.
+    console.assert(
+      ttById.arm.read(restingArmsAtSides).lamp === true,
+      "ADDITIONAL FINDING: ARM also reads lit on this same resting stance — a relaxed hanging arm measures as very nearly straight, the same shape of bug as SEP"
+    );
+
+    // RAISE / OPEN: a dedicated arm-raised fixture (the earlier `raise` fixture's bow arm points
+    // sideways to test hand separation, not upward, so it doesn't exercise bowArmRaiseHeight).
+    raiseArmed = false;
+    lastDrawWrist = null;
+    const armRaised = mkLandmarks({
+      ...base,
+      13: { x: 0.3, y: 0.1 }, // bow elbow, above the bow shoulder
+      15: { x: 0.3, y: 0.0 }, // bow wrist, well above the bow shoulder (y=0.3) — comfortably past shoulder height
+      16: { x: 0.5, y: 0.6 }, // draw wrist stays down at rest — this is a raise, not a draw
+    });
+    const raisedHeight = bowArmRaiseHeight(armRaised, NOOP_W, NOOP_H);
+    console.assert(
+      raisedHeight >= RAISE_TRIGGER_UP_FRACTION,
+      `arm-raised fixture must itself clear RAISE_TRIGGER_UP_FRACTION for this to be a fair test — got ${raisedHeight}`
+    );
+    updateRaiseTrigger(armRaised, NOOP_W, NOOP_H, 0);
+    console.assert(ttById.raise.read(armRaised).lamp === true, "RAISE screen must read lit once the bow wrist clears shoulder height");
+    attempt = null;
+    trackShotAttempt({ handSep: null, raiseArmed, atFullDraw: false, eligible: false }, 0);
+    console.assert(ttById.open.read(armRaised).lamp === true, "OPEN screen must read lit once the raise alone has opened an attempt");
+
+    const armDown = mkLandmarks({ ...base, 13: { x: 0.3, y: 0.45 }, 15: { x: 0.3, y: 0.58 }, 16: { x: 0.5, y: 0.58 } });
+    updateRaiseTrigger(armDown, NOOP_W, NOOP_H, 1000);
+    console.assert(ttById.raise.read(armDown).lamp === false, "RAISE screen must read dark once the bow wrist drops back down well below shoulder height");
+    trackShotAttempt({ handSep: 0, raiseArmed, atFullDraw: false, eligible: false }, 1000);
+    console.assert(ttById.open.read(armDown).lamp === false, "OPEN screen must read dark once the attempt has closed (hands relaxed, raise cleared)");
+
+    // ELIGIBLE: resetSettling() must show 0 settled frames and a dark (unlit) lamp; enough
+    // consecutive advanceSettling() calls must clear the frame-count gate and light the momentary
+    // ELIGIBLE lamp — cropBoxStableThisFrame passed as true throughout so this isolates the frame-
+    // count gate specifically, regardless of ROI_CROPPING_ENABLED's real value (advanceSettling
+    // ignores that argument entirely when cropping is off).
+    resetSettling();
+    console.assert(ttById.eligible.read(null).rows[0].value === "0", "ELIGIBLE's settled-frame count must read 0 right after a reset");
+    console.assert(ttById.eligible.read(null).lamp === false, "ELIGIBLE lamp must be dark right after a reset — no frame has been eligible yet");
+    let eligibleNow = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED; i++) eligibleNow = advanceSettling(true, true);
+    console.assert(eligibleNow === true, "advanceSettling must itself return true once enough frames have passed, or this isn't a fair test of ELIGIBLE");
+    debugEvents.frameEligible = performance.now();
+    console.assert(ttById.eligible.read(null).lamp === true, "ELIGIBLE screen must read lit the instant a frame clears the settling gate");
+
+    // POSE: a direct, honest reflection of lastPoseSeen — set here exactly as renderLoop's own two
+    // branches set it, not recomputed independently.
+    lastPoseSeen = true;
+    console.assert(ttById.pose.read(drawn).lamp === true, "POSE screen must read lit when lastPoseSeen is true");
+    console.assert(ttById.pose.read(drawn).inputs.length === 15, "POSE screen must list all 15 named landmarks this app tracks");
+    lastPoseSeen = false;
+    console.assert(ttById.pose.read(null).lamp === false, "POSE screen must read dark when lastPoseSeen is false");
+
+    // ATTN: attentionIsClearlyCalm decides calm/not-calm per sample; updateAttentionState's state
+    // machine decides engaged/idle from a HELD stretch of that signal. Drive both directly with a
+    // calm, motionless fixture and confirm the ATTN screen only goes dark (idle) once the hold has
+    // actually lasted ATTENTION_IDLE_AFTER_MS, and instantly back to lit (engaged) the moment a
+    // single sample stops being calm — the fail-toward-recording asymmetry CLAUDE.md describes.
+    attentionEngaged = true;
+    attentionCalmSinceMs = null;
+    attentionPrevRef = null;
+    attentionLastEvalMs = null;
+    attempt = null;
+    const calmFixture = mkLandmarks({ ...base, 15: { x: 0.3, y: 0.58 }, 16: { x: 0.32, y: 0.58 } }); // hands relaxed together, well under ATTENTION_REST_HAND_SEP_MAX
+    updateAttentionState(0, calmFixture, NOOP_W, NOOP_H, true, true);
+    console.assert(ttById.attn.read(calmFixture).lamp === true, "ATTN must still read lit (engaged) on the very first calm sample — one sample is never enough to idle");
+    updateAttentionState(ATTENTION_IDLE_AFTER_MS + 1, calmFixture, NOOP_W, NOOP_H, true, true);
+    console.assert(ttById.attn.read(calmFixture).lamp === false, "ATTN must read dark (idle) once the calm condition has held continuously for ATTENTION_IDLE_AFTER_MS");
+    const movingFixture = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } }); // hands apart — not calm
+    updateAttentionState(ATTENTION_IDLE_AFTER_MS + 100, movingFixture, NOOP_W, NOOP_H, true, true);
+    console.assert(ttById.attn.read(movingFixture).lamp === true, "ATTN must read lit (engaged) again the instant a single sample stops being calm — no confirmation delay");
+  }
+
+  // --- ?triggertest DOM RESIDUE: found in review. `renderCurrentTrigger` sets tt-note/tt-reason
+  // text only inside the `if (has one)` branch and only cleared DISPLAY (not text) in the `else`
+  // — so a note/reason from a PREVIOUS screen stayed sitting in the DOM (invisible via
+  // display:none, but still readable as text) until a later screen overwrote it. The bug is
+  // ORDER-DEPENDENT: it never shows up checking one screen fresh off a page load, only checking a
+  // note-less screen AFTER a screen that had one — so that's exactly what this checks. Only
+  // meaningful once the real panel exists (buildTriggerTestPanel/ttRefs — see TRIGGERTEST's own
+  // comment for why this needs the flag itself, not just DEBUG).
+  if (TRIGGERTEST) {
+    const savedTtIndex = ttIndex;
+    const sepIndex = TRIGGER_DEFS.findIndex((d) => d.id === "sep"); // has a note
+    const stillIndex = TRIGGER_DEFS.findIndex((d) => d.id === "still"); // note: null
+    ttIndex = sepIndex;
+    renderCurrentTrigger();
+    console.assert(
+      ttRefs["tt-note"].textContent.includes("Known issue"),
+      "sanity check: SEP's own note must actually render, or the ordering check below proves nothing"
+    );
+    ttIndex = stillIndex;
+    renderCurrentTrigger();
+    console.assert(
+      ttRefs["tt-note"].textContent === "",
+      `a screen with note:null must leave tt-note's TEXT empty, not just hidden, once a PREVIOUS screen has set one — got ${JSON.stringify(ttRefs["tt-note"].textContent)}`
+    );
+
+    // Same class of bug, same fix, for the reason line: drive isAtFullDraw into a bail state (a
+    // real reason) on one screen, then switch to a screen whose `read()` never returns a `reason`
+    // key at all (raise) and confirm the text — not just the display — actually clears.
+    lastDrawWrist = null;
+    const missingForReason = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3, visibility: 0 }, 16: { x: 0.52, y: 0.31 } });
+    isAtFullDraw(missingForReason, 0, true, NOOP_W, NOOP_H);
+    const anchorIndex = TRIGGER_DEFS.findIndex((d) => d.id === "anchor");
+    ttIndex = anchorIndex;
+    renderCurrentTrigger();
+    console.assert(
+      ttRefs["tt-reason"].textContent.length > 0,
+      "sanity check: a real bail reason must actually render, or the ordering check below proves nothing"
+    );
+    const raiseIndex = TRIGGER_DEFS.findIndex((d) => d.id === "raise"); // read() never sets `reason`
+    ttIndex = raiseIndex;
+    renderCurrentTrigger();
+    console.assert(
+      ttRefs["tt-reason"].textContent === "",
+      `a screen whose read() carries no reason must leave tt-reason's TEXT empty, not just hidden, once a PREVIOUS screen has set one — got ${JSON.stringify(ttRefs["tt-reason"].textContent)}`
+    );
+
+    ttIndex = savedTtIndex;
+    renderCurrentTrigger();
+  }
 
   // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand
   // separation stays at/above DRAW_ATTEMPT_MIN_SEP, collecting its eligible frames along the way
