@@ -50,9 +50,38 @@ const FULL_DRAW_BOW_ARM_MIN = 140; // degrees; bow arm must be at least this str
 // catch. Read the live elevation angle off the ?triggertest ARM screen to tighten this once real
 // numbers exist, same loop as every other constant in this block.
 const FULL_DRAW_ARM_CONE_APERTURE_DEG = 45;
-const FULL_DRAW_HAND_SEP_MIN = 0.75; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. THE key signal: a compound's draw length is fixed by a mechanical stop, so this is near-binary (mid-raise vs. hard against the wall) and can be set with confidence
-const DRAW_ATTEMPT_MIN_SEP = 0.3; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one
-const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still" — kept tight (not loosened) because a compound archer at let-off is genuinely steady, unlike the fast continuous motion of the raise
+// HAND-SEPARATION FAMILY — RE-DERIVED 2026-08-24 from the owner's own ?triggertest field
+// readings, which OVERRIDE every earlier desk estimate here (see CLAUDE.md's FIELD FEEDBACK
+// entry): full draw measured 1.5 (torso-length fraction); resting, standing still, measured
+// 1.07 (median of 1,497 samples). That resting number is the whole reason this block changed —
+// FULL_DRAW_HAND_SEP_MIN was 0.75 and DRAW_ATTEMPT_MIN_SEP was 0.3, both far BELOW his own resting
+// reading, so an attempt opened on the very first frame and could never close, and "SEP" read as
+// full draw permanently. Owner's own words: "there are many more arrows than I've actually shot"
+// and, on the OPEN trigger specifically, "always lit, even with one hand behind my back."
+//
+// THE COUPLING TRAP — why three constants had to be re-derived TOGETHER, not one at a time.
+// SHOT_MIN_PEAK_SEP below used to be defined as a FRACTION of FULL_DRAW_HAND_SEP_MIN
+// (0.8 * FULL_DRAW_HAND_SEP_MIN). Raising FULL_DRAW_HAND_SEP_MIN alone to fix IT would have
+// dragged that fraction's absolute value up too, and — because the whole usable band between
+// 1.07 and 1.5 is only 0.43 wide — a plausible-looking fix could easily have landed the fraction
+// BELOW 1.07 again while looking fixed on paper. That is why SHOT_MIN_PEAK_SEP is no longer a
+// fraction of anything (see its own comment below): a constant whose value depends on another
+// constant can silently reopen exactly this trap the next time either one is retuned.
+//
+// The three constants below are laid out on the measured 1.07-to-1.5 line, evenly spaced with
+// real margin at both ends and from each other — none of them a hairline split:
+//   DRAW_ATTEMPT_MIN_SEP   1.20   (+0.13 / +12% above rest, -0.30 / -20% below full draw)
+//   SHOT_MIN_PEAK_SEP      1.30   (+0.23 / +21% above rest, -0.20 / -13% below full draw)
+//   FULL_DRAW_HAND_SEP_MIN 1.35   (+0.28 / +26% above rest, -0.15 / -10% below full draw)
+// RAISE cautiously, and only against a NEW field reading — CLAUDE.md flags that his measured
+// NOCKING and MID-RAISE readings are still missing, and a synthetic model (since shown to
+// understate his real full draw) once argued those two phases could read HIGHER than full draw.
+// Until those two are actually measured, treat 1.07 as the only proven floor, not the only one
+// that will ever matter.
+const FULL_DRAW_HAND_SEP_MIN = 1.35; // the two wrists must be at least this far apart, as a fraction of torso length, to count as "drawn" — during the raise both hands are close together near the head, only at full draw are they a draw-length apart. See the HAND-SEPARATION FAMILY comment above for the full derivation against his measured 1.07 (rest) / 1.5 (full draw)
+const DRAW_ATTEMPT_MIN_SEP = 1.2; // fraction of torso length; hand separation must drop back below this (hands back together, at rest between shots) before the shot log below will treat the NEXT rise as a new attempt — this is what stops one long hold from being logged as several rows, and stops two separate shots from being merged into one. This is a FALLBACK path now that the RAISE TRIGGER below is the owner's confirmed-working way to open an attempt early (his own field report: "works perfectly") — hand separation alone only has to catch what the raise trigger misses (occlusion, a raise trigger that never fires), so it can sit close to FULL_DRAW_HAND_SEP_MIN without losing the early-raise coverage the raise trigger already provides
+const FULL_DRAW_STILL_MAX = 0.15; // the draw wrist may drift at most this much (as a fraction of torso length) per second and still count as "holding still". RE-DERIVED 2026-08-24: the owner's own ?triggertest reading while genuinely holding at full draw was 0.05 — the old 0.35 was seven times looser than that, so a brief pause mid-draw (not a real hold) could satisfy it. Set to 3x his measured value (single field sample, not a spread, so real margin against ordinary noise) rather than tightened all the way to 0.05 itself. See FULL_DRAW_STILL_HOLD_MS below for the other half of his complaint — this bounds INSTANTANEOUS speed only, a hold requirement is separate
+const FULL_DRAW_STILL_HOLD_MS = 500; // NEW 2026-08-24, owner's own complaint: "the check is a moment, not a hold" — a brief pause mid-draw used to satisfy STILL for a single frame. The draw wrist's speed must now stay at/under FULL_DRAW_STILL_MAX continuously for this long, not just on one lucky frame, before STILL passes (see the stillHoldStartMs bookkeeping in isAtFullDraw). Set to well under half of SHOT_MIN_DURATION_MS (600ms) so a genuine hold is confirmed comfortably inside a valid shot's own duration; a compound archer's mechanical let-off makes half a second of stillness trivial to hold (he can hold steady for SECONDS), so this costs a real hold nothing while still ruling out a rushed, momentary pause
 
 // Shot-log ATTEMPT GATING — decide whether a draw attempt plausibly happened at all, before it's
 // allowed to become a row. Added after a field report: with only DRAW_ATTEMPT_MIN_SEP as a floor
@@ -72,13 +101,24 @@ const FULL_DRAW_STILL_MAX = 0.35; // the draw wrist may drift at most this much 
 // enough pause in that orientation can still clear these two gates and open/log a row via hand
 // separation alone (the raise trigger's fallback path, kept deliberately — see its own comment:
 // a missed raise must still be able to log a real shot). Do NOT read that as license to tighten
-// SHOT_MIN_PEAK_SEP_FRACTION/DRAW_ATTEMPT_MIN_SEP against it — with the reachedFullDraw distinction
+// SHOT_MIN_PEAK_SEP/DRAW_ATTEMPT_MIN_SEP against it — with the reachedFullDraw distinction
 // below (see fullDrawShotCount, endAttempt's signalOutcome call, and renderShotLog/buildShareText),
 // this case can no longer fake a green "arrow counted" flash or corrupt the consistency numbers:
 // anchorOk fails for it every time (nobody's hand is near their face while just standing there),
 // so it logs a marked, excluded, "seen but not confirmed" row — a correct, acceptable outcome for
 // a resting posture, not a bug to chase by making these two constants stricter.
-const SHOT_MIN_PEAK_SEP_FRACTION = 0.8; // the attempt's peak hand separation must reach at least this fraction of FULL_DRAW_HAND_SEP_MIN (0.8 x 0.75 = 0.6 torso-lengths apart) to count as a real draw attempt — comfortably above the ~0.3-0.5 range nocking/lowering the bow produces, comfortably below the 0.75 that counts as full draw itself
+//
+// NO LONGER A FRACTION OF FULL_DRAW_HAND_SEP_MIN — deliberately changed 2026-08-24. It used to be
+// SHOT_MIN_PEAK_SEP_FRACTION (0.8) times FULL_DRAW_HAND_SEP_MIN, so retuning the full-draw
+// threshold alone silently retuned this gate too — the exact coupling trap the HAND-SEPARATION
+// FAMILY comment above describes: raising FULL_DRAW_HAND_SEP_MIN to fix the resting-reads-as-
+// full-draw bug would have dragged this fraction's absolute value up right along with it, with no
+// guarantee it landed on the correct side of the owner's 1.07 resting reading. An absolute
+// constant can't be dragged by a change somewhere else; it has to be looked at and re-checked
+// against 1.07 on its own, which is the whole point. Kept the honest name this time — a constant
+// called "_FRACTION" that no longer holds a fraction would be exactly the kind of trap the next
+// engineer falls into.
+const SHOT_MIN_PEAK_SEP = 1.3; // the attempt's peak hand separation must reach at least this — a real, standalone torso-length fraction, not a fraction of another constant (see above) — to count as a real draw attempt. Sits between DRAW_ATTEMPT_MIN_SEP (1.2) and FULL_DRAW_HAND_SEP_MIN (1.35) on the owner's measured 1.07 (rest) to 1.5 (full draw) line: +0.23/+21% above rest, -0.2/-13% below his measured full draw — comfortably clear of both with only two field readings to go on
 const SHOT_MIN_DURATION_MS = 600; // an attempt must last at least this long, from when hands first cross DRAW_ATTEMPT_MIN_SEP to when they drop back below it, to count as a real draw rather than a brief noise spike (a hand passing near the body, a tracking glitch) — a real compound draw, even a rushed one, takes real time to raise, draw and settle
 
 // RAISE TRIGGER — owner's own proposal, field-tested reasoning: "every time i raise my left arm
@@ -514,6 +554,15 @@ let mirrorToggled = false;
 // below. Deliberately just one remembered frame, not a history buffer — cheap and enough.
 let lastDrawWrist = null;
 
+// Wall-clock time (nowMs) the CURRENT unbroken streak of "instantaneous speed at/under
+// FULL_DRAW_STILL_MAX" began, or null if the most recent frame wasn't still — see
+// FULL_DRAW_STILL_HOLD_MS and isAtFullDraw's own stillOk computation. Reset alongside
+// resetSettling() (see that function): a streak measured across a settling-reset boundary
+// (session start, tracking lost, camera switched, attention wake) would be comparing a fresh
+// position against a stale one, the same reasoning PIPELINE SETTLING already applies to
+// everything else that resets at those points.
+let stillHoldStartMs = null;
+
 // Builds a fresh "nothing computed yet/this bail" debugInfo object — the ?debug panel's
 // NEVER-BLANK guarantee lives here. `reason` is a plain-language sentence naming why isAtFullDraw
 // couldn't get all the way through this frame (or null on a frame that succeeded); every other
@@ -530,7 +579,7 @@ function emptyDebugInfo(reason) {
     anchorBackward: null, anchorBackwardOk: null,
     bowArmAngle: null, armStraightOk: null,
     armElevation: null, armConeOk: null, armOk: null,
-    speed: null, stillOk: null,
+    speed: null, stillSpeedOk: null, stillHoldMs: null, stillOk: null,
     // Pixel-space points/scale, filled in only on a frame that got all the way through — used
     // exclusively by drawTriggerTestOverlay to draw the acceptance regions on top of the camera
     // picture without recomputing any geometry a second time (see that function's own comment).
@@ -1064,9 +1113,18 @@ function advanceSettling(cropBoxUsedThisFrame, cropBoxStableThisFrame, landmarks
 // exactly as untrustworthy as one right after startup, and must be re-gated the same way. Also
 // drops prevUsedCropBox — a box from before the reset must never be compared against a fresh one
 // after it, which would falsely read as "stable" when nothing has actually settled.
+//
+// Also clears stillHoldStartMs — a DIFFERENT mechanism (FULL_DRAW_STILL_HOLD_MS's continuous-hold
+// streak in isAtFullDraw) reset here for the SAME reason: lastDrawWrist is not itself reset at
+// these points (see its own comment), so the first frame back after a reset can compare against a
+// stale, pre-reset position/timestamp and read a falsely low speed. A stale streak surviving that
+// one bad frame could then let a single-frame artifact seed a "held still" clock across a moment
+// where nothing was actually being tracked. Clearing it here — the one function every reset point
+// already calls — costs nothing extra and closes that gap for free.
 function resetSettling() {
   settledFrames = 0;
   prevUsedCropBox = null;
+  stillHoldStartMs = null;
 }
 // ===========================================================================
 
@@ -2299,7 +2357,22 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
     prev && dtSec > 0 ? Math.hypot(wrist.x - prev.x, wrist.y - prev.y) / scale / dtSec : Infinity;
 
   const sepOk = handSep >= FULL_DRAW_HAND_SEP_MIN;
-  const stillOk = speed <= FULL_DRAW_STILL_MAX;
+
+  // STILL is now a HOLD, not a moment — owner's own complaint: "the check is a moment, not a
+  // hold", a brief pause mid-draw used to satisfy it. stillSpeedOk is the old instantaneous
+  // check, kept as its own name so the two ideas ("slow enough right now" vs "has STAYED slow
+  // enough for a while") are never conflated again. stillHoldStartMs (module state, reset
+  // alongside resetSettling — see its own comment) marks when the CURRENT unbroken streak of
+  // stillSpeedOk began; any single non-still frame collapses it back to null, so the streak can
+  // never survive a real pause and must restart from zero — no partial credit for "mostly still".
+  const stillSpeedOk = speed <= FULL_DRAW_STILL_MAX;
+  if (stillSpeedOk) {
+    if (stillHoldStartMs === null) stillHoldStartMs = nowMs;
+  } else {
+    stillHoldStartMs = null;
+  }
+  const stillHoldMs = stillHoldStartMs === null ? 0 : nowMs - stillHoldStartMs;
+  const stillOk = stillSpeedOk && stillHoldMs >= FULL_DRAW_STILL_HOLD_MS;
 
   if (DEBUG || TRIGGERTEST) {
     debugInfo = {
@@ -2307,7 +2380,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
       anchorDist, anchorOk, anchorVerticalOffset, anchorVerticalOk, anchorBackward, anchorBackwardOk,
       handSep, sepOk,
       bowArmAngle, armStraightOk, armElevation, armConeOk, armOk,
-      speed, stillOk,
+      speed, stillSpeedOk, stillHoldMs, stillOk,
       // Pixel-space points/scale for drawTriggerTestOverlay — see emptyDebugInfo's own comment.
       anchorPx: anchor, drawWristPx: wrist, bowWristPx: bowWristPos,
       bowShoulderPx: toPixelSpace(landmarks[bowShoulder], frameWidth, frameHeight),
@@ -2363,7 +2436,7 @@ function isAtFullDraw(landmarks, nowMs, frameEligible, frameWidth, frameHeight) 
 //
 // An in-progress attempt tracks TWO separate things, deliberately kept apart:
 //   - peakHandSep: the best hand separation seen on ANY frame, eligible or not. This is what
-//     the SHOT_MIN_PEAK_SEP_FRACTION gate in endAttempt below judges — whether the archer really
+//     the SHOT_MIN_PEAK_SEP gate in endAttempt below judges — whether the archer really
 //     drew the bow is a fact about what his hands did, unaffected by whether the pipeline had
 //     finished settling yet. UNCHANGED by the move to medians below: "did he draw far enough to
 //     count as a shot at all" is still, correctly, a question about the single most extreme
@@ -2544,7 +2617,7 @@ function medianSampleOf(frames) {
 // wouldn't have earned.
 //
 // Two gates first, both against the attempt's own peak (ALL frames, eligible or not — see
-// trackShotAttempt above) — see SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS above for
+// trackShotAttempt above) — see SHOT_MIN_PEAK_SEP and SHOT_MIN_DURATION_MS above for
 // why these two specifically. An attempt that fails either one gets thrown away, not logged:
 // counted in rejectedAttemptCount, and any clip recording still running for it gets DISCARDED
 // (see discardRecording) right now rather than left to expire on its own.
@@ -2572,7 +2645,7 @@ function endAttempt(nowMs) {
   const a = attempt;
   attempt = null; // clear first — logShot/finalizeRecording below must never see a stale in-progress attempt
 
-  const gotDeepEnough = a.peakHandSep >= SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN;
+  const gotDeepEnough = a.peakHandSep >= SHOT_MIN_PEAK_SEP;
   const lastedLongEnough = typeof nowMs === "number" && typeof a.startMs === "number" && nowMs - a.startMs >= SHOT_MIN_DURATION_MS;
 
   if (!gotDeepEnough || !lastedLongEnough) {
@@ -2825,7 +2898,7 @@ function finalizeRecording(rec) {
 }
 
 // Marks a recording as belonging to an attempt the app has just decided to THROW AWAY (failed
-// SHOT_MIN_PEAK_SEP_FRACTION/SHOT_MIN_DURATION_MS, or never produced a single settled frame) —
+// SHOT_MIN_PEAK_SEP/SHOT_MIN_DURATION_MS, or never produced a single settled frame) —
 // see endAttempt's two early-return branches, the only callers. This is a genuinely different
 // claim from a recording that failed: the app is not reporting "this clip broke", it's reporting
 // "there was never going to be a shot here to have a clip at all." Set BEFORE finalizeRecording
@@ -4093,7 +4166,13 @@ function syncDebugOverlay(nowMs, landmarks, frameWidth, frameHeight) {
   setGate("g-anchor", d.anchorDist, d.anchorOk, `≤ ${FULL_DRAW_ANCHOR_MAX}`, fmt);
   setGate("g-arm", d.bowArmAngle, d.armOk, `≥ ${FULL_DRAW_BOW_ARM_MIN}°`, fmtDeg);
   setGate("g-sep", d.handSep, d.sepOk, `≥ ${FULL_DRAW_HAND_SEP_MIN}`, fmt);
-  setGate("g-still", d.speed, d.stillOk, `≤ ${FULL_DRAW_STILL_MAX}`, fmt);
+  // Custom, not setGate: STILL is now a hold, not a moment (see FULL_DRAW_STILL_HOLD_MS), so the
+  // value line packs in both halves — how fast right now, and how long that's held continuously —
+  // rather than just the instantaneous speed setGate's generic shape shows for every other gate.
+  r["g-still-val"].textContent = `${fmt(d.speed)} · held ${((d.stillHoldMs ?? 0) / 1000).toFixed(1)}s`;
+  r["g-still-val"].className = `dbg-val ${okClass(d.stillOk)}`;
+  r["g-still-thresh"].textContent = `≤ ${FULL_DRAW_STILL_MAX}, ≥ ${(FULL_DRAW_STILL_HOLD_MS / 1000).toFixed(1)}s`;
+  setLamp(r["g-still-lamp"], d.stillOk === true);
   setLamp(r["g-fulldraw-lamp"], d.anchorOk === true && d.armOk === true && d.sepOk === true && d.stillOk === true);
 
   // ----- TRIGGERS / STATE -----
@@ -4434,9 +4513,9 @@ const TRIGGER_DEFS = [
   {
     id: "sep",
     label: "SEP",
-    sentence: "Are your two hands far enough apart to look like a real full draw — roughly three-quarters of your own torso length or more?",
+    sentence: "Are your two hands far enough apart to look like a real full draw — more than one torso length apart?",
     doThis: "Draw the bow all the way back to light this. Bring your hands back together to make it go dark.",
-    note: "Known issue, proven against a real session (see CLAUDE.md): standing normally with your arms relaxed at your sides is often enough on its own to light this up — your shoulders alone are usually wider than this threshold. If this stays lit while you're just standing there doing nothing, that's a known limitation of this check, not something wrong with your stance — it's one of the reasons this inspector exists.",
+    note: "Known issue, re-measured 2026-08-24 off your own real numbers (resting 1.07, full draw 1.5 — see CLAUDE.md): standing normally at rest should no longer light this up. What's still unmeasured is nocking an arrow and raising the bow partway — if either of THOSE lights this up, that's a known gap this hasn't been checked against yet, not something wrong with your stance. Tell us the reading if it happens.",
     read(landmarks) {
       const { bowWrist, drawWrist, bowShoulder, bowElbow } = triggerTestRoleLabels();
       const d = debugInfo;
@@ -4474,8 +4553,8 @@ const TRIGGER_DEFS = [
   {
     id: "still",
     label: "STILL",
-    sentence: "Has your draw hand stopped moving — are you holding steady?",
-    doThis: "Hold your position still for a moment to light this. Keep moving your draw arm/hand to make it go dark.",
+    sentence: "Has your draw hand stopped moving, AND held steady long enough — not just for one lucky instant?",
+    doThis: "Hold your position completely still for at least half a second to light this. Keep moving your draw arm/hand — or even pause briefly and move again — to make it go dark and restart the hold clock.",
     note: null,
     read(landmarks) {
       const { drawWrist } = triggerTestRoleLabels();
@@ -4483,7 +4562,21 @@ const TRIGGER_DEFS = [
       return {
         lamp: d.stillOk === true,
         reason: d.reason,
-        rows: [{ label: "Draw-wrist speed", value: `${ttFmt(d.speed)} × torso/second`, threshold: `needs ≤ ${FULL_DRAW_STILL_MAX}`, ok: d.stillOk }],
+        // Two rows now, not one — the owner's own complaint was "this is a moment, not a hold",
+        // so both halves of that need to be visible on their own: is he slow enough RIGHT NOW
+        // (stillSpeedOk), and separately, has that been true continuously for long enough
+        // (stillHoldMs vs. FULL_DRAW_STILL_HOLD_MS). The lamp above is d.stillOk, both ANDed
+        // together — a screen where the speed row is green but the hold row isn't is exactly the
+        // case this hold requirement exists to catch (a brief pause mid-draw, not a real hold).
+        rows: [
+          { label: "Draw-wrist speed", value: `${ttFmt(d.speed)} × torso/second`, threshold: `needs ≤ ${FULL_DRAW_STILL_MAX}`, ok: d.stillSpeedOk },
+          {
+            label: "Held that still for",
+            value: `${((d.stillHoldMs ?? 0) / 1000).toFixed(1)}s`,
+            threshold: `needs ≥ ${(FULL_DRAW_STILL_HOLD_MS / 1000).toFixed(1)}s straight`,
+            ok: d.stillHoldMs == null ? null : d.stillHoldMs >= FULL_DRAW_STILL_HOLD_MS,
+          },
+        ],
         inputs: [
           ttInputRow(landmarks, drawWrist, "draw wrist — compared against where it was on the previous frame; there's no second landmark for this one"),
         ],
@@ -5684,12 +5777,18 @@ function selfTest() {
   console.assert(isAtFullDraw(raise, 0, true, NOOP_W, NOOP_H) === false, "raise (first frame) must not read as full draw");
   console.assert(
     isAtFullDraw(raise, 500, true, NOOP_W, NOOP_H) === false,
-    "raise held steady for a second frame (passes stillness too, now) must still be rejected — by hand separation alone"
+    // Note: with FULL_DRAW_STILL_HOLD_MS added 2026-08-24, this second frame doesn't even clear
+    // STILL on its own any more (the hold streak has only just begun) — but that's moot here,
+    // since hand separation alone already fails this fixture regardless of stillness.
+    "raise held steady for a second frame must still be rejected — by hand separation alone"
   );
 
-  // --- Full draw, held: hands apart, near anchor, bow arm straight. Rejected on the first
-  // frame only because there's no prior position yet to judge stillness from; reads true once
-  // it's held for a frame.
+  // --- Full draw, held: hands apart, near anchor, bow arm straight. Rejected on the first frame
+  // because there's no prior position yet to judge stillness from; STILL is now a HOLD, not a
+  // moment (FULL_DRAW_STILL_HOLD_MS, added 2026-08-24 — see isAtFullDraw's stillHoldStartMs
+  // bookkeeping), so a second frame with zero speed starts the hold streak but does not yet
+  // clear it (stillHoldMs is 0 right on the frame the streak begins); only reads true once held
+  // continuously for FULL_DRAW_STILL_HOLD_MS (500ms).
   lastDrawWrist = null;
   const drawn = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.52, y: 0.31 } });
   console.assert(
@@ -5697,8 +5796,12 @@ function selfTest() {
     "first frame at full draw should read as still-moving (no prior position yet)"
   );
   console.assert(
-    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H) === true,
-    "same position 500ms later (zero speed) should read as full draw"
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H) === false,
+    "same position 500ms later (zero speed): the hold streak has only just begun (0ms of the required 500ms) — must not read as full draw yet"
+  );
+  console.assert(
+    isAtFullDraw(drawn, 1001, true, NOOP_W, NOOP_H) === true,
+    "held continuously for 501ms since the streak began — clears FULL_DRAW_STILL_HOLD_MS, should now read as full draw"
   );
 
   // --- Drawing in progress: hands already apart and already near anchor (so anchor, arm, and
@@ -5841,9 +5944,18 @@ function selfTest() {
     // A genuine held full draw (reusing the `drawn` fixture from earlier) must light ANCHOR, ARM,
     // SEP, STILL and the AT FULL DRAW composite all at once — the SHOULD-FIRE case for all five
     // full-draw screens, and the never-blank reason must have cleared (see debugInfo.reason).
+    // THREE frames now, not two — FULL_DRAW_STILL_HOLD_MS (500ms) added a HOLD requirement on
+    // top of the old instantaneous speed check (see isAtFullDraw's stillHoldStartMs bookkeeping),
+    // and a single zero-speed frame no longer clears it: the hold streak only STARTS on the frame
+    // where speed first reads still (frame 2 here, t=500 — speed is Infinity on frame 1, with no
+    // previous position to compare against), so stillHoldMs is still 0 right on frame 2 itself.
+    // Frame 3 (t=1001) is >=500ms after the streak began, clearing the hold — this drives the
+    // real pipeline through the actual number of frames a real sustained hold needs, rather than
+    // loosening what STILL means to fit two frames.
     lastDrawWrist = null;
     isAtFullDraw(drawn, 0, true, NOOP_W, NOOP_H);
-    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H); // second frame: zero speed, so STILL passes too
+    isAtFullDraw(drawn, 500, true, NOOP_W, NOOP_H); // speed becomes 0 here, starting the hold streak — stillHoldMs is still 0 on this very frame
+    isAtFullDraw(drawn, 1001, true, NOOP_W, NOOP_H); // 501ms into the streak — clears FULL_DRAW_STILL_HOLD_MS (500ms), so STILL now passes for real
     console.assert(ttById.anchor.read(drawn).lamp === true, "ANCHOR screen must read lit on a genuine held full draw");
     console.assert(ttById.arm.read(drawn).lamp === true, "ARM screen must read lit on a genuine held full draw");
     console.assert(ttById.sep.read(drawn).lamp === true, "SEP screen must read lit on a genuine held full draw");
@@ -5852,10 +5964,10 @@ function selfTest() {
     console.assert(fdOnDraw.lamp === true, "AT FULL DRAW screen must read lit once all four sub-checks are true");
     console.assert(fdOnDraw.subLamps.every((s) => s.ok === true), "AT FULL DRAW's own sub-lamps must all show lit when the composite is lit");
 
-    // THE proven bug this whole tool exists to surface (see CLAUDE.md): a realistic body standing
-    // at rest, arms hanging naturally at the sides — NOT drawing at all — must make SEP read lit
-    // anyway, because an ordinary adult's shoulder width alone is comfortably past
-    // FULL_DRAW_HAND_SEP_MIN as a fraction of torso length. Anthropometric assumptions (standard
+    // FIXED 2026-08-24 (was: THE proven bug this whole tool exists to surface — see CLAUDE.md).
+    // A realistic body standing at rest, arms hanging naturally at the sides — NOT drawing at all
+    // — USED TO make SEP read lit anyway, because an ordinary adult's shoulder width alone was
+    // comfortably past the old FULL_DRAW_HAND_SEP_MIN (0.75). Anthropometric assumptions (standard
     // adult anthropometry figures, as fractions of standing height): biacromial (shoulder) width
     // ≈0.26x height, shoulder-to-hip (torso) length ≈0.29x height. On this file's shared 0.3
     // torso-length scale (see `base` above), that puts the shoulders ≈0.26 apart (0.26/0.29 × 0.3),
@@ -5863,7 +5975,12 @@ function selfTest() {
     // body, just a convenient shared rig for angle fixtures, so this trigger-test fixture overrides
     // shoulder width rather than reusing it. Hanging arms, both wrists at the same height straight
     // down from their own shoulder, then separate horizontally by that same ≈0.26/0.3 ≈ 0.87
-    // torso-lengths — comfortably past the 0.75 threshold.
+    // torso-lengths — comfortably past the OLD 0.75 threshold, but now comfortably BELOW the
+    // re-derived FULL_DRAW_HAND_SEP_MIN (1.35) and DRAW_ATTEMPT_MIN_SEP (1.2) both. This is a
+    // second, independent confirmation of the fix beyond the owner's own 1.07 resting reading —
+    // an idealized anthropometric model, not just one field measurement, also lands safely below
+    // every re-derived threshold. See the HAND-SEPARATION FAMILY comment near those constants for
+    // the full derivation.
     lastDrawWrist = null;
     const restingArmsAtSides = mkLandmarks({
       11: { x: 0.3, y: 0.3 }, // bow shoulder
@@ -5895,23 +6012,28 @@ function selfTest() {
         restingArmsAtSides[R_WRIST].x - restingArmsAtSides[L_WRIST].x,
         restingArmsAtSides[R_WRIST].y - restingArmsAtSides[L_WRIST].y
       ) / restScale;
+    // Fairness check, inverted from what it used to assert: this fixture's OWN handSep must sit
+    // BELOW the re-derived FULL_DRAW_HAND_SEP_MIN (and below DRAW_ATTEMPT_MIN_SEP too — this
+    // idealized resting posture shouldn't even open an attempt any more), or this isn't proving
+    // the fix holds at all. Kept as its own named quantity (not folded into the SEP assertion
+    // below) so a future engineer sees the actual number, not just a pass/fail lamp.
     console.assert(
-      restHandSep >= FULL_DRAW_HAND_SEP_MIN,
-      `resting-arms-at-sides fixture must itself measure past FULL_DRAW_HAND_SEP_MIN (${FULL_DRAW_HAND_SEP_MIN}) for this to be a fair test of the known bug — got ${restHandSep.toFixed(3)}`
+      restHandSep < FULL_DRAW_HAND_SEP_MIN && restHandSep < DRAW_ATTEMPT_MIN_SEP,
+      `resting-arms-at-sides fixture must measure below both DRAW_ATTEMPT_MIN_SEP (${DRAW_ATTEMPT_MIN_SEP}) and FULL_DRAW_HAND_SEP_MIN (${FULL_DRAW_HAND_SEP_MIN}) for the fix below to mean anything — got ${restHandSep.toFixed(3)}`
     );
     isAtFullDraw(restingArmsAtSides, 0, true, NOOP_W, NOOP_H);
     isAtFullDraw(restingArmsAtSides, 500, true, NOOP_W, NOOP_H); // standing still — isolates the finding to SEP/ANCHOR/ARM specifically, not STILL
     console.assert(
-      ttById.sep.read(restingArmsAtSides).lamp === true,
-      "PROVEN BUG (see CLAUDE.md): SEP must read lit on an ordinary resting stance — if this ever reads dark, either the underlying bug was fixed (update the report) or this fixture stopped being realistic"
+      ttById.sep.read(restingArmsAtSides).lamp === false,
+      "FIXED (was PROVEN BUG, see CLAUDE.md): SEP must now correctly read DARK on an ordinary resting stance — if this ever reads lit again, the hand-separation coupling trap has reopened (see the HAND-SEPARATION FAMILY comment near FULL_DRAW_HAND_SEP_MIN)"
     );
     console.assert(
       ttById.anchor.read(restingArmsAtSides).lamp === false,
-      "ANCHOR must correctly stay dark at rest (the draw hand is nowhere near the face) — this is what keeps AT FULL DRAW honest even while SEP alone is wrong"
+      "ANCHOR must ALSO stay dark at rest (the draw hand is nowhere near the face) — belt-and-braces alongside the now-fixed SEP check above, not the only thing keeping AT FULL DRAW honest any more"
     );
     console.assert(
       ttById.fulldraw.read(restingArmsAtSides).lamp === false,
-      "AT FULL DRAW must stay dark at rest even though SEP alone incorrectly fires — ANCHOR failing must be enough to keep the composite honest"
+      "AT FULL DRAW must stay dark at rest — now doubly true, since both SEP and ANCHOR correctly fail on their own"
     );
     // ARM CONE FIX (this task, 2026-08-24): a relaxed hanging arm doesn't buckle at the elbow
     // under just its own weight, so it still measures as very nearly straight (armStraightOk true
@@ -6201,7 +6323,7 @@ function selfTest() {
   // --- Shot log attempt-boundary rule: an attempt is "in progress" for as long as hand
   // separation stays at/above DRAW_ATTEMPT_MIN_SEP, collecting its eligible frames along the way
   // (see reservoirAdd); it ends when separation drops back below that floor OR the pose is lost —
-  // but only gets LOGGED if it also cleared the SHOT_MIN_PEAK_SEP_FRACTION and SHOT_MIN_DURATION_MS
+  // but only gets LOGGED if it also cleared the SHOT_MIN_PEAK_SEP and SHOT_MIN_DURATION_MS
   // gates in endAttempt (added after the field report: without these, nocking an arrow or lowering
   // the bow was logging as a phantom shot). Reset to a clean slate here — the outer save/restore
   // above puts it all back afterwards regardless.
@@ -6222,19 +6344,28 @@ function selfTest() {
     stillOk: true,
     ...extra,
   });
-  // SHOT_MIN_PEAK_SEP_FRACTION * FULL_DRAW_HAND_SEP_MIN = 0.8 * 0.75 = 0.6 — the peak-separation
-  // gate every fixture below is deliberately placed clearly above or clearly below.
+  // ABSOLUTE FIXTURE VALUES — deliberately NOT written as offsets from the constants they test
+  // (e.g. never `DRAW_ATTEMPT_MIN_SEP + 0.1`). A fixture defined relative to the constant it's
+  // checking can never catch that constant being wrong — exactly the "an assertion that cannot
+  // fail is worse than no assertion" trap this project has already shipped twice. These are
+  // plain numbers, chosen against the owner's own 2026-08-24 field readings (rest 1.07, full
+  // draw 1.5) and the re-derived constants (DRAW_ATTEMPT_MIN_SEP 1.2, SHOT_MIN_PEAK_SEP 1.3,
+  // FULL_DRAW_HAND_SEP_MIN 1.35 — see the HAND-SEPARATION FAMILY comment up top for the
+  // arithmetic) with real margin on the correct side of each line, same as the constants
+  // themselves. 1.07 (his real resting median) is used directly wherever a fixture means "at
+  // rest" — that doubles as a live check that the coupling trap can't quietly reopen: if
+  // DRAW_ATTEMPT_MIN_SEP were ever dragged back down to or under 1.07, these would start failing.
 
-  trackShotAttempt(sample(0.1), 0); // resting, below the floor: no attempt yet
+  trackShotAttempt(sample(1.07), 0); // resting — his own measured median, below DRAW_ATTEMPT_MIN_SEP (1.2): no attempt yet
   console.assert(log.length === 0 && attempt === null, "resting below the floor should not start an attempt");
 
   // --- A short, shallow wiggle — nocking an arrow, lowering the bow, hands drifting apart for a
   // moment — must NOT be logged: this is the exact field bug. It crosses DRAW_ATTEMPT_MIN_SEP
-  // (so it IS an "attempt" briefly), but its peak (0.45) never gets near the 0.6 gate, and it's
-  // over in 250ms, well under SHOT_MIN_DURATION_MS (600ms).
-  trackShotAttempt(sample(0.35), 1000); // crosses the floor
-  trackShotAttempt(sample(0.45), 1100); // peak — shallow
-  trackShotAttempt(sample(0.1), 1250); // hands back together 250ms after it started — ends the attempt
+  // (1.2, so it IS an "attempt" briefly), but its peak (1.26) never gets near SHOT_MIN_PEAK_SEP
+  // (1.3), and it's over in 250ms, well under SHOT_MIN_DURATION_MS (600ms).
+  trackShotAttempt(sample(1.22), 1000); // crosses the floor
+  trackShotAttempt(sample(1.26), 1100); // peak — shallow, well short of the 1.3 peak gate
+  trackShotAttempt(sample(1.07), 1250); // hands back together 250ms after it started — ends the attempt
   console.assert(log.length === 0, "a brief, shallow wiggle must not be logged as a shot");
   console.assert(shotCount === 0, "shotCount must not advance for a rejected attempt");
   console.assert(rejectedAttemptCount === 1, "the rejected wiggle should be counted");
@@ -6243,18 +6374,19 @@ function selfTest() {
   // --- Long enough AND deep enough, but short of literal full draw: still logged, and marked as
   // such — the deliberate behaviour CLAUDE.md/README call out on purpose (a draw that fell short
   // of full draw is still worth seeing; only noise should be thrown away).
-  trackShotAttempt(sample(0.4), 2000); // crosses the floor
-  trackShotAttempt(sample(0.65), 2400); // peak: 0.65 clears the 0.6 gate, but never reaches FULL_DRAW_HAND_SEP_MIN (0.75)
-  trackShotAttempt(sample(0.6), 2800); // held near peak
-  trackShotAttempt(sample(0.05), 3200); // ends — 1200ms after it started, comfortably over SHOT_MIN_DURATION_MS
+  trackShotAttempt(sample(1.22), 2000); // crosses the floor
+  trackShotAttempt(sample(1.32), 2400); // peak: 1.32 clears SHOT_MIN_PEAK_SEP (1.3), but never reaches FULL_DRAW_HAND_SEP_MIN (1.35)
+  trackShotAttempt(sample(1.28), 2800); // held near peak, but lower than it
+  trackShotAttempt(sample(1.07), 3200); // ends — 1200ms after it started, comfortably over SHOT_MIN_DURATION_MS
   console.assert(log.length === 1, "a long, near-full-draw attempt should be logged");
   console.assert(
     log[0].shotNum === 1,
     "the first LOGGED attempt should be shot 1 — the rejected wiggle above must not have consumed a shot number"
   );
-  // Eligible handSeps for this attempt were 0.4, 0.65, 0.6 — the MEDIAN (middle of the sorted
-  // three) is 0.6, not the peak (0.65, which only the SHOT_MIN_PEAK_SEP_FRACTION gate above uses).
-  console.assert(log[0].handSep === 0.6, "the logged row should carry the median hand separation across eligible frames, not the peak");
+  // Eligible handSeps for this attempt were 1.22, 1.32, 1.28 — the MEDIAN (middle of the sorted
+  // three: 1.22, 1.28, 1.32) is 1.28, not the peak (1.32, which only the SHOT_MIN_PEAK_SEP gate
+  // above uses).
+  console.assert(log[0].handSep === 1.28, "the logged row should carry the median hand separation across eligible frames, not the peak");
   console.assert(log[0].reachedFullDraw === false, "an attempt that never reached full draw must be marked as such");
   // Green means an arrow, not "a row got added" — see endAttempt's own comment at its
   // signalOutcome call. A logged-but-short-of-full-draw row is real and stays in the log (see the
@@ -6266,10 +6398,11 @@ function selfTest() {
 
   // --- An attempt that DOES reach full draw (atFullDraw: true on its peak frame): logged, NOT
   // marked as short of full draw, DOES flash the confirmed-arrow cue, and DOES count as an arrow.
-  trackShotAttempt(sample(0.4), 4000);
-  trackShotAttempt(sample(0.8, true), 4400); // peak, and a genuine full draw (all four isAtFullDraw gates true)
-  trackShotAttempt(sample(0.78, true), 4800); // held at full draw
-  trackShotAttempt(sample(0.05), 5200); // ends
+  // Peak/held values here are the owner's own measured full-draw reading (1.5) and just under it.
+  trackShotAttempt(sample(1.22), 4000);
+  trackShotAttempt(sample(1.5, true), 4400); // peak, and a genuine full draw (all four isAtFullDraw gates true)
+  trackShotAttempt(sample(1.45, true), 4800); // held at full draw
+  trackShotAttempt(sample(1.07), 5200); // ends
   console.assert(log.length === 2, "a full-draw attempt should log as its own row");
   console.assert(log[0].shotNum === 2, "second logged attempt should be shot 2");
   console.assert(log[0].reachedFullDraw === true, "an attempt that reached full draw must not be marked as short of it");
@@ -6278,7 +6411,7 @@ function selfTest() {
 
   // --- Pose loss on an UNQUALIFIED attempt (short, shallow) discards it, same as one that ends
   // by hands relaxing — losing tracking must not manufacture a shot out of noise.
-  trackShotAttempt(sample(0.35), 6000); // crosses the floor, shallow
+  trackShotAttempt(sample(1.22), 6000); // crosses the floor, shallow (never nears the 1.3 peak gate)
   endAttempt(6100); // pose lost 100ms later — short AND shallow (renderLoop's !landmarks branch calls endAttempt directly)
   console.assert(log.length === 2, "pose loss on an attempt that never qualified must not log a phantom row");
   console.assert(rejectedAttemptCount === 2, "pose-loss discard should still count as a rejected attempt");
@@ -6287,19 +6420,19 @@ function selfTest() {
   // --- Pose loss on a QUALIFIED attempt (deep and long enough already) still logs it — losing
   // tracking is what ENDS the attempt, it doesn't retroactively disqualify one that already
   // earned its place.
-  trackShotAttempt(sample(0.4), 7000);
-  trackShotAttempt(sample(0.7), 7400); // deep enough (0.7 >= 0.6)
+  trackShotAttempt(sample(1.22), 7000);
+  trackShotAttempt(sample(1.32), 7400); // deep enough (1.32 >= SHOT_MIN_PEAK_SEP's 1.3)
   endAttempt(7700); // pose lost 700ms after the attempt started — long enough (>= 600ms)
   console.assert(log.length === 3, "pose loss on a qualified attempt must still log it");
   console.assert(log[0].shotNum === 3, "third logged attempt should be shot 3");
-  // Eligible handSeps were 0.4 and 0.7 — median of an even count is the average of the two middle
-  // values: (0.4 + 0.7) / 2 = 0.55.
-  console.assert(log[0].handSep === 0.55, "the logged row should carry the median hand separation across eligible frames even though the attempt ended via pose loss");
+  // Eligible handSeps were 1.22 and 1.32 — median of an even count is the average of the two
+  // middle values: (1.22 + 1.32) / 2 = 1.27.
+  console.assert(log[0].handSep === 1.27, "the logged row should carry the median hand separation across eligible frames even though the attempt ended via pose loss");
 
   // --- A further, separate attempt becomes its own row, not merged into the previous one.
-  trackShotAttempt(sample(0.4), 8000);
-  trackShotAttempt(sample(0.9), 8400);
-  trackShotAttempt(sample(0.05), 9000); // 1000ms elapsed — ends
+  trackShotAttempt(sample(1.22), 8000);
+  trackShotAttempt(sample(1.5), 8400);
+  trackShotAttempt(sample(1.07), 9000); // 1000ms elapsed — ends
   console.assert(log.length === 4, "a further attempt must log as its own row, not merge into the previous one");
   console.assert(log[0].shotNum === 4 && log[1].shotNum === 3, "log should stay newest-first");
 
@@ -6312,11 +6445,11 @@ function selfTest() {
   // is deep and long enough to qualify, so every one of them logs.
   let capT = 10000;
   for (let i = 0; i < SHOT_LOG_MAX + 3; i++) {
-    trackShotAttempt(sample(0.4), capT);
+    trackShotAttempt(sample(1.22), capT);
     capT += 400;
-    trackShotAttempt(sample(0.9), capT);
+    trackShotAttempt(sample(1.5), capT);
     capT += 400;
-    trackShotAttempt(sample(0.05), capT); // ends — 800ms elapsed, over SHOT_MIN_DURATION_MS
+    trackShotAttempt(sample(1.07), capT); // ends — 800ms elapsed, over SHOT_MIN_DURATION_MS
     capT += 1000;
   }
   console.assert(log.length === SHOT_LOG_MAX, `log should cap at ${SHOT_LOG_MAX} entries, has ${log.length}`);
@@ -6372,13 +6505,16 @@ function selfTest() {
 
     // The raise alone opens a "watching" attempt, before hands have separated at all — and must
     // NOT start the SHOT_MIN_DURATION_MS clock (startMs stays null) until hands actually do.
-    trackShotAttempt(raiseSample(0.05), 0);
+    // handSep here is the owner's own resting median (1.07) — hands together, well under
+    // DRAW_ATTEMPT_MIN_SEP (1.2) — not a placeholder near zero, so this exercises the actual
+    // real-world "resting while the raise trigger alone is watching" case.
+    trackShotAttempt(raiseSample(1.07), 0);
     console.assert(attempt !== null, "the raise alone should open an attempt, before hand separation ever crosses DRAW_ATTEMPT_MIN_SEP");
     console.assert(attempt.startMs === null, "a raise with hands still together must not start the real-draw duration clock");
 
     // He changes his mind and lowers the bow without ever drawing: must close as a REJECTED row
     // (peakHandSep never left 0), never a stuck "watching" state.
-    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 200);
+    trackShotAttempt(sample(1.07, false, true, { raiseArmed: false }), 200);
     console.assert(attempt === null, "a raise that never turns into a draw must close, not hang open");
     console.assert(rejectedAttemptCount === 1, "an abandoned raise should be counted as a rejected attempt, same as any other non-draw");
 
@@ -6387,10 +6523,10 @@ function selfTest() {
     // crosses DRAW_ATTEMPT_MIN_SEP should eligible frames start counting. Deliberately wrong
     // bowArmAngle values on the raise-phase frames (20°, 25° — nowhere near a real 178° full
     // draw) so contamination would be obvious if this regressed.
-    trackShotAttempt(raiseSample(0.05, { bowArmAngle: 20 }), 1000); // raised, hands together, mid-raise
-    trackShotAttempt(raiseSample(0.15, { bowArmAngle: 25 }), 1100); // still short of DRAW_ATTEMPT_MIN_SEP (0.3)
-    trackShotAttempt(raiseSample(0.8, { bowArmAngle: 178, atFullDraw: true }), 1700); // now genuinely drawing
-    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 2400); // ends — 700ms of real draw, over SHOT_MIN_DURATION_MS
+    trackShotAttempt(raiseSample(1.07, { bowArmAngle: 20 }), 1000); // raised, hands together (rest), mid-raise
+    trackShotAttempt(raiseSample(1.15, { bowArmAngle: 25 }), 1100); // still short of DRAW_ATTEMPT_MIN_SEP (1.2)
+    trackShotAttempt(raiseSample(1.5, { bowArmAngle: 178, atFullDraw: true }), 1700); // now genuinely drawing — his own measured full draw (1.5)
+    trackShotAttempt(sample(1.07, false, true, { raiseArmed: false }), 2400); // ends — 700ms of real draw, over SHOT_MIN_DURATION_MS
     console.assert(shotCount === 1, "a real raise-then-draw should log exactly one shot");
     console.assert(
       log[0].bowArmAngle === 178,
@@ -6402,11 +6538,11 @@ function selfTest() {
     // RAISE_ATTEMPT_TIMEOUT_MS closes it as rejected.
     attempt = null;
     rejectedAttemptCount = 0;
-    trackShotAttempt(raiseSample(0.05), 5000);
+    trackShotAttempt(raiseSample(1.07), 5000);
     console.assert(attempt !== null, "setup: the raise should still be open just before the timeout");
-    trackShotAttempt(raiseSample(0.05), 5000 + RAISE_ATTEMPT_TIMEOUT_MS - 100);
+    trackShotAttempt(raiseSample(1.07), 5000 + RAISE_ATTEMPT_TIMEOUT_MS - 100);
     console.assert(attempt !== null, "an armed raise under RAISE_ATTEMPT_TIMEOUT_MS old must still be open");
-    trackShotAttempt(raiseSample(0.05), 5000 + RAISE_ATTEMPT_TIMEOUT_MS + 100);
+    trackShotAttempt(raiseSample(1.07), 5000 + RAISE_ATTEMPT_TIMEOUT_MS + 100);
     console.assert(attempt === null, "an armed raise older than RAISE_ATTEMPT_TIMEOUT_MS that never drew must close on its own");
     console.assert(rejectedAttemptCount === 1, "a timed-out raise should be counted as a rejected attempt");
 
@@ -6416,9 +6552,9 @@ function selfTest() {
     log = [];
     shotCount = 0;
     fullDrawShotCount = 0;
-    trackShotAttempt(sample(0.4, false, true, { raiseArmed: false, bowArmAngle: 179 }), 8000);
-    trackShotAttempt(sample(0.8, true, true, { raiseArmed: false, bowArmAngle: 179 }), 8400);
-    trackShotAttempt(sample(0.05, false, true, { raiseArmed: false }), 9000);
+    trackShotAttempt(sample(1.22, false, true, { raiseArmed: false, bowArmAngle: 179 }), 8000);
+    trackShotAttempt(sample(1.5, true, true, { raiseArmed: false, bowArmAngle: 179 }), 8400);
+    trackShotAttempt(sample(1.07, false, true, { raiseArmed: false }), 9000);
     console.assert(shotCount === 1, "hand separation alone (raise missed) must still be able to open and log a shot, unchanged");
     console.assert(log[0].bowArmAngle === 179, "a fallback-only shot's numbers must be exactly what the pre-raise-trigger logic would have produced");
 
@@ -6642,12 +6778,12 @@ function selfTest() {
   unsettledAttemptCount = 0;
 
   // A real draw (deep and long enough) made ENTIRELY of unsettled frames: nothing here is noise
-  // — sample(0.9, false, false) clears both SHOT_MIN_PEAK_SEP_FRACTION and, given the timing
+  // — sample(1.5, false, false) clears both SHOT_MIN_PEAK_SEP (1.3) and, given the timing
   // below, SHOT_MIN_DURATION_MS — but every frame is ineligible, so there is no honest reading to
   // log. Must be counted as unsettled, NOT rejected, and must not appear in the log.
-  trackShotAttempt(sample(0.4, false, false), 20000); // crosses the floor, unsettled
-  trackShotAttempt(sample(0.9, false, false), 20400); // peak, still unsettled
-  trackShotAttempt(sample(0.05, false, false), 20900); // ends — 900ms elapsed, well over SHOT_MIN_DURATION_MS
+  trackShotAttempt(sample(1.22, false, false), 20000); // crosses the floor, unsettled
+  trackShotAttempt(sample(1.5, false, false), 20400); // peak, still unsettled
+  trackShotAttempt(sample(1.07, false, false), 20900); // ends — 900ms elapsed, well over SHOT_MIN_DURATION_MS
   console.assert(log.length === 0, "an attempt made entirely of unsettled frames must not be logged");
   console.assert(shotCount === 0, "shotCount must not advance for an unsettled attempt");
   console.assert(rejectedAttemptCount === 0, "an unsettled-but-otherwise-real attempt must NOT be counted as rejected (noise) — those are different claims");
@@ -6658,15 +6794,15 @@ function selfTest() {
   // the logged row's median must be computed from the eligible frame(s) only — the two ineligible
   // frames (including the higher-handSep one) must never enter the median at all, not even diluted
   // in with the eligible ones.
-  trackShotAttempt(sample(0.4, false, false), 21000); // crosses the floor, unsettled
-  trackShotAttempt(sample(0.95, false, false), 21400); // higher handSep, but STILL unsettled — must never be logged
-  trackShotAttempt(sample(0.8, true, true, { bowArmAngle: 171 }), 21800); // settles now — the ONLY eligible frame this attempt has
-  trackShotAttempt(sample(0.05), 22400); // ends — 1400ms elapsed
+  trackShotAttempt(sample(1.22, false, false), 21000); // crosses the floor, unsettled
+  trackShotAttempt(sample(1.45, false, false), 21400); // higher handSep, but STILL unsettled — must never be logged
+  trackShotAttempt(sample(1.4, true, true, { bowArmAngle: 171 }), 21800); // settles now — the ONLY eligible frame this attempt has
+  trackShotAttempt(sample(1.07), 22400); // ends — 1400ms elapsed
   console.assert(log.length === 1, "an attempt that settles partway through should still log, once it has an eligible frame");
   // Exactly one eligible frame — the median of a single value is that value itself, so this also
   // covers "a single-frame attempt still works" from a real trackShotAttempt/endAttempt run, not
   // just a direct call into medianSampleOf.
-  console.assert(log[0].handSep === 0.8, "the logged reading must come from the eligible frame (0.8), not the higher-handSep unsettled one (0.95)");
+  console.assert(log[0].handSep === 1.4, "the logged reading must come from the eligible frame (1.4), not the higher-handSep unsettled one (1.45)");
   console.assert(log[0].bowArmAngle === 171, "the logged reading's other fields must also come from the eligible frame, not an unsettled one");
   console.assert(log[0].reachedFullDraw === true, "reachedFullDraw should reflect the eligible frame's own atFullDraw reading");
   console.assert(unsettledAttemptCount === 1, "a settled-in-time attempt must not also be counted as unsettled");
@@ -7342,17 +7478,17 @@ function selfTest() {
     fullDrawShotCount = 0;
     let evictT = 50000; // a fresh, well-separated block of the fake clock so this loop's timing can't collide with the timeline above
     for (let i = 0; i < SHOT_LOG_MAX; i++) {
-      trackShotAttempt(sample(0.9), evictT); // deep enough to clear SHOT_MIN_PEAK_SEP_FRACTION
+      trackShotAttempt(sample(1.5), evictT); // deep enough to clear SHOT_MIN_PEAK_SEP (1.3) and open the attempt on its own (>= DRAW_ATTEMPT_MIN_SEP, 1.2)
       evictT += 800; // long enough to clear SHOT_MIN_DURATION_MS
-      trackShotAttempt(sample(0.05), evictT); // ends the attempt, logs it
+      trackShotAttempt(sample(1.07), evictT); // ends the attempt, logs it — his own measured resting separation
       evictT += 200;
     }
     console.assert(log.length === SHOT_LOG_MAX, "setup: log should be exactly full before the eviction check");
     const oldestUrl = "blob:fake-oldest-for-selftest";
     log[log.length - 1].clipUrl = oldestUrl; // pretend the row about to be evicted has a clip attached
-    trackShotAttempt(sample(0.9), evictT);
+    trackShotAttempt(sample(1.5), evictT);
     evictT += 800;
-    trackShotAttempt(sample(0.05), evictT); // one more attempt: pushes the oldest row (the one just tagged) off the end
+    trackShotAttempt(sample(1.07), evictT); // one more attempt: pushes the oldest row (the one just tagged) off the end
     console.assert(
       revokedUrls.includes(oldestUrl),
       "evicting a row that has a clip attached must revoke its object URL"
