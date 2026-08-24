@@ -557,6 +557,11 @@ let debugAttnSpeed = null; // body-reference-point drift speed, torso-lengths/se
 // right where that's already computed for frameEligible, so the panel can show it as its own
 // continuous lamp without recomputing crop-box geometry a second time.
 let lastCropBoxStable = false;
+// Which required measurement landmarks (see missingMeasurementLandmarks) were missing on the
+// most recent frame that had landmarks at all — same display-only convention as lastCropBoxStable
+// just above, captured in renderLoop right where it's computed for frameEligible so the
+// ?triggertest ELIGIBLE screen can show the owner exactly which joint is the problem.
+let lastMissingLandmarks = [];
 // Whether a pose was actually found the last time detection genuinely ran (full-rate frame, or an
 // idle-rate sample) — NOT updated on an idle-throttle tick that skipped detection entirely, so the
 // panel correctly keeps showing the last real answer through an idle gap instead of flickering to
@@ -1007,11 +1012,26 @@ function cropBoxIsStable(box, prevBox) {
 // the settling counter and reports whether THIS frame's own numbers are trustworthy enough to
 // log: takes the crop state as plain values rather than reading module state directly, so
 // selfTest can drive it deterministically without a real camera or crop box.
-function advanceSettling(cropBoxUsedThisFrame, cropBoxStableThisFrame) {
+//
+// landmarksVisibleThisFrame (see measurementLandmarksVisible) defaults to true so every existing
+// call site that only cares about settle-count/crop-box behaviour (several in selfTest) keeps
+// working unchanged — same convention as nowMs/frameEligible elsewhere in this file.
+//
+// Deliberately does NOT reset settledFrames when visibility fails, unlike a genuine pose loss
+// (see resetSettling). A shoulder briefly dipping below MIN_VISIBILITY — stepping half out of
+// frame, an arm swinging past the camera — doesn't make the SMOOTHING filter's or the crop box's
+// state stale the way losing the archer entirely does; the next frame with the full body back in
+// view is just as settled as the one before the dip, so re-running the whole multi-second settle
+// wait for it would be a needless additional delay with no accuracy benefit. Only the frames that
+// are actually missing a required joint are excluded from logging — via this function's own
+// return value — while settledFrames keeps counting underneath, exactly like cropBoxIsStable
+// already does for "box exists but hasn't stopped moving yet".
+function advanceSettling(cropBoxUsedThisFrame, cropBoxStableThisFrame, landmarksVisibleThisFrame = true) {
   settledFrames++;
   return (
     settledFrames >= SETTLE_FRAMES_REQUIRED &&
-    (!ROI_CROPPING_ENABLED || (cropBoxUsedThisFrame && cropBoxStableThisFrame))
+    (!ROI_CROPPING_ENABLED || (cropBoxUsedThisFrame && cropBoxStableThisFrame)) &&
+    landmarksVisibleThisFrame
   );
 }
 
@@ -1450,6 +1470,45 @@ function visible(landmarks, idx) {
   const lm = landmarks[idx];
   return lm && (lm.visibility ?? 0) >= MIN_VISIBILITY;
 }
+
+// ===== MEASUREMENT-LANDMARK VISIBILITY — the landmarks the four SHOT-LOGGED measures actually
+// depend on, derived by reading those functions (bowArmAngleOf, shoulderDropSampleOf via
+// shoulderDropOf, drawElbowAlignmentOf) and torsoLength, the scale reference shoulderDropOf
+// divides by — not guessed. Both shoulders/elbows/wrists are required UNCONDITIONALLY: which
+// side is "bow" and which is "draw" flips with the handedness toggle, so a frame can't know in
+// advance which side's arm it'll need and must have both. A hip and an ear are each needed on
+// only ONE side, because shoulderDropOf explicitly falls back to the other side's hip/ear when
+// its own isn't visible (see that function's own "own side preferred, other side as fallback"
+// comment) — requiring both would be a stricter bar than the measures themselves ever apply.
+//
+// This is a DIFFERENT check from ROI_MIN_VISIBLE_LANDMARKS (see that constant): that one asks
+// "is there enough of a body here to trust a crop box built from it", using a loose landmark
+// list including the face. This asks "are the specific joints today's four measures divide and
+// subtract actually there" — a frame can clear the loose crop-box bar (e.g. a shoulder, an arm
+// and a face) while badly failing this one, which is exactly the owner's field report: ELIGIBLE
+// stayed lit walking almost out of frame with only a shoulder and an arm visible.
+const REQUIRED_MEASUREMENT_LANDMARKS = [
+  [L_SHOULDER, "left shoulder"], [R_SHOULDER, "right shoulder"],
+  [L_ELBOW, "left elbow"], [R_ELBOW, "right elbow"],
+  [L_WRIST, "left wrist"], [R_WRIST, "right wrist"],
+];
+
+// Plain-language names of whatever's currently missing — empty means every shot-logged measure
+// has a fighting chance of returning a real number this frame. Used both to gate PIPELINE
+// SETTLING eligibility (see advanceSettling) and to show the owner exactly which joint is the
+// problem on the ?triggertest ELIGIBLE screen, rather than just a lit/unlit lamp.
+function missingMeasurementLandmarks(landmarks) {
+  if (!landmarks) return REQUIRED_MEASUREMENT_LANDMARKS.map(([, name]) => name).concat(["a hip", "an ear"]);
+  const missing = REQUIRED_MEASUREMENT_LANDMARKS.filter(([i]) => !visible(landmarks, i)).map(([, name]) => name);
+  if (!visible(landmarks, L_HIP) && !visible(landmarks, R_HIP)) missing.push("a hip");
+  if (!visible(landmarks, L_EAR) && !visible(landmarks, R_EAR)) missing.push("an ear");
+  return missing;
+}
+
+function measurementLandmarksVisible(landmarks) {
+  return missingMeasurementLandmarks(landmarks).length === 0;
+}
+// ===========================================================================
 
 function setReadout(readoutEl, valueEl, text, state) {
   valueEl.textContent = text;
@@ -4500,12 +4559,13 @@ const TRIGGER_DEFS = [
   {
     id: "eligible",
     label: "ELIGIBLE",
-    sentence: "Has the tracking pipeline been reading you steadily for long enough — and, if the zoomed-in tracking box has stopped resizing — that THIS frame's numbers are trustworthy enough to log?",
-    doThis: "This one isn't about your pose at all — it's about how long the app has been tracking you continuously. Stand still and stay in frame for a couple of seconds after the app starts (or after it loses and re-finds you) to light this. Step out of frame, or move enough that the tracking box keeps jumping around, to make it go dark.",
+    sentence: "Has the tracking pipeline been reading you steadily for long enough, with the joints today's measures need actually visible — and, if the zoomed-in tracking box has stopped resizing — that THIS frame's numbers are trustworthy enough to log?",
+    doThis: "Stand still, fully in frame (both arms, both shoulders), for a couple of seconds after the app starts (or after it loses and re-finds you) to light this. Step out of frame, turn so an arm or shoulder is hidden, or move enough that the tracking box keeps jumping around, to make it go dark.",
     note: null,
     read(landmarks) {
       const NAMED = [L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST, L_HIP, R_HIP, NOSE, MOUTH_L, MOUTH_R, L_EAR, R_EAR];
       const visibleCount = landmarks ? NAMED.filter((i) => visible(landmarks, i)).length : 0;
+      const missing = lastMissingLandmarks;
       const fired = isDebugEventLit(debugEvents.frameEligible, performance.now());
       return {
         lamp: fired,
@@ -4523,7 +4583,17 @@ const TRIGGER_DEFS = [
             ok: ROI_CROPPING_ENABLED ? lastCropBoxStable : null,
           },
           {
-            label: "Confidently-visible landmarks this frame",
+            // The joints the four shot-logged MEASURES actually need (see
+            // missingMeasurementLandmarks) — a stricter, more specific bar than the row below,
+            // which is only about whether there's enough of a body to trust a crop box at all.
+            // This is the row that catches "only a shoulder and an arm visible".
+            label: "Needed for today's measures",
+            value: missing.length === 0 ? "all visible" : `missing ${missing.join(", ")}`,
+            threshold: "both shoulders/elbows/wrists, a hip, an ear",
+            ok: missing.length === 0,
+          },
+          {
+            label: "Confidently-visible landmarks (tracking-box lock)",
             value: `${visibleCount}`,
             threshold: `≥ ${ROI_MIN_VISIBLE_LANDMARKS} keeps the tracking box locked on`,
             ok: visibleCount >= ROI_MIN_VISIBLE_LANDMARKS,
@@ -5091,7 +5161,14 @@ function renderLoop() {
     const cropBoxStableThisFrame = cropBoxIsStable(usedCropBox, prevUsedCropBox);
     if (DEBUG || TRIGGERTEST) lastCropBoxStable = cropBoxStableThisFrame; // display-only, see its own declaration
     prevUsedCropBox = usedCropBox;
-    const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame);
+    // Required-landmark visibility (see measurementLandmarksVisible) — the frame the four
+    // shot-logged measures actually depend on, not the looser crop-box "is there roughly a body
+    // here" bar (ROI_MIN_VISIBLE_LANDMARKS). Computed here alongside the other two eligibility
+    // inputs for the same reason as cropBoxStableThisFrame: threaded through explicitly so
+    // selfTest can drive it too.
+    const missingLandmarksThisFrame = missingMeasurementLandmarks(landmarks);
+    if (DEBUG || TRIGGERTEST) lastMissingLandmarks = missingLandmarksThisFrame; // display-only, see its own declaration
+    const frameEligible = advanceSettling(!!usedCropBox, cropBoxStableThisFrame, missingLandmarksThisFrame.length === 0);
     if ((DEBUG || TRIGGERTEST) && frameEligible) debugEvents.frameEligible = now; // display-only latch, see DEBUG_EVENT_LATCH_MS
     isAtFullDraw(landmarks, now, frameEligible, frameWidth, frameHeight);
     // `attempt` (module-level, see trackShotAttempt) is already up to date for THIS frame — the
@@ -5972,6 +6049,22 @@ function selfTest() {
     debugEvents.frameEligible = performance.now();
     console.assert(ttById.eligible.read(null).lamp === true, "ELIGIBLE screen must read lit the instant a frame clears the settling gate");
 
+    // ELIGIBLE's new "Needed for today's measures" row: a direct, honest reflection of
+    // lastMissingLandmarks — same convention as lastCropBoxStable/lastPoseSeen just below — set
+    // here exactly as renderLoop's own real call site sets it, not recomputed independently. This
+    // is the row that answers the owner's own field report ("only a shoulder and an arm visible").
+    lastMissingLandmarks = [];
+    const eligibleRowOk = ttById.eligible.read(null).rows[2];
+    console.assert(eligibleRowOk.label === "Needed for today's measures", "ELIGIBLE's third row must be the landmark-visibility row this task added");
+    console.assert(eligibleRowOk.ok === true && eligibleRowOk.value === "all visible", "ELIGIBLE's landmark-visibility row must read ok/'all visible' when nothing is missing");
+    lastMissingLandmarks = ["right elbow", "right wrist"];
+    const eligibleRowMissing = ttById.eligible.read(null).rows[2];
+    console.assert(
+      eligibleRowMissing.ok === false && eligibleRowMissing.value === "missing right elbow, right wrist",
+      "ELIGIBLE's landmark-visibility row must name the specific missing joints, not just go red"
+    );
+    lastMissingLandmarks = []; // leave clean for whatever reads this screen next
+
     // POSE: a direct, honest reflection of lastPoseSeen — set here exactly as renderLoop's own two
     // branches set it, not recomputed independently.
     lastPoseSeen = true;
@@ -6349,6 +6442,111 @@ function selfTest() {
     console.assert(advanceSettling(true, true) === true, "setup: should be settled before the reset");
     resetSettling();
     console.assert(advanceSettling(true, true) === false, "a reset mid-session must re-arm the gate — the very next frame should read as unsettled again");
+
+    // The landmark-VISIBILITY requirement (third argument, see measurementLandmarksVisible) is
+    // independent of frame count too, same shape as the crop-present/crop-stable tests above:
+    // even with far more than SETTLE_FRAMES_REQUIRED good-tracking frames, a frame missing a
+    // required measurement landmark (e.g. only a shoulder and an arm in view — the owner's own
+    // field report) must never read as settled.
+    resetSettling();
+    let sawTrueWithoutVisibility = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED + 20; i++) {
+      if (advanceSettling(true, true, false)) sawTrueWithoutVisibility = true;
+    }
+    console.assert(
+      !sawTrueWithoutVisibility,
+      "a frame missing a required measurement landmark must never read as settled, no matter how many good-tracking frames have passed"
+    );
+    // RESET-VS-SKIP, proven directly: the visibility failure above must NOT have reset
+    // settledFrames the way a genuine pose loss does (see resetSettling and advanceSettling's own
+    // comment on this) — a shoulder briefly dropping out of view doesn't make the smoothing
+    // filter or the crop box stale. So the very next frame, fully visible again, must read
+    // eligible IMMEDIATELY, with no fresh multi-second settle wait. If a future change made
+    // visibility failure reset the counter (an easy-looking "fix" that would actually be wrong,
+    // per CLAUDE.md's fail-toward-recording rule), this assertion is what would catch it.
+    console.assert(
+      advanceSettling(true, true, true) === true,
+      "recovering visibility should read settled immediately — a visibility-only gap must not have reset the settle counter"
+    );
+
+    // Third argument defaults to true, so every call site above (and every one already in this
+    // file) that never mentions visibility at all keeps working exactly as before.
+    resetSettling();
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED - 1; i++) advanceSettling(true, true);
+    console.assert(advanceSettling(true, true) === true, "omitting the third argument must still behave as fully visible, for every existing 2-argument call site");
+  }
+
+  // --- measurementLandmarksVisible / missingMeasurementLandmarks: the ELIGIBLE gate's new
+  // landmark-visibility requirement. Derived from reading bowArmAngleOf, shoulderDropSampleOf
+  // (via shoulderDropOf) and drawElbowAlignmentOf plus torsoLength, not guessed — see the
+  // function's own block comment. Built with real geometry fixtures (mkLandmarks), not
+  // hand-picked booleans, so a mistake in the derivation itself (not just in wiring it up) would
+  // show here.
+  {
+    // A fully-visible archer: both shoulders/elbows/wrists, plus base's existing hips and ears.
+    const fullyVisibleOverrides = {
+      ...base,
+      14: { x: 0.65, y: 0.3 }, // draw (right) elbow
+      15: { x: 0.0, y: 0.3 }, // bow (left) wrist
+      16: { x: 0.7, y: 0.31 }, // draw (right) wrist
+    };
+    const fullyVisible = mkLandmarks(fullyVisibleOverrides);
+    console.assert(missingMeasurementLandmarks(fullyVisible).length === 0, "a fully-visible body must have no missing measurement landmarks");
+    console.assert(measurementLandmarksVisible(fullyVisible) === true, "measurementLandmarksVisible must read true when every required joint is visible");
+
+    // No landmarks at all (pose lost): every unconditional joint plus a hip and an ear (6 + 2).
+    console.assert(missingMeasurementLandmarks(null).length === 8, "no landmarks at all must report every required joint, plus a hip and an ear, as missing");
+    console.assert(measurementLandmarksVisible(null) === false, "measurementLandmarksVisible must read false with no landmarks at all");
+
+    // THE FIELD REPORT ITSELF: "only a shoulder and an arm visible" — one shoulder, one elbow,
+    // one wrist, nothing else. Must fail, and fail for the RIGHT missing joints, not just happen
+    // to fail for some other reason.
+    const shoulderAndArmOnly = mkLandmarks({ 11: base[11], 13: base[13], 15: { x: 0.0, y: 0.3 } });
+    const missingShoulderAndArm = missingMeasurementLandmarks(shoulderAndArmOnly);
+    console.assert(
+      ["right shoulder", "right elbow", "right wrist", "a hip", "an ear"].every((name) => missingShoulderAndArm.includes(name)),
+      "the owner's own field report (one shoulder, one arm) must be flagged missing the other side's shoulder/elbow/wrist, plus a hip and an ear"
+    );
+    console.assert(measurementLandmarksVisible(shoulderAndArmOnly) === false, "measurementLandmarksVisible must read false for the owner's own field-reported case");
+
+    // Unconditional joints have no fallback: missing exactly one (the draw elbow) must be named
+    // exactly, not silently tolerated the way a hip or an ear would be.
+    const missingDrawElbow = mkLandmarks({ ...base, 15: { x: 0.0, y: 0.3 }, 16: { x: 0.7, y: 0.31 } }); // no 14 override -> R_ELBOW invisible by mkLandmarks's own default
+    const missing1 = missingMeasurementLandmarks(missingDrawElbow);
+    console.assert(missing1.length === 1 && missing1[0] === "right elbow", "a body missing only the draw elbow must report exactly that one joint missing");
+    console.assert(measurementLandmarksVisible(missingDrawElbow) === false, "measurementLandmarksVisible must read false when a required joint is invisible");
+
+    // Hip and ear DO have a fallback (shoulderDropOf explicitly falls back to the other side —
+    // see its own comment) — one visible hip, or one visible ear, must be enough; requiring both
+    // would be a stricter bar than the measures themselves ever apply.
+    const oneHipMissing = mkLandmarks({ ...fullyVisibleOverrides, 24: { ...base[24], visibility: 0 } });
+    console.assert(missingMeasurementLandmarks(oneHipMissing).length === 0, "one visible hip must satisfy the torso-scale fallback — must not be flagged missing");
+    const oneEarMissing = mkLandmarks({ ...fullyVisibleOverrides, 8: { ...base[8], visibility: 0 } });
+    console.assert(missingMeasurementLandmarks(oneEarMissing).length === 0, "one visible ear must satisfy shoulderDropOf's own ear fallback — must not be flagged missing");
+
+    // But losing BOTH hips, or BOTH ears, is a real gap with no fallback left — must be reported,
+    // named specifically ("a hip"/"an ear"), not silently accepted.
+    const noHips = mkLandmarks({ ...fullyVisibleOverrides, 23: { ...base[23], visibility: 0 }, 24: { ...base[24], visibility: 0 } });
+    console.assert(missingMeasurementLandmarks(noHips).length === 1 && missingMeasurementLandmarks(noHips)[0] === "a hip", "losing both hips must be reported as a missing hip");
+    const noEars = mkLandmarks({ ...fullyVisibleOverrides, 7: { ...base[7], visibility: 0 }, 8: { ...base[8], visibility: 0 } });
+    console.assert(missingMeasurementLandmarks(noEars).length === 1 && missingMeasurementLandmarks(noEars)[0] === "an ear", "losing both ears must be reported as a missing ear");
+
+    // WIRING check: renderLoop's real call site feeds missingMeasurementLandmarks(landmarks).length
+    // === 0 straight into advanceSettling's third argument — prove that exact combination end to
+    // end with real fixtures, not just each half in isolation.
+    resetSettling();
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED; i++) advanceSettling(true, true, measurementLandmarksVisible(fullyVisible));
+    console.assert(
+      advanceSettling(true, true, measurementLandmarksVisible(fullyVisible)) === true,
+      "a fully-visible real fixture, run through the exact wiring renderLoop uses, must read eligible once settled"
+    );
+    resetSettling();
+    let sawTrueWithMissingBody = false;
+    for (let i = 0; i < SETTLE_FRAMES_REQUIRED + 5; i++) {
+      if (advanceSettling(true, true, measurementLandmarksVisible(missingDrawElbow))) sawTrueWithMissingBody = true;
+    }
+    console.assert(!sawTrueWithMissingBody, "a real fixture missing a required joint, run through the exact wiring renderLoop uses, must never read eligible");
+    resetSettling(); // leave settling clean for whatever runs next
   }
 
   // --- cropBoxIsStable: pure geometry, no dependency on advanceSettling's frame counting.
