@@ -946,6 +946,18 @@ Rules the PM follows:
     single-sample 1.5), and `SHOT_MIN_PEAK_SEP` (1.3) and `DRAW_ATTEMPT_MIN_SEP`
     (1.2) sit below it as designed. Do not tighten any of the three further
     without a new reading; a shot reading 1.32 would already fail full draw.
+  - **EVERY OTHER TRIGGER — works. His words: "the other triggers all seem to
+    work fine."** Covers ANCHOR, STILL, OPEN, ELIGIBLE, ATTN, POSE, RAISE and AT
+    FULL DRAW. Of these, **OPEN is the significant one**: it was the confirmed
+    phantom-shot mechanism ("always lit, even with one hand behind my back"), and
+    it is now closing. Treat this as a broad pass, NOT as per-trigger
+    calibration data — it is one qualitative sentence, not the kind of measured
+    reading the numbers above are, and no threshold should be tuned against it.
+    **What it does NOT establish**: that the SHOT LOG matches the arrows he
+    actually shot. Every trigger reading correctly frame-by-frame is a
+    necessary, not sufficient, condition for that — the log is produced by
+    attempt gating and median-of-eligible-frames on top of these triggers, and
+    has never once been checked against a real end.
   - **ARM CONE — too big.** `FULL_DRAW_ARM_CONE_APERTURE_DEG` is 45°, an
     unmeasured placeholder, which accepts a bow arm anywhere from 45° above to
     45° below horizontal — an arm hanging well down still passes. His measured
