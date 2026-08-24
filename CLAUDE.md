@@ -936,6 +936,28 @@ Rules the PM follows:
   session's readings supersede this block entirely. ARM and POSE are unchanged
   since he measured them; RAISE was correct and was deliberately left alone.
 
+  **RETEST 2026-08-24, after the day's changes shipped — first readings against
+  the new constants:**
+
+  - **SEP — WORKS. His words: "sep value averages around 1.45 seems to work fine
+    as is."** Confirms the re-derived `FULL_DRAW_HAND_SEP_MIN` (1.35) against a
+    real body: full draw averages 1.45, so it passes with ~7% margin. Note that
+    margin is thinner than the derivation assumed (it was set against a
+    single-sample 1.5), and `SHOT_MIN_PEAK_SEP` (1.3) and `DRAW_ATTEMPT_MIN_SEP`
+    (1.2) sit below it as designed. Do not tighten any of the three further
+    without a new reading; a shot reading 1.32 would already fail full draw.
+  - **ARM CONE — too big.** `FULL_DRAW_ARM_CONE_APERTURE_DEG` is 45°, an
+    unmeasured placeholder, which accepts a bow arm anywhere from 45° above to
+    45° below horizontal — an arm hanging well down still passes. His measured
+    elevation at full draw has NOT been captured yet; get it off the ARM screen's
+    "Elevation off horizontal (the cone)" row before setting a value, the same
+    way `FULL_DRAW_ANCHOR_MAX` and the anchor region were set. **Do not guess a
+    tighter number**: the cone is measured relative to the CAMERA's horizontal,
+    so a phone that is not perfectly level rotates every reading, which is the
+    reason the placeholder was generous in the first place.
+
+  **ORIGINAL READINGS, all predating the day's changes:**
+
   - **SEP — "ridiculous". Full draw measures 1.5; the gate is 0.75.** His
     resting reading was ~1.07 (median of 1,497 samples, same day). **This partly
     contradicts the "hand separation is unfixable" Key decision above and that
