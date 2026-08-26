@@ -342,6 +342,65 @@ const ATTENTION_REST_ARM_DOWN_MAX = -0.6;
 const ATTENTION_REST_MOVE_MAX_PER_SEC = 0.5; // how fast the body's reference point (hip midpoint, see bodyReferencePoint) may drift, in torso-lengths per second, and still count as "not walking/stepping". Ordinary standing sway is a small fraction of this; a real step or a walk toward/away from the line covers far more than a torso-length in a second. RAISE if ordinary standing sway is ever mistaken for movement (blocks idling, safe but wastes battery); LOWER if genuine walking is ever mistaken for standing still (also safe on its own — it only delays idling — but defeats the point of this feature if it happens often)
 // ===========================================================================
 
+// ===== DETECTION RATE CAP — performance knob, not calibration; safe to change without a coach,
+// same family as SMOOTH_*/ROI_*/SETTLE_FRAMES_REQUIRED/ATTENTION_* above.
+//
+// FIRST ATTEMPT AT THIS (rejected, kept here as the reasoning trail): a flat MAX_FPS=60 cap on the
+// WHOLE renderLoop tick, reasoning that a 120Hz ProMotion display was running pose detection twice
+// as often as needed. The owner's own shot log immediately disproved the premise: his phone runs
+// "full" at ~30.2ms/frame, ~28.2fps actually rendered — nowhere near 60Hz, let alone 120Hz. A cap
+// at 60fps would sit ABOVE his phone's own natural ceiling and could never once engage — exactly
+// the "looks like a fix, silently never runs" shape CLAUDE.md warns against. Diagnosis was wrong,
+// not the instinct to cap something.
+//
+// THE REAL BOTTLENECK, per those same numbers: pose detection alone costs ~30.2ms/call, so
+// detection single-handedly caps the loop around 1000/30.2 ≈ 33fps before drawing or anything else
+// gets a turn — and (see paintCanvas's own comment on the field bug it already partly fixed) this
+// app's renderLoop used to call detectForVideo and THEN paintCanvas synchronously in the same tick,
+// so paintCanvas — and therefore every RECORDED CLIP's captured frames, which bake straight off the
+// canvas paintCanvas draws into — could never update faster than one detection call allowed, no
+// matter how fast the display itself could otherwise refresh. That coupling, not the display's own
+// Hz, is what a MAX_FPS-style cap could never have fixed.
+//
+// THE ACTUAL FIX: decouple drawing from detection. paintCanvas now runs on every single
+// renderLoop/rAF tick, at the display's own native rate, whether or not detection ran that tick —
+// using the most recently known landmarks (see lastKnownLandmarks below) when it didn't, so the
+// skeleton never blanks out and flickers between "drawn" and "blank" (which would land straight in
+// a recording — see the DETECTION RATE CAP runtime block's own comment). DETECTION_MIN_INTERVAL_MS
+// is what actually gets capped now: only detectForVideo itself, the genuinely expensive step, is
+// throttled to at most once per this many milliseconds; every downstream measurement
+// (smoothing/settling/readouts/isAtFullDraw/the shot log) only ever runs on a tick that genuinely
+// got fresh landmarks — see the runtime block's own comment on why re-running any of that against
+// stale landmarks would fabricate stillness that never happened.
+//
+// MUST sit BELOW the phone's own observed per-detection cost to change anything at all — capping
+// above the phone's natural ceiling is the exact mistake the first attempt made. 50ms (20fps) is
+// comfortably under the owner's measured ~30.2ms floor, so it actually engages and buys real
+// headroom for paintCanvas to run between detection calls, while staying above
+// MODEL_SLOW_FRAME_MS's own implicit "noticeably behind" floor (60ms ≈ 16fps) and matching the
+// ~20fps cadence SETTLE_FRAMES_REQUIRED's own derivation already assumes is a perfectly fine
+// cadence for this whole pipeline (see that constant's comment: "at a modest ~20fps ... this file
+// already assumes a phone can run this slow"). RAISE (throttle detection further, more headroom
+// for drawing, slower to notice a still/motion change) if drawing still isn't smooth enough on some
+// phone; LOWER (react faster, less headroom) only down toward whatever that specific phone's own
+// measured per-detection cost is — below that floor this constant stops doing anything at all,
+// exactly like the rejected MAX_FPS=60 did on this owner's own phone.
+//
+// Applies uniformly, including during the one-time POSE MODEL warm-up window (see
+// measurePoseModelPerf below) — deliberately, not by oversight. The full-vs-lite MODEL DECISION
+// itself is untouched either way (it's based on avgMs, the per-call cost detectForVideo itself
+// takes, which how often we choose to call it cannot change) — but the warm-up's reported
+// "renderedFps" figure now measures DETECTION cadence specifically (drawing is decoupled from it,
+// see above), and is only an honest description of the app's real post-decision detection cadence
+// if it's measured under this SAME cap; exempting warm-up would report a rate the app will never
+// sustain again the instant the cap starts applying — the exact "reported frame rate doesn't match
+// what actually ran" shape of bug CLAUDE.md already records once (see the POSE MODEL section
+// there, and see setModelStatusLine's own comment for the wording fix that keeps this honest now
+// that "renderedFps" no longer means "the whole frame, drawing included" the way it used to before
+// drawing and detection were decoupled).
+const DETECTION_MIN_INTERVAL_MS = 50;
+// ===========================================================================
+
 // ===== CALIBRATION — owner's body-proportion reference (HANDOVER.md Stage 4). NOT a form target
 // like CALIBRATE WITH COACH above — nothing here judges his archery. This is a reference for what
 // HIS body's own proportions actually are, captured passively while he's standing calmly in frame
@@ -877,20 +936,25 @@ async function initPoseLandmarker() {
   activePoseModel = "full";
 }
 
-// Called once per frame from renderLoop with how long that frame's detectForVideo call took (in
-// milliseconds) and the frame's own timestamp (performance.now(), from the top of renderLoop —
-// NOT re-read afterwards, so the measurement window's wall-clock length isn't inflated by this
+// Called once per DETECTION tick from renderLoop (never on a tick the DETECTION RATE CAP skipped —
+// see that block's own comment) with how long that tick's detectForVideo call took (in
+// milliseconds) and the tick's own timestamp (performance.now(), from the top of renderLoop — NOT
+// re-read afterwards, so the measurement window's wall-clock length isn't inflated by this
 // function's own work). No-ops once modelDecisionMade is true — see that variable's comment.
 // Skips the first MODEL_WARMUP_FRAMES entirely (cold-start frames are always slow and not
 // representative), then averages the next MODEL_MEASURE_FRAMES to make the one-time decision.
 //
 // Reports two different numbers, not one, because they answer different questions and conflating
 // them was actively misleading: "avgMs" is purely how long pose detection itself took, the direct
-// cost of this feature; "renderedFps" is how many whole frames (detection + smoothing + drawing +
-// everything else in renderLoop) actually got through per second over the same window — the
-// number that reflects what the owner's phone actually delivered. A frame rate computed from
-// inference time alone (1000/avgMs) ignores every other cost in the frame and can look many times
-// faster than the app really ran, which is exactly the bug this replaced (see CLAUDE.md).
+// cost of this feature; "detectionFps" is how many DETECTION ticks actually got through per second
+// over the same window — a real measured-window figure, not one derived from inference time alone
+// (1000/avgMs would ignore every other cost a tick pays and can look many times faster than
+// detection really ran, which is exactly the bug this replaced — see CLAUDE.md). NOTE: since the
+// DETECTION RATE CAP decoupled drawing from detection, this number is no longer "the whole frame,
+// drawing included" the way it originally was — it now measures DETECTION cadence specifically
+// (throttled to DETECTION_MIN_INTERVAL_MS in normal operation), while drawing runs independently,
+// on every rAF tick, at whatever rate the display itself can manage. See setModelStatusLine's own
+// comment for the wording that keeps this distinction honest to the owner.
 function measurePoseModelPerf(inferenceMs, nowMs) {
   if (modelDecisionMade) return;
   modelWarmupSeen++;
@@ -903,11 +967,11 @@ function measurePoseModelPerf(inferenceMs, nowMs) {
   modelDecisionMade = true;
   const avgMs = modelMeasureTotalMs / measured;
   const windowElapsedMs = Math.max(nowMs - modelMeasureWindowStartMs, 1e-6); // guards a divide-by-zero if somehow every measured frame landed on the same timestamp
-  const renderedFps = (measured * 1000) / windowElapsedMs;
+  const detectionFps = (measured * 1000) / windowElapsedMs;
   if (avgMs > MODEL_SLOW_FRAME_MS && activePoseModel === "full") {
-    switchToLitePoseModel(avgMs, renderedFps);
+    switchToLitePoseModel(avgMs, detectionFps);
   } else {
-    setModelStatusLine(avgMs, renderedFps);
+    setModelStatusLine(avgMs, detectionFps);
   }
 }
 
@@ -917,7 +981,7 @@ function measurePoseModelPerf(inferenceMs, nowMs) {
 // flaky fetch for the model file, most likely), the OLD "full" landmarker just keeps running —
 // slower than ideal, but still tracking, which is what matters (see CLAUDE.md: pose tracking
 // must never just stop).
-async function switchToLitePoseModel(avgMs, renderedFps) {
+async function switchToLitePoseModel(avgMs, detectionFps) {
   try {
     const next = await createPoseLandmarker("lite");
     const old = poseLandmarker;
@@ -927,15 +991,23 @@ async function switchToLitePoseModel(avgMs, renderedFps) {
   } catch (err) {
     console.error("archery-form-coach: falling back to lite pose model failed, staying on full", err);
   }
-  setModelStatusLine(avgMs, renderedFps);
+  setModelStatusLine(avgMs, detectionFps);
 }
 
-function setModelStatusLine(avgMs, renderedFps) {
+// Wording fix (post DETECTION RATE CAP): this used to say "fps actually rendered" back when
+// drawing and detection ran on the same tick, so a detection-window fps figure genuinely was the
+// app's overall frame rate. Now that paintCanvas runs on every rAF tick independent of detection
+// (see DETECTION_MIN_INTERVAL_MS's own comment), that claim would be actively misleading — this
+// figure specifically describes how often the app SAMPLES the archer, not how smoothly it draws,
+// and the two can legitimately differ a lot. Saying "actually rendered" here again would be a new
+// instance of the exact "reported frame rate doesn't match what actually ran" bug CLAUDE.md
+// already records once — the wording below is deliberately about SAMPLING, not rendering.
+function setModelStatusLine(avgMs, detectionFps) {
   const label =
     activePoseModel === "full"
       ? "full"
       : "lite (auto-switched — full ran too slow on this phone)";
-  modelStatusLine = `Pose model: ${label} — pose detection took about ${avgMs.toFixed(1)}ms/frame, ${renderedFps.toFixed(1)} fps actually rendered, measured at startup.`;
+  modelStatusLine = `Pose model: ${label} — pose detection took about ${avgMs.toFixed(1)}ms/frame, sampling the archer about ${detectionFps.toFixed(1)} times/sec, measured at startup.`;
   renderShotLog();
 }
 // ===========================================================================
@@ -1366,6 +1438,36 @@ function updateAttentionState(nowMs, landmarks, frameWidth, frameHeight, gatingE
 }
 // ===========================================================================
 
+// ===== DETECTION RATE CAP — runtime state and the mechanism. See the constant's own comment above
+// for the full reasoning (and the rejected MAX_FPS-on-the-whole-tick attempt this replaced).
+//
+// Composes with the ATTENTION GATING idle throttle above rather than fighting it: idle already
+// only samples once every ATTENTION_IDLE_SAMPLE_INTERVAL_MS (150ms), far coarser than this cap's
+// own DETECTION_MIN_INTERVAL_MS (50ms — see the selfTest assertion enforcing that relationship,
+// same convention as the existing ATTENTION_IDLE_SAMPLE_INTERVAL_MS < SHOT_MIN_DURATION_MS one),
+// so this cap is a provable no-op whenever the idle throttle is already the binding constraint on
+// how often detection runs. It only ever bites while ENGAGED — which is exactly the case (a phone
+// whose own detection cost is fast enough that back-to-back calls would otherwise starve drawing
+// of any headroom) it exists to catch.
+let lastDetectionMs = null; // performance.now() of the last renderLoop tick that actually ran detectForVideo — renderLoop throttles DETECTION against this, not a frame counter (real elapsed time, regardless of the device's actual tick rate), same convention as attentionLastIdleSampleMs above. Drawing is NOT throttled against this — see lastKnownLandmarks below and DETECTION_MIN_INTERVAL_MS's own comment for why the two are deliberately decoupled
+let lastKnownLandmarks = null; // the most recently smoothed, full-frame landmarks from a genuine detection tick, or null if the archer isn't currently tracked (set null the instant a detection tick comes back with no pose — see renderLoop's own comment). What a draw-only tick (one that skipped detection this time — see shouldSkipDetectionForRateCap) paints the skeleton from, instead of drawing nothing: painting null there would flicker the skeleton between drawn and blank at DETECTION_MIN_INTERVAL_MS's own cadence, and — since paintCanvas is what every recorded clip bakes its frames from — that flicker would land straight in the owner's saved clips, not just the live view. Reusing this value for drawing is display-only and must never itself be fed back into smoothing/settling/measurement — see the same comment
+
+// Pure: true if a tick arriving at nowMs, given the last tick that actually ran DETECTION at
+// lastDetectionMs (null if none yet — the very first tick is always processed, same "never skip on
+// a cold start" reasoning as attentionLastIdleSampleMs's own null case), would run detection sooner
+// than minIntervalMs after the previous one. Both timestamps and the interval are parameters, not
+// module state read internally (same convention as updateAttentionState's nowMs/gatingEnabled), so
+// selfTest can drive this deterministically without a real display or a real camera. Strict `<`,
+// not `<=`: a tick arriving EXACTLY on the cap's own interval is never skipped — only one arriving
+// faster is. Takes a plain millisecond interval, not an fps figure, specifically so no fps->ms
+// conversion (and its floating-point rounding) has to happen at the exact-boundary case either
+// here or in the tests that exercise it.
+function shouldSkipDetectionForRateCap(nowMs, lastDetectionMs, minIntervalMs) {
+  if (lastDetectionMs === null) return false;
+  return nowMs - lastDetectionMs < minIntervalMs;
+}
+// ===========================================================================
+
 async function startCamera() {
   // A landmark position smoothed from BEFORE a camera switch (different framing, possibly a
   // mirrored front camera) must never blend into positions AFTER it — that would drag the
@@ -1376,6 +1478,11 @@ async function startCamera() {
   // nothing once the video source has changed underneath it, and could even be the wrong shape
   // for the new frame's resolution. Detect on the whole frame again until a fresh box is found.
   currentCropBox = null;
+  // Same reasoning again for the cached "last known" skeleton (see DETECTION RATE CAP): a skeleton
+  // drawn from the OLD camera's view would be a stale, mismatched overlay drawn on top of a
+  // brand-new picture (a different lens, a different framing, possibly a different mirror
+  // convention) for however many draw-only ticks pass before the next real detection lands.
+  lastKnownLandmarks = null;
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
   }
@@ -5142,11 +5249,15 @@ function renderLoop() {
   requestAnimationFrame(renderLoop);
   const now = performance.now();
 
-  // Display-only: a live "rendered fps" figure for the ?debug SESSION section, recomputed from
-  // consecutive renderLoop calls — this callback runs every rAF tick regardless of attention
-  // gating (only the detection work below is ever skipped), so this is the same "whole frame,
-  // drawing included" quantity the one-time POSE MODEL warm-up measurement reports, just live.
-  // Guarded by DEBUG so it costs nothing outside ?debug.
+  // Display-only: a live "drawn fps" figure for the ?debug SESSION section, recomputed from
+  // consecutive renderLoop calls — this callback runs every rAF tick unconditionally, including
+  // every idle-gate and DETECTION RATE CAP tick below that skips DETECTION (drawing itself is
+  // never skipped — see DETECTION_MIN_INTERVAL_MS's own comment on why the two are deliberately
+  // decoupled). So this is genuinely the app's live on-screen/recorded-clip draw rate. It can now
+  // legitimately run FASTER than modelStatusLine's detection-sampling figure (see
+  // measurePoseModelPerf's detectionFps, throttled to DETECTION_MIN_INTERVAL_MS) — that gap is the
+  // point of this whole feature, not a bug: drawing no longer waits on detection. Guarded by DEBUG
+  // so it costs nothing outside ?debug.
   if (DEBUG) {
     if (debugLastFrameTs !== null) debugInstantFps = 1000 / (now - debugLastFrameTs);
     debugLastFrameTs = now;
@@ -5155,27 +5266,56 @@ function renderLoop() {
   if (!poseLandmarker || video.readyState < 2) return;
 
   // ROUTINE-START ATTENTION GATING: while idle, pose detection (the expensive step) only runs
-  // every ATTENTION_IDLE_SAMPLE_INTERVAL_MS — everything below this point in renderLoop is
-  // skipped on the frames in between. This is the ONLY thing idle changes: detection still runs,
-  // just less often, so there is no state in which the app has stopped watching for the owner to
-  // start (see ATTENTION_GATING_ENABLED's own comment for why that's structural, not a promise).
-  // While engaged, this never skips anything — every frame behaves exactly as it did before this
-  // feature existed.
+  // every ATTENTION_IDLE_SAMPLE_INTERVAL_MS — everything below this point in renderLoop that
+  // depends on FRESH landmarks is skipped on the frames in between (see DETECTION RATE CAP just
+  // below for what still runs). This is the ONLY thing idle changes: detection still runs, just
+  // less often, so there is no state in which the app has stopped watching for the owner to start
+  // (see ATTENTION_GATING_ENABLED's own comment for why that's structural, not a promise). While
+  // engaged, this never skips anything — every frame behaves exactly as it did before this feature
+  // existed.
   if (ATTENTION_GATING_ENABLED && !attentionEngaged) {
     const dueForIdleSample =
       attentionLastIdleSampleMs === null || now - attentionLastIdleSampleMs >= ATTENTION_IDLE_SAMPLE_INTERVAL_MS;
     if (!dueForIdleSample) {
-      paintCanvas(null); // <video> keeps playing on its own; this only matters if a clip happens to be recording (see paintCanvas)
-      // landmarks argument omitted (undefined), not null: this tick never ran detection at all —
-      // see syncDebugOverlay's own comment on the difference — so the panel keeps showing its
-      // last real reading through the idle gap instead of flashing "not seen" for a reason that
-      // has nothing to do with whether the archer is actually there.
+      // lastKnownLandmarks, not null: drawing must never blank the skeleton just because detection
+      // didn't run this tick — see that variable's own comment for why (a blank-then-drawn flicker
+      // would land straight in a recording, if one happens to be running). <video> itself keeps
+      // playing on its own regardless; this only changes what the SKELETON overlay shows.
+      paintCanvas(lastKnownLandmarks);
+      // landmarks argument omitted (undefined), not null/lastKnownLandmarks: this tick never ran
+      // detection at all — see syncDebugOverlay's own comment on the difference — so the panel
+      // keeps showing its last real reading through the idle gap instead of flashing "not seen"
+      // for a reason that has nothing to do with whether the archer is actually there.
       syncDebugOverlay(now);
       syncTriggerTestPanel(now);
       return;
     }
     attentionLastIdleSampleMs = now; // this frame IS the idle sample — the next one is due no sooner than a full interval from now
   }
+
+  // DETECTION RATE CAP: whichever of the two paths above just let this tick through (genuinely
+  // engaged, or this IS the due idle sample), don't run DETECTION (the genuinely expensive step —
+  // ~30ms+ on the owner's own phone) more often than DETECTION_MIN_INTERVAL_MS — see that
+  // constant's own comment for the full reasoning, including the rejected first attempt at this.
+  // Never skips the rAF call itself (already unconditional at the very top of this function), and
+  // — unlike that rejected attempt — never skips DRAWING either: paintCanvas still runs this tick,
+  // using the most recently known landmarks, so the on-screen picture and any clip currently
+  // recording stay exactly as fresh as the display itself can manage, decoupled from how often
+  // detection actually runs. Only detectForVideo and everything measurement-related that depends
+  // on FRESH landmarks (smoothing, settling, the readouts, isAtFullDraw, the shot log) is skipped
+  // here — see lastKnownLandmarks's own comment for why reusing a cached value for DRAWING is safe
+  // while feeding it back into any of those would fabricate stillness that never happened. Composes
+  // with the idle-gate rather than fighting it: while idle, ticks that reach this point are already
+  // spaced ATTENTION_IDLE_SAMPLE_INTERVAL_MS (150ms) apart, well past this cap's own
+  // DETECTION_MIN_INTERVAL_MS (50ms), so this is a genuine no-op there — it only ever bites while
+  // ENGAGED, on a phone whose own detection cost would otherwise starve drawing of any headroom.
+  if (shouldSkipDetectionForRateCap(now, lastDetectionMs, DETECTION_MIN_INTERVAL_MS)) {
+    paintCanvas(lastKnownLandmarks); // see the idle-gate's identical call just above for why this must never be null/blank
+    syncDebugOverlay(now);
+    syncTriggerTestPanel(now);
+    return;
+  }
+  lastDetectionMs = now;
 
   const frameWidth = video.videoWidth;
   const frameHeight = video.videoHeight;
@@ -5257,6 +5397,7 @@ function renderLoop() {
   if (!rawLandmarks) {
     updateCue(true, false); // "not seeing you" — set before endAttempt below, so a rejected/logged flash this same frame knows to hand back to "lost", not "resting", once it clears
     paintCanvas(null); // no skeleton to draw; <video> keeps the on-screen view alive on its own, and paintCanvas still bakes the picture in if a clip is recording
+    lastKnownLandmarks = null; // pose genuinely lost on a REAL detection tick (not just skipped) — nothing left to cache for a subsequent draw-only tick; see that variable's own comment
     setReadout(readoutBowArm, valueBowArm, "— uncertain", "uncertain");
     setValueState(valueShoulderBow, "—", "uncertain");
     setValueState(valueShoulderDraw, "—", "uncertain");
@@ -5287,6 +5428,7 @@ function renderLoop() {
     // coordinate system that doesn't itself change shape from frame to frame the way a moving
     // crop box would.
     const landmarks = landmarkSmoother.smooth(rawLandmarks, now / 1000);
+    lastKnownLandmarks = landmarks; // cache for the next draw-only tick(s) between now and the next real detection — see DETECTION RATE CAP and this variable's own comment
     landmarksForDebug = landmarks; // display-only — see its own declaration and syncDebugOverlay's call at the bottom of this function
     if (DEBUG || TRIGGERTEST) lastPoseSeen = true;
     paintCanvas(landmarks);
@@ -8353,6 +8495,56 @@ function selfTest() {
     attentionEngaged = false;
     callAttention(t4 + 100, calmLm, false);
     console.assert(attentionEngaged === true, "gatingEnabled=false must force engaged, even starting from idle");
+  }
+
+  // --- DETECTION RATE CAP: shouldSkipDetectionForRateCap, pure. Proves both halves — a tick
+  // arriving faster than DETECTION_MIN_INTERVAL_MS is skipped, and one arriving at or slower than
+  // it never is — the same "assert what should happen AND what shouldn't" discipline CLAUDE.md
+  // requires (an assertion that can't fail is worse than none).
+  {
+    // lastDetectionMs is 0 (not some offset like 1000) in every case below on purpose: nowMs then
+    // equals the elapsed-time value directly, no addition-then-subtraction round trip needed —
+    // unlike the rejected fps-based first attempt, this function takes a plain ms interval, so
+    // there's no floating-point division to introduce rounding error at the exact-boundary case
+    // even if an offset were used, but 0 keeps every case here trivially exact regardless.
+    console.assert(
+      shouldSkipDetectionForRateCap(0, null, DETECTION_MIN_INTERVAL_MS) === false,
+      "the very first tick (no prior detection tick yet) must never be skipped"
+    );
+    console.assert(
+      shouldSkipDetectionForRateCap(DETECTION_MIN_INTERVAL_MS / 2, 0, DETECTION_MIN_INTERVAL_MS) === true,
+      "a tick arriving faster than DETECTION_MIN_INTERVAL_MS (half the minimum interval early) must be skipped"
+    );
+    console.assert(
+      shouldSkipDetectionForRateCap(DETECTION_MIN_INTERVAL_MS - 0.001, 0, DETECTION_MIN_INTERVAL_MS) === true,
+      "a tick arriving a hair under the minimum interval must still be skipped"
+    );
+    console.assert(
+      shouldSkipDetectionForRateCap(DETECTION_MIN_INTERVAL_MS, 0, DETECTION_MIN_INTERVAL_MS) === false,
+      "a tick arriving EXACTLY on the minimum interval must never be skipped — only strictly faster ticks are"
+    );
+    console.assert(
+      shouldSkipDetectionForRateCap(DETECTION_MIN_INTERVAL_MS * 3, 0, DETECTION_MIN_INTERVAL_MS) === false,
+      "a tick arriving slower than DETECTION_MIN_INTERVAL_MS must never be skipped"
+    );
+    // Composition with the ATTENTION GATING idle throttle: this cap's own floor must stay at or
+    // under ATTENTION_IDLE_SAMPLE_INTERVAL_MS, or the cap would silently make idle sampling
+    // slower than that constant's own comment promises — same style of numeric invariant as the
+    // existing ATTENTION_IDLE_SAMPLE_INTERVAL_MS < SHOT_MIN_DURATION_MS assertion above.
+    console.assert(
+      DETECTION_MIN_INTERVAL_MS <= ATTENTION_IDLE_SAMPLE_INTERVAL_MS,
+      "DETECTION_MIN_INTERVAL_MS must not exceed ATTENTION_IDLE_SAMPLE_INTERVAL_MS, or this cap would slow down idle sampling below what that constant claims"
+    );
+    // Sanity bound on the constant itself, not just the function: DETECTION_MIN_INTERVAL_MS only
+    // does anything on a phone whose own per-call detection cost is faster than it. It must stay
+    // comfortably under MODEL_SLOW_FRAME_MS (the "noticeably behind a live camera feed" floor that
+    // triggers the full->lite fallback) — a value at or above that would either never engage on any
+    // phone the app is willing to keep running "full" on, or would throttle detection into the
+    // "noticeably behind" territory MODEL_SLOW_FRAME_MS exists to catch in the first place.
+    console.assert(
+      DETECTION_MIN_INTERVAL_MS < MODEL_SLOW_FRAME_MS,
+      "DETECTION_MIN_INTERVAL_MS should sit comfortably under MODEL_SLOW_FRAME_MS, or the cap risks throttling detection into the same 'noticeably behind' territory the full->lite fallback exists to catch"
+    );
   }
 
   // --- CALIBRATION (HANDOVER.md Stage 4): body-proportion measurement, the physical-plausibility
