@@ -313,6 +313,47 @@ Rules the PM follows:
   alone ignores everything else a frame costs and can look many times faster
   than the app actually ran; that was a real bug this replaced.
 
+- **Drawing and pose detection are decoupled, and only detection is rate-capped
+  (2026-08-26).** Field report: "when i load the app on the phone it still
+  stutters a bit", with the owner's own proposal to cap the frame rate at 60fps.
+  His shot-log line settled what was actually happening and refuted that plan:
+  pose model **full**, **~30.2ms per detection**, **~28.2fps** rendered. He is
+  nowhere near 60Hz, so a 60fps cap could never once have fired — a change that
+  looks like a fix and cannot engage, exactly the "silent because it never ran"
+  failure this file warns about. **Do not reintroduce a whole-loop frame cap.**
+  Root cause: `renderLoop` called `detectForVideo` (the ~30ms bottleneck)
+  synchronously and then `paintCanvas` on the same tick, so the picture could
+  never update faster than one detection allowed — and since `paintCanvas` is
+  what `canvas.captureStream` records, that ceiling applied to every saved clip
+  too, not just the live view. Fix: `paintCanvas` now runs on EVERY
+  `requestAnimationFrame` tick, from `lastKnownLandmarks` when detection didn't
+  run; only detection and everything downstream of fresh landmarks is throttled,
+  via the pure `shouldSkipDetectionForRateCap` and
+  `DETECTION_MIN_INTERVAL_MS` (50ms ≈ 20fps — below his measured ~30ms floor so
+  it genuinely engages). **`lastKnownLandmarks` is display-only and must NEVER be
+  fed back into smoothing, settling or measurement**: re-running the draw-wrist
+  speed check on a repeated position at a fresh timestamp would fabricate
+  perfect stillness that never happened. Both skip branches return immediately
+  after painting, before any of that code, which is what makes this safe.
+  Composition is asserted, not assumed: `DETECTION_MIN_INTERVAL_MS` must stay
+  below `ATTENTION_IDLE_SAMPLE_INTERVAL_MS` (150ms, so the cap is a provable
+  no-op while idle and only bites while engaged) and comfortably under
+  `MODEL_SLOW_FRAME_MS`. `SETTLE_FRAMES_REQUIRED` counts detection frames, so
+  settling now takes ~1.5s instead of ~1s — accepted, not silently patched.
+  **The shot-log wording changed with this**: `renderedFps` became
+  `detectionFps` and the line now says "sampling the archer about N times/sec"
+  rather than "fps actually rendered", because after this change those are
+  genuinely different numbers and the old wording would have been a fresh
+  instance of the stale-frame-rate claim recorded below.
+
+- **`MODEL_SLOW_FRAME_MS` (60) is tuned for "unusable", not "stuttery", and the
+  owner's phone sits in the gap.** He measures 30.2ms — half the threshold — so
+  the automatic full→lite fallback correctly concluded his phone was fine while
+  the app rendered at 28fps. Not changed: swapping him to `lite` trades steadier
+  landmarks (the whole reason `full` is the default) for speed, and that is the
+  owner's call, not a threshold to quietly retune. Revisit only if the detection
+  decoupling above proves insufficient in the field.
+
 - **Region-of-interest cropping — the real fix for distance-driven jitter, not
   just smoothing it away.** At five metres the archer occupies a small part of
   the camera frame, and MediaPipe itself resizes whatever image it's given
